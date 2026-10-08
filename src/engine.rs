@@ -156,7 +156,7 @@ impl Deck {
             looping: false,
             loop_adjust: false,
             start_time: 0.0,
-            brake_time: 0.0,
+            brake_time: 0.25,
             bpm_override: None,
             xfade: None,
             gain: 0.0,

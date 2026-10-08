@@ -17,3 +17,19 @@ and search need key-release events; elsewhere those holds fall back to timers.
 Press `?` in the app for all keys. Memory points, hot cues, loops and tapped
 BPMs are remembered per track in `~/.local/share/odj/memory.json`; settings
 such as Auto Cue live in `settings.json` next to it.
+
+## Install on Omarchy / Arch
+
+```
+git clone https://github.com/ibz/odj && cd odj/packaging/arch
+makepkg -si
+```
+
+This builds the latest `master`, pulls in `rubberband` and `alsa-lib`, and
+installs `odj` plus a launcher entry (Super+Space → "odj"), which opens in
+your default terminal. Run `makepkg -si` again to update; `sudo pacman -R
+odj-git` removes it. Once it's on the AUR: `yay -S odj-git`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

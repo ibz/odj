@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=odj
+GenericName=DJ Player
+Comment=Keyboard-driven DJ player inspired by the Pioneer CDJ-800
+Exec=odj %f
+Terminal=true
+Icon=audio-x-generic
+Categories=AudioVideo;Audio;Player;ConsoleOnly;
+Keywords=dj;cdj;music;bpm;mixer;
+MimeType=audio/mpeg;audio/flac;audio/x-wav;audio/ogg;audio/mp4;audio/aac;audio/x-aiff;

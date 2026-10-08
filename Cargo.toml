@@ -2,6 +2,10 @@
 name = "odj"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Keyboard-driven DJ player for the terminal, inspired by the Pioneer CDJ-800"
+repository = "https://github.com/ibz/odj"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"

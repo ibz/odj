@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let mut browser = Browser::new(dir);
     if let Some(f) = &file {
         let f = f.canonicalize().unwrap_or(f.clone());
-        browser.selected = browser.entries.iter().position(|e| e.path == f).unwrap_or(0);
+        browser.select(&f);
     }
 
     let mut terminal = ratatui::init();

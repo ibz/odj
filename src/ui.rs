@@ -243,21 +243,33 @@ fn draw_browser(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 70, 70);
     f.render_widget(Clear, area);
     let b = &app.browser;
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(format!(" {} ", b.dir.display()))
-        .title_bottom(" ↑↓ select  Enter/→ open  ←/Backspace up  Esc close ")
+        .title_bottom(" type to filter  ↑↓ select  Enter/→ open  ←/Backspace up  Esc clear/close ")
         .border_style(Style::new().fg(AMBER));
-    let items: Vec<ListItem> = if b.entries.is_empty() {
-        vec![ListItem::new("(no folders or audio files)").fg(DIM)]
+    if !b.query.is_empty() {
+        block = block.title(Line::from(format!(" filter: {}▏", b.query)).right_aligned().bold());
+    }
+    let items: Vec<ListItem> = if b.visible.is_empty() {
+        let msg = if b.entries.is_empty() { "(no folders or audio files)" } else { "(no matches)" };
+        vec![ListItem::new(msg).fg(DIM)]
     } else {
-        b.entries
+        b.visible
             .iter()
-            .map(|e| {
-                if e.is_dir {
-                    ListItem::new(format!("▸ {}/", e.name)).fg(Color::Cyan)
-                } else {
-                    ListItem::new(format!("♪ {}", e.name))
-                }
+            .map(|(i, matched)| {
+                let e = &b.entries[*i];
+                let (icon, suffix, color) =
+                    if e.is_dir { ("▸ ", "/", Color::Cyan) } else { ("♪ ", "", Color::Reset) };
+                let mut spans = vec![Span::raw(icon)];
+                spans.extend(e.name.chars().enumerate().map(|(k, c)| {
+                    if matched.contains(&k) {
+                        Span::styled(c.to_string(), Style::new().fg(AMBER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+                    } else {
+                        Span::raw(c.to_string())
+                    }
+                }));
+                spans.push(Span::raw(suffix));
+                ListItem::new(Line::from(spans)).fg(color)
             })
             .collect()
     };
@@ -316,7 +328,7 @@ fn draw_help(f: &mut Frame) {
         ("T / Shift+T", "Elapsed / remaining time · Auto Cue on/off"),
         ("A / Shift+A", "Tap BPM / back to detected BPM"),
         ("S / V", "Cycle start / brake time"),
-        ("Tab", "Browse files"),
+        ("Tab", "Browse files; type to filter the folder"),
         ("Shift+Q, Ctrl+C", "Quit (cue memory is saved)"),
     ];
     let lines: Vec<Line> = rows

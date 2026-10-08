@@ -256,7 +256,7 @@ impl App {
             if ctrl && code == KeyCode::Char('c') {
                 self.quit = true;
             } else if self.browser.open {
-                self.browser_key(code);
+                self.browser_key(&key);
             } else {
                 self.deck_key(code, shift, repeat);
             }
@@ -275,22 +275,35 @@ impl App {
         }
     }
 
-    fn browser_key(&mut self, code: KeyCode) {
-        match code {
+    /// Takes the raw key: typed characters go into the filter as they are.
+    fn browser_key(&mut self, key: &KeyEvent) {
+        let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char(c) if typing => self.browser.type_char(c),
             KeyCode::Up => self.browser.move_by(-1),
             KeyCode::Down => self.browser.move_by(1),
             KeyCode::PageUp => self.browser.move_by(-10),
             KeyCode::PageDown => self.browser.move_by(10),
             KeyCode::Home => self.browser.selected = 0,
             KeyCode::End => self.browser.move_by(isize::MAX / 2),
-            KeyCode::Left | KeyCode::Backspace => self.browser.parent(),
+            KeyCode::Backspace => {
+                if !self.browser.backspace() {
+                    self.browser.parent();
+                }
+            }
+            KeyCode::Left => self.browser.parent(),
             KeyCode::Enter | KeyCode::Right => {
                 if let Some(path) = self.browser.activate() {
                     self.load(path);
-                    self.browser.open = false;
+                    self.browser.close();
                 }
             }
-            KeyCode::Esc | KeyCode::Tab => self.browser.open = false,
+            KeyCode::Esc => {
+                if !self.browser.clear_query() {
+                    self.browser.close();
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => self.browser.close(),
             _ => {}
         }
     }

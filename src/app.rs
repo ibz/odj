@@ -106,13 +106,9 @@ impl App {
 
     // --- Tracks ----------------------------------------------------------------
 
-    /// Starts loading a track. Refused while playing (an eject
-    /// lock), so a stray key can't stop the music. Returns whether it started.
-    pub fn load(&mut self, path: PathBuf) -> bool {
-        if self.deck().is_playing() {
-            self.set_status("Load locked while playing: pause first");
-            return false;
-        }
+    /// Starts loading a track in the background; it replaces the current
+    /// one, playing or not, once decoded.
+    pub fn load(&mut self, path: PathBuf) {
         // Absolute paths keep folder lookups and cue memory keys stable.
         let path = path.canonicalize().unwrap_or(path);
         let (tx, rx) = mpsc::channel();
@@ -121,7 +117,6 @@ impl App {
             let _ = tx.send(Track::load(&p));
         });
         self.loading = Some((path, rx));
-        true
     }
 
     /// Stores the loaded track's cues so they come back next time.
@@ -147,9 +142,6 @@ impl App {
         let path = path.clone();
         self.loading = None;
         match result {
-            Ok(_) if self.deck().is_playing() => {
-                self.set_status("Load cancelled: the deck started playing");
-            }
             Ok(track) => {
                 self.remember();
                 let mem = self.memory.get(&track.path);
@@ -293,9 +285,8 @@ impl App {
             KeyCode::End => self.browser.move_by(isize::MAX / 2),
             KeyCode::Left | KeyCode::Backspace => self.browser.parent(),
             KeyCode::Enter | KeyCode::Right => {
-                if let Some(path) = self.browser.activate()
-                    && self.load(path)
-                {
+                if let Some(path) = self.browser.activate() {
+                    self.load(path);
                     self.browser.open = false;
                 }
             }
@@ -527,13 +518,11 @@ mod tests {
     }
 
     #[test]
-    fn loading_is_locked_while_playing() {
+    fn loading_works_while_playing() {
         let mut app = app();
         press(&mut app, KeyCode::Char(' '), false);
-        assert!(!app.load(PathBuf::from("other.mp3")));
-        assert!(app.loading.is_none());
-        press(&mut app, KeyCode::Char(' '), false);
-        assert!(app.load(PathBuf::from("other.mp3")));
+        app.load(PathBuf::from("other.mp3"));
+        assert!(app.loading.is_some());
     }
 
     #[test]

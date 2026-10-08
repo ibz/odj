@@ -269,6 +269,30 @@ fn draw_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// Startup list of sound card outputs, shown when there is more than one stereo out.
+/// Unavailable entries (`false`) are dimmed.
+pub fn draw_output_picker(f: &mut Frame, items: &[(String, bool)], selected: usize) {
+    let area = centered(f.area(), 70, 70);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Audio output ")
+        .title_bottom(" ↑↓ select  Enter use  Esc quit ")
+        .border_style(Style::new().fg(AMBER));
+    let items: Vec<ListItem> = items
+        .iter()
+        .map(|(label, ok)| {
+            let item = ListItem::new(label.as_str());
+            if *ok { item } else { item.fg(DIM) }
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().fg(Color::Black).bg(AMBER))
+        .highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_help(f: &mut Frame) {
     let rows: &[(&str, &str)] = &[
         ("Space", "Play / Pause"),

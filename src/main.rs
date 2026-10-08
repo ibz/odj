@@ -12,10 +12,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
@@ -41,10 +41,6 @@ fn main() -> Result<()> {
     };
     let dir = dir.canonicalize().unwrap_or(dir);
 
-    let output = audio::Output::open()?;
-    let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
-    let _stream = output.start(deck.clone())?;
-
     let mut browser = Browser::new(dir);
     if let Some(f) = &file {
         let f = f.canonicalize().unwrap_or(f.clone());
@@ -65,6 +61,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let result = start(&mut terminal, browser, file, key_release);
+
+    if key_release {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    ratatui::restore();
+    result
+}
+
+fn start(terminal: &mut DefaultTerminal, browser: Browser, file: Option<PathBuf>, key_release: bool) -> Result<()> {
+    let host = audio::host();
+    let Some(output) = open_output(terminal, &host)? else {
+        return Ok(());
+    };
+    let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
+    let _stream = output.start(deck.clone())?;
+
     let name = format!("{} · {} Hz", output.name, output.sample_rate());
     let mut app = App::new(deck, browser, key_release, name);
     match file {
@@ -73,14 +86,46 @@ fn main() -> Result<()> {
         }
         _ => app.browser.open = true,
     }
-    let result = run(&mut terminal, &mut app);
+    let result = run(terminal, &mut app);
     app.remember();
-
-    if key_release {
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    }
-    ratatui::restore();
     result
+}
+
+/// Plays on the only stereo output there is; with more to choose from, or when a card
+/// is unavailable, asks. `None` means the user quit the picker.
+fn open_output(terminal: &mut DefaultTerminal, host: &cpal::Host) -> Result<Option<audio::Output>> {
+    let cards = audio::cards(host)?;
+    let choices = audio::choices(&cards);
+    if choices.is_empty() {
+        return audio::Output::open_default(host)
+            .context("no audio outputs found (does your user have access to /dev/snd, e.g. via the `audio` group?)")
+            .map(Some);
+    }
+    let all_available = choices.iter().all(|c| c.available(&cards));
+    let mut stereo = choices.iter().filter(|c| matches!(c.route, audio::Route::Stereo(..)));
+    if let (true, Some(only), None) = (all_available, stereo.next(), stereo.next()) {
+        return audio::Output::open(&cards, only).map(Some);
+    }
+    let items: Vec<(String, bool)> = choices.iter().map(|c| (c.label(&cards), c.available(&cards))).collect();
+    let mut selected = items.iter().position(|(_, ok)| *ok).unwrap_or(0);
+    loop {
+        terminal.draw(|f| ui::draw_output_picker(f, &items, selected))?;
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(items.len() - 1),
+            KeyCode::Home => selected = 0,
+            KeyCode::End => selected = items.len() - 1,
+            KeyCode::Enter if items[selected].1 => {
+                return audio::Output::open(&cards, &choices[selected]).map(Some);
+            }
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Ok(None),
+            _ => {}
+        }
+    }
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {

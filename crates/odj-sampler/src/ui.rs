@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
 
+use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
 use odj_core::tui::{AMBER, DIM, centered};
 
@@ -228,7 +229,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         Screen::Picker(_) => " type to filter  ↑↓ select  Enter assign  Esc clear/close",
         Screen::Editor(_) => {
-            " Tab start/end  ←/→ ±1 beat (Shift: bar)  ,/. ±10 ms (Shift: 1 ms)  [ ] halve/double  Space preview  Enter keep  Esc cancel"
+            " Tab start/end  ←/→ beat (Shift: bar)  ,/. ±10 ms (Shift: 1 ms)  [ ] halve/double  Space preview  Enter keep  Esc cancel"
         }
     };
     let line = match app.status() {
@@ -322,10 +323,10 @@ fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u
     if ed.previewing {
         length.push(Span::styled("   ▶ PREVIEW", Style::new().fg(PLAYING).bold()));
     }
-    let bpm = match (ed.tapped_bpm, ed.bpm()) {
-        (Some(b), _) => format!("{b:.1} (tapped)"),
-        (None, Some(b)) => format!("{b:.1}"),
-        (None, None) => "none, steps are seconds".into(),
+    let bpm = match ed.grid() {
+        Some(g) if ed.grid_edited() => format!("{:.2} (your grid)", g.bpm),
+        Some(g) => format!("{:.2}", g.bpm),
+        None => "none, steps are seconds".into(),
     };
     // The edge the keys move is highlighted.
     let edge = |name: &str, t: f64, active: bool, color: Color| {
@@ -349,17 +350,18 @@ fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u
     let span = (secs * 1.3).max(1.0);
     let view = (start - span * 0.1, start + span * 0.9);
     let playhead = s.preview.filter(|p| ed.previewing && p.playing).map(|p| start + p.progress as f64 * secs);
-    let beat = ed.beat().map(|b| b / sr);
-    f.render_widget(Ruler { view, start, end, beat }, ruler);
+    let grid = ed.grid().map(|g| BeatGrid { anchor: g.anchor / sr, ..g });
+    f.render_widget(Ruler { view, start, end, grid }, ruler);
     f.render_widget(Wave { track, view, start, end, playhead }, wave);
 }
 
-/// Beat and bar ticks over the region, with its start and end.
+/// Beat and bar ticks of the grid, with the region's start and end.
 struct Ruler {
     view: (f64, f64),
     start: f64,
     end: f64,
-    beat: Option<f64>,
+    /// In seconds: the anchor is in seconds and the rate is 1.
+    grid: Option<BeatGrid>,
 }
 
 impl Widget for Ruler {
@@ -379,13 +381,14 @@ impl Widget for Ruler {
                 cell.set_char(ch).set_style(style);
             }
         };
-        if let Some(beat) = self.beat.filter(|&b| b / per_col >= 1.0) {
-            let mut n = 1;
-            while self.start + n as f64 * beat < self.end.max(self.view.1) {
-                let ch = if n % 4 == 0 { '|' } else { '·' };
-                let style = if n % 4 == 0 { Style::new().fg(Color::Gray) } else { Style::new().fg(DIM) };
-                put(self.start + n as f64 * beat, ch, style);
-                n += 1;
+        if let Some(g) = self.grid.filter(|g| g.period(1.0) / per_col >= 1.0) {
+            let mut n = g.beat_at(self.view.0, 1.0).ceil();
+            while g.beat_pos(n, 1.0) < self.view.1 {
+                let bar = n.rem_euclid(BAR as f64) == 0.0;
+                let ch = if bar { '|' } else { '·' };
+                let style = if bar { Style::new().fg(Color::Gray) } else { Style::new().fg(DIM) };
+                put(g.beat_pos(n, 1.0), ch, style);
+                n += 1.0;
             }
         }
         put(self.start, '[', Style::new().fg(PLAYING).bold());
@@ -467,7 +470,7 @@ fn draw_help(f: &mut Frame) {
         ("- / = / 0", "Gain down / up / 0 dB"),
         ("Delete", "Clear the selected pad"),
         ("Editor Tab", "Switch between moving the start and the end"),
-        ("Editor ← / →", "Move it ±1 beat (Shift: ±1 bar); seconds without a BPM"),
+        ("Editor ← / →", "Move it to the next beat of the grid (Shift: 4 beats); seconds without a BPM"),
         ("Editor , / .", "Move it ±10 ms (Shift: ±1 ms)"),
         ("Editor [ / ]", "Halve / double the length"),
         ("Editor Space", "Preview (loops)"),

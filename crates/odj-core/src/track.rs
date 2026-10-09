@@ -1,5 +1,5 @@
 //! Decoding a file fully into memory, plus the analysis the player's display
-//! shows: waveform, BPM and the auto-cue point.
+//! shows: waveform, beat grid and the auto-cue point.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag};
+
+use crate::grid::{BAR, BeatGrid};
 
 /// Waveform bins per second of audio.
 pub const WAVE_RATE: f64 = 100.0;
@@ -36,7 +38,10 @@ pub struct Track {
     /// Interleaved stereo.
     pub samples: Vec<f32>,
     pub wave: Vec<WaveBin>,
-    pub bpm: Option<f64>,
+    /// Detected beat grid; the user's corrections live in the track's memory.
+    pub grid: Option<BeatGrid>,
+    /// The beats keep to the grid, so quantizing makes sense.
+    pub steady: bool,
     /// First audible frame, used as the default cue point.
     pub first_sound: f64,
 }
@@ -61,6 +66,10 @@ impl Track {
         self.frames() as f64 / self.sample_rate as f64
     }
 
+    pub fn bpm(&self) -> Option<f64> {
+        self.grid.map(|g| g.bpm)
+    }
+
     pub fn load(path: &Path) -> Result<Track> {
         let d = decode(path)?;
         let mut track = Track::from_samples(path.to_path_buf(), d.title, d.artist, d.sample_rate, d.samples);
@@ -80,11 +89,13 @@ impl Track {
             .as_chunks::<2>().0.iter()
             .position(|f| f[0].abs().max(f[1].abs()) > AUTO_CUE_LEVEL)
             .unwrap_or(0) as f64;
+        let (grid, steady) = detect_grid(&mono, sample_rate).map_or((None, false), |(g, s)| (Some(g), s));
         Track {
             // Set by `load`; tracks built from bare samples have no file to fingerprint.
             id: String::new(),
             wave: waveform(&mono, sample_rate),
-            bpm: detect_bpm(&mono, sample_rate),
+            grid,
+            steady,
             path,
             title,
             artist,
@@ -206,19 +217,24 @@ fn waveform(mono: &[f32], sample_rate: u32) -> Vec<WaveBin> {
         .collect()
 }
 
-/// Tempo estimate from the autocorrelation of an onset-strength envelope.
-pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f64> {
-    const ENV_RATE: f64 = 200.0;
-    const MIN_BPM: f64 = 60.0;
-    const MAX_BPM: f64 = 200.0;
+/// Bins per second of the energy envelopes the beat analysis works on.
+const ENERGY_RATE: f64 = 1000.0;
+/// Energy bins per bin of the tempo search's envelope (200 Hz).
+const COARSE: usize = 5;
+/// Beats whose onsets stray further than this from the fitted grid make a
+/// track unsteady; so does finding onsets on too few of its beats.
+const STEADY_MS: f64 = 8.0;
+const STEADY_SHARE: f64 = 0.5;
 
-    let hop = ((sample_rate as f64 / ENV_RATE) as usize).max(1);
-    let env_rate = sample_rate as f64 / hop as f64;
-    if mono.len() < hop * (env_rate as usize) * 4 {
-        return None;
-    }
+/// Signal energy, full band and bass, in bins of `hop` frames.
+struct Energy {
+    hop: usize,
+    full: Vec<f32>,
+    low: Vec<f32>,
+}
 
-    // Energy envelopes of the full band and the bass band (kicks).
+fn energy(mono: &[f32], sample_rate: u32) -> Energy {
+    let hop = ((sample_rate as f64 / ENERGY_RATE) as usize).max(1);
     let a = lowpass_coef(150.0, sample_rate);
     let mut lp = 0.0f32;
     let (mut full, mut low) = (Vec::new(), Vec::new());
@@ -229,10 +245,45 @@ pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f64> {
             ef += x * x;
             el += lp * lp;
         }
-        let n = chunk.len() as f32;
-        full.push((1.0 + 1000.0 * ef / n).ln());
-        low.push((1.0 + 1000.0 * el / n).ln());
+        full.push(ef);
+        low.push(el);
     }
+    Energy { hop, full, low }
+}
+
+/// The detected grid, and whether the beats keep to it closely enough to quantize.
+pub fn detect_grid(mono: &[f32], sample_rate: u32) -> Option<(BeatGrid, bool)> {
+    let e = energy(mono, sample_rate);
+    let bpm = rough_bpm(&e, sample_rate)?;
+    let rate = sample_rate as f64 / e.hop as f64;
+    let onset = fine_onsets(&e);
+    let fit = fit_beats(&onset, rate * 60.0 / bpm, rate)?;
+    let hop = e.hop as f64;
+    let bpm = 60.0 * rate / fit.period;
+    let bar = BAR as f64 * fit.period * hop;
+    let grid = BeatGrid { bpm, anchor: ((fit.phase + fit.downbeat as f64 * fit.period) * hop).rem_euclid(bar) };
+    Some((grid, fit.steady))
+}
+
+/// Tempo estimate from the autocorrelation of an onset-strength envelope, in
+/// 78..180 BPM.
+fn rough_bpm(e: &Energy, sample_rate: u32) -> Option<f64> {
+    const MIN_BPM: f64 = 60.0;
+    const MAX_BPM: f64 = 200.0;
+
+    let hop = e.hop * COARSE;
+    let env_rate = sample_rate as f64 / hop as f64;
+    if e.full.len() < COARSE * (env_rate as usize) * 4 {
+        return None;
+    }
+
+    // Log energy of the full band and the bass band (kicks).
+    let log = |bins: &[f32]| -> Vec<f32> {
+        bins.chunks(COARSE)
+            .map(|c| (1.0 + 1000.0 * c.iter().sum::<f32>() / (c.len() * e.hop) as f32).ln())
+            .collect()
+    };
+    let (full, low) = (log(&e.full), log(&e.low));
 
     // Onset strength: rectified rise in log energy, minus its local mean.
     let mut onset: Vec<f32> = (1..full.len())
@@ -307,22 +358,170 @@ pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f64> {
     while bpm >= 180.0 {
         bpm /= 2.0;
     }
-    if (bpm - bpm.round()).abs() < 0.1 {
-        bpm = bpm.round();
+    Some(bpm)
+}
+
+/// Onset strength at every energy bin: how much louder the next 10 ms are than
+/// the last 10 ms, bass counting double. It peaks at the bin an attack starts in.
+fn fine_onsets(e: &Energy) -> Vec<f32> {
+    const W: usize = 10;
+    let prefix = |bins: &[f32]| -> Vec<f64> {
+        let mut p = vec![0.0f64; bins.len() + 1];
+        for (i, &v) in bins.iter().enumerate() {
+            p[i + 1] = p[i] + v as f64;
+        }
+        p
+    };
+    let (pf, pl) = (prefix(&e.full), prefix(&e.low));
+    let n = e.full.len();
+    let scale = 1000.0 / (W * e.hop) as f64;
+    let level = |p: &[f64], from: usize| (1.0 + scale * (p[from + W] - p[from])).ln();
+    (0..n)
+        .map(|i| {
+            if i < W || i + W > n {
+                return 0.0;
+            }
+            let rise = |p: &[f64]| (level(p, i) - level(p, i - W)).max(0.0);
+            (rise(&pf) + 2.0 * rise(&pl)) as f32
+        })
+        .collect()
+}
+
+struct BeatFit {
+    /// Bin of beat 0 and bins per beat, fractional.
+    phase: f64,
+    period: f64,
+    /// Which of the first four beats starts a bar.
+    downbeat: usize,
+    steady: bool,
+}
+
+/// Places a grid on the onsets: finds the phase for the rough period, then
+/// fits a line through the onset nearest each beat, narrowing in.
+fn fit_beats(onset: &[f32], period: f64, rate: f64) -> Option<BeatFit> {
+    let n = onset.len();
+    // The phase where the beats line up with the most onset strength. The
+    // onsets are widened first so a slightly wrong period still lines up.
+    let wide: Vec<f32> = (0..n)
+        .map(|i| onset[i.saturating_sub(8)..(i + 9).min(n)].iter().fold(0.0f32, |m, &v| m.max(v)))
+        .collect();
+    let mut best = (0.0, f32::MIN);
+    let mut phase = 0.0;
+    while phase < period {
+        let mut s = 0.0;
+        let mut t = phase;
+        while (t as usize) < n {
+            s += wide[t as usize];
+            t += period;
+        }
+        if s > best.1 {
+            best = (phase, s);
+        }
+        phase += 1.0;
     }
-    Some((bpm * 10.0).round() / 10.0)
+
+    let (mut phase, mut period) = (best.0, period);
+    let mut beats = Vec::new();
+    for window in [0.2 * period, 0.08 * period, 0.025 * rate] {
+        beats = match_beats(onset, phase, period, window);
+        let (p, q) = fit_line(&beats)?;
+        (phase, period) = (p, q);
+    }
+
+    // A whole BPM is likely meant; take it when it fits about as well.
+    let bpm = 60.0 * rate / period;
+    let whole = 60.0 * rate / bpm.round();
+    if (bpm - bpm.round()).abs() < 0.05 {
+        let w: f64 = beats.iter().map(|b| b.2).sum();
+        let whole_phase = beats.iter().map(|&(k, t, s)| (t - k * whole) * s).sum::<f64>() / w;
+        if spread(&beats, whole_phase, whole) <= spread(&beats, phase, period) + 0.5 {
+            (phase, period) = (whole_phase, whole);
+        }
+    }
+
+    // Downbeat: the beat of the bar with the strongest onsets, or when that is
+    // a close call, the first beat found, as tracks tend to start on a bar.
+    let mut bar = [0.0f64; BAR as usize];
+    for &(k, _, s) in &beats {
+        bar[(k as i64).rem_euclid(BAR) as usize] += s;
+    }
+    let strongest = (0..bar.len()).max_by(|&a, &b| bar[a].total_cmp(&bar[b])).unwrap_or(0);
+    let first = beats.first().map_or(0, |b| (b.0 as i64).rem_euclid(BAR) as usize);
+    let downbeat = if bar[first] >= 0.9 * bar[strongest] { first } else { strongest };
+
+    let (first, last) = (beats.first().map_or(0.0, |b| b.0), beats.last().map_or(0.0, |b| b.0));
+    let share = beats.len() as f64 / (last - first + 1.0);
+    let steady = share >= STEADY_SHARE && spread(&beats, phase, period) <= STEADY_MS * rate / 1000.0;
+    Some(BeatFit { phase, period, downbeat, steady })
+}
+
+/// For each beat of the grid, the strongest onset within `window` bins of it,
+/// as (beat, bin, strength); weak ones, where there is no real onset, are left out.
+fn match_beats(onset: &[f32], phase: f64, period: f64, window: f64) -> Vec<(f64, f64, f64)> {
+    let mut found = Vec::new();
+    let mut k = (-phase / period).ceil();
+    loop {
+        let t = phase + k * period;
+        let (lo, hi) = ((t - window).ceil().max(0.0) as usize, (t + window).floor() as usize);
+        if lo >= onset.len() {
+            break;
+        }
+        let hi = hi.min(onset.len() - 1);
+        if let Some(i) = (lo..=hi).max_by(|&a, &b| onset[a].total_cmp(&onset[b])) {
+            found.push((k, i as f64, onset[i] as f64));
+        }
+        k += 1.0;
+    }
+    let mut strengths: Vec<f64> = found.iter().map(|b| b.2).collect();
+    strengths.sort_by(f64::total_cmp);
+    let strong = strengths.get(strengths.len() * 3 / 4).copied().unwrap_or(0.0);
+    found.retain(|b| b.2 > 0.0 && b.2 >= 0.3 * strong);
+    found
+}
+
+/// Weighted least squares of bin against beat: the phase and period.
+fn fit_line(beats: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    let w: f64 = beats.iter().map(|b| b.2).sum();
+    if beats.len() < 8 || w <= 0.0 {
+        return None;
+    }
+    let mk = beats.iter().map(|b| b.0 * b.2).sum::<f64>() / w;
+    let mt = beats.iter().map(|b| b.1 * b.2).sum::<f64>() / w;
+    let cov: f64 = beats.iter().map(|&(k, t, s)| s * (k - mk) * (t - mt)).sum();
+    let var: f64 = beats.iter().map(|&(k, _, s)| s * (k - mk) * (k - mk)).sum();
+    if var <= 0.0 {
+        return None;
+    }
+    let period = cov / var;
+    Some((mt - period * mk, period))
+}
+
+/// Median distance, in bins, of the onsets from the grid.
+fn spread(beats: &[(f64, f64, f64)], phase: f64, period: f64) -> f64 {
+    let mut d: Vec<f64> = beats.iter().map(|&(k, t, _)| (t - phase - k * period).abs()).collect();
+    d.sort_by(f64::total_cmp);
+    d.get(d.len() / 2).copied().unwrap_or(f64::MAX)
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util {
     /// A synthetic four-on-the-floor kick pattern with off-beat hats.
     pub fn click_track(bpm: f64, seconds: f64, sample_rate: u32) -> Vec<f32> {
+        let beat = 60.0 / bpm;
+        clicks((0..).map(|k| (beat * (k as f64 + 0.5), 0.8)), beat, seconds, sample_rate)
+    }
+
+    /// A kick at each (time in seconds, level), each followed by a hat half a
+    /// `beat` later.
+    pub fn clicks(beats: impl IntoIterator<Item = (f64, f32)>, beat: f64, seconds: f64, sample_rate: u32) -> Vec<f32> {
         let frames = (seconds * sample_rate as f64) as usize;
-        let beat = 60.0 / bpm * sample_rate as f64;
+        let sr = sample_rate as f64;
         let mut out = vec![0.0f32; frames * 2];
-        let mut t = beat * 0.5;
-        while (t as usize) < frames {
-            let start = t as usize;
+        for (t, level) in beats {
+            let start = (t * sr) as usize;
+            if start >= frames {
+                break;
+            }
             for i in 0..(sample_rate as usize / 8) {
                 let s = start + i;
                 if s >= frames {
@@ -330,10 +529,10 @@ pub mod test_util {
                 }
                 let x = i as f32 / sample_rate as f32;
                 let kick = (2.0 * std::f32::consts::PI * 55.0 * x).sin() * (-x * 25.0).exp();
-                out[s * 2] += 0.8 * kick;
-                out[s * 2 + 1] += 0.8 * kick;
+                out[s * 2] += level * kick;
+                out[s * 2 + 1] += level * kick;
             }
-            let hat = (t + beat / 2.0) as usize;
+            let hat = ((t + beat / 2.0) * sr) as usize;
             for i in 0..(sample_rate as usize / 50) {
                 let s = hat + i;
                 if s >= frames {
@@ -344,7 +543,6 @@ pub mod test_util {
                 out[s * 2] += 0.2 * noise * (-x * 300.0).exp();
                 out[s * 2 + 1] += 0.2 * noise * (-x * 300.0).exp();
             }
-            t += beat;
         }
         out
     }
@@ -352,17 +550,73 @@ pub mod test_util {
 
 #[cfg(test)]
 mod tests {
-    use super::test_util::click_track;
+    use super::test_util::{click_track, clicks};
     use super::*;
 
+    fn grid_of(samples: &[f32]) -> Option<(BeatGrid, bool)> {
+        let mono: Vec<f32> = samples.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
+        detect_grid(&mono, 44_100)
+    }
+
     #[test]
-    fn detects_common_tempos() {
+    fn detects_common_tempos_and_their_phase() {
         for &bpm in &[90.0, 124.0, 128.0, 140.0, 174.0] {
-            let s = click_track(bpm, 40.0, 44_100);
-            let mono: Vec<f32> = s.chunks_exact(2).map(|f| f[0]).collect();
-            let got = detect_bpm(&mono, 44_100).expect("bpm");
-            assert!((got - bpm).abs() < 0.15, "expected {bpm}, got {got}");
+            let (grid, steady) = grid_of(&click_track(bpm, 40.0, 44_100)).expect("grid");
+            assert!((grid.bpm - bpm).abs() < 0.02, "expected {bpm}, got {}", grid.bpm);
+            // The kicks are half a beat in.
+            let kick = 0.5 * 60.0 / bpm * 44_100.0;
+            let off = (grid.nearest(kick, 44_100.0) - kick) / 44.1;
+            assert!(off.abs() < 2.0, "{bpm} BPM: first beat {off:.2} ms off");
+            assert!(steady);
+            // All beats alike: the first one starts bar 1.
+            assert_eq!(grid.bar_beat(kick, 44_100.0), (1, 1), "{bpm} BPM");
         }
+    }
+
+    #[test]
+    fn grid_holds_over_a_whole_track() {
+        // An odd tempo, a first beat 37 ms in, and accented downbeats from beat 2 on.
+        let (bpm, first) = (123.45, 0.037);
+        let beat = 60.0 / bpm;
+        let at = |k: f64| (first + k * beat) * 44_100.0;
+        let beats = (0..).map(|k| (first + k as f64 * beat, if k % 4 == 2 { 0.9 } else { 0.5 }));
+        let (grid, steady) = grid_of(&clicks(beats, beat, 300.0, 44_100)).expect("grid");
+        assert!((grid.bpm - bpm).abs() < 0.005, "bpm {}", grid.bpm);
+        assert!(steady);
+        for k in [0.0, 300.0, 610.0] {
+            let off = (grid.nearest(at(k), 44_100.0) - at(k)) / 44.1;
+            assert!(off.abs() < 2.0, "beat {k}: {off:.2} ms off");
+        }
+        assert_eq!(grid.bar_beat(at(2.0), 44_100.0), (1, 1));
+        assert_eq!(grid.bar_beat(at(0.0), 44_100.0), (0, 3));
+    }
+
+    #[test]
+    fn whole_tempos_come_out_exact() {
+        let (grid, _) = grid_of(&click_track(128.0, 60.0, 44_100)).expect("grid");
+        assert_eq!(grid.bpm, 128.0);
+    }
+
+    #[test]
+    fn loose_timing_is_not_steady() {
+        // A player drifting around 120 BPM.
+        let mut t = 0.3;
+        let drifting = (0..400).map(|k| {
+            let at = t;
+            t += 0.5 / (1.0 + 0.04 * (k as f64 / 30.0).sin());
+            (at, 0.8)
+        });
+        let grid = grid_of(&clicks(drifting, 0.5, 200.0, 44_100));
+        assert!(grid.is_none_or(|(_, steady)| !steady), "{grid:?}");
+        // Steady on average, but each beat up to 30 ms off.
+        let mut seed = 1u32;
+        let jittered = (0..400).map(|k| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let jitter = (seed >> 8) as f64 / (1u32 << 24) as f64 * 0.06 - 0.03;
+            (0.3 + k as f64 * 0.5 + jitter, 0.8)
+        });
+        let grid = grid_of(&clicks(jittered, 0.5, 200.0, 44_100));
+        assert!(grid.is_none_or(|(_, steady)| !steady), "{grid:?}");
     }
 
     /// A 16-bit stereo WAV, optionally with a LIST/INFO title tag before the audio.
@@ -437,6 +691,6 @@ mod file_test {
     fn load_real_file() {
         let p = std::env::var("ODJ_TEST_FILE").unwrap();
         let t = super::Track::load(std::path::Path::new(&p)).unwrap();
-        eprintln!("title={} artist={:?} sr={} dur={:.2} bpm={:?} first={}", t.title, t.artist, t.sample_rate, t.duration(), t.bpm, t.first_sound);
+        eprintln!("title={} artist={:?} sr={} dur={:.2} bpm={:?} first={}", t.title, t.artist, t.sample_rate, t.duration(), t.grid, t.first_sound);
     }
 }

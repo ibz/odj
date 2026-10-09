@@ -18,6 +18,10 @@ const HOT_COLOR: Color = Color::Rgb(60, 220, 100);
 const PLAYHEAD: Color = Color::Rgb(210, 40, 40);
 const MEMORY_COLOR: Color = Color::Rgb(255, 70, 70);
 const LOOP_BG: Color = Color::Rgb(40, 70, 25);
+const GRID_COLOR: Color = Color::Rgb(90, 200, 230);
+/// Backgrounds of the columns a beat or a bar starts in.
+const BEAT_BG: Color = Color::Rgb(38, 38, 44);
+pub const BAR_BG: Color = Color::Rgb(75, 75, 88);
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
 
@@ -44,11 +48,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     if let Some(track) = &s.track {
         let now = s.pos / track.sample_rate as f64;
         f.render_widget(
-            Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false },
+            Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false, beats: s.show_grid },
             zoom_inner,
         );
         f.render_widget(
-            Wave { track, s, start: 0.0, end: track.duration(), dim_played: true },
+            Wave { track, s, start: 0.0, end: track.duration(), dim_played: true, beats: false },
             overview_inner,
         );
     } else {
@@ -160,12 +164,30 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         Some(bpm) => {
             let heard = bpm * (1.0 + s.tempo / 100.0);
             spans.push(Span::styled(format!("{heard:.1}"), Style::new().bold()));
-            if s.bpm_tapped {
-                spans.push(Span::styled(" TAP", Style::new().fg(Color::Cyan)));
+            if s.grid_edited {
+                spans.push(Span::styled(" GRID", Style::new().fg(GRID_COLOR)));
             }
         }
         None => spans.push(Span::styled("---.-", Style::new().fg(DIM))),
     }
+    if let (Some(g), Some(t)) = (s.grid, &s.track)
+        && s.show_grid
+    {
+        let (bar, beat) = g.bar_beat(s.pos, t.sample_rate as f64);
+        spans.push(Span::styled("   BAR ", Style::new().fg(DIM)));
+        spans.push(Span::styled(format!("{bar}.{beat} "), Style::new().bold()));
+        for b in 1..=4 {
+            let lit = Style::new().fg(if beat == 1 { Color::Red } else { GRID_COLOR });
+            spans.push(if b == beat { Span::styled("■", lit) } else { Span::styled("□", Style::new().fg(DIM)) });
+        }
+    }
+    spans.push(Span::raw("    "));
+    let q_style = match (s.quantize, s.grid.is_some()) {
+        (true, _) => Style::new().fg(Color::Black).bg(GRID_COLOR).bold(),
+        (false, true) => Style::new().fg(DIM),
+        (false, false) => Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
+    };
+    spans.push(Span::styled(" QUANTIZE ", q_style));
 
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
@@ -181,12 +203,15 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     } else {
         Span::styled(" PLAY", Style::new().fg(DIM))
     }];
+    // A hot cue waiting for the beat blinks with the beats.
+    let blink = s.grid.is_some_and(|g| g.beat_at(s.pos, sr).rem_euclid(1.0) < 0.5);
     for (i, hot) in s.hot.iter().enumerate() {
         let letter = (b'A' + i as u8) as char;
         match hot {
             Some(h) => {
                 let kind = if h.loop_out.is_some() { "⟲" } else { "" };
-                spans.push(Span::styled(format!(" {letter} "), Style::new().fg(Color::Black).bg(HOT_COLOR).bold()));
+                let bg = if s.pending_hot == Some(i) && blink { AMBER } else { HOT_COLOR };
+                spans.push(Span::styled(format!(" {letter} "), Style::new().fg(Color::Black).bg(bg).bold()));
                 spans.push(Span::styled(format!(" {}{kind}  ", short_time(h.pos / sr)), Style::new().fg(HOT_COLOR)));
             }
             None => spans.push(Span::styled(format!(" {letter} ----  "), Style::new().fg(DIM))),
@@ -198,6 +223,9 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     spans.push(Span::styled(" LOOP ", loop_style));
     if s.loop_adjust {
         spans.push(Span::styled(" OUT ADJ ", Style::new().fg(Color::Black).bg(Color::Yellow).bold()));
+    }
+    if s.grid_adjust {
+        spans.push(Span::styled(" GRID ADJ ", Style::new().fg(Color::Black).bg(GRID_COLOR).bold()));
     }
     match (s.loop_in, s.loop_out) {
         (Some(a), Some(b)) => {
@@ -232,7 +260,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
         None => Line::from(Span::styled(
-            " Space play  C cue  1-3 hot cue  I/O/P loop  L auto loop  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
+            " Space play  C cue  1-3 hot cue  I/O/P loop  L auto loop  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
             Style::new().fg(DIM),
         )),
     };
@@ -286,7 +314,7 @@ fn draw_help(f: &mut Frame) {
         ("Space", "Play / Pause"),
         ("C", "Cue — playing: back to cue & pause · paused: set cue · hold on cue: preview"),
         ("Space while holding C", "Keep playing after releasing Cue"),
-        ("1 2 3", "Hot cue A/B/C: jump & play · in REC mode: store (stores loops too)"),
+        ("1 2 3", "Hot cue A/B/C: jump & play (on the next beat when quantizing) · REC mode: store"),
         ("E", "Hot cue REC / PLAY mode"),
         ("Shift+1 2 3", "Clear hot cue (REC mode only)"),
         ("I / O / P", "Loop in / Loop out / Reloop-Exit"),
@@ -298,11 +326,14 @@ fn draw_help(f: &mut Frame) {
         ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
         ("M", "Master Tempo (key lock)"),
         (", / .", "Jog: hold to slow/speed up · paused: 1 frame (Shift: strong / 1 beat)"),
+        ("Q", "Quantize this track: cues, loops and jumps go on the beat"),
+        ("A / Shift+A", "Tap BPM (playing: the beats go on the taps) / back to the detected grid"),
+        ("D", "Make the playhead beat 1 of a bar"),
+        ("Y", "Grid adjust: , / . shift the beats 1 ms (Shift 10) · ↑/↓ BPM ±0.01 (Shift 0.1)"),
         ("← / →", "Search (hold) · Shift: super fast search"),
         ("B / N", "Previous / next track in folder"),
         ("R", "Reverse"),
         ("T / Shift+T", "Elapsed / remaining time · Auto Cue on/off"),
-        ("A / Shift+A", "Tap BPM / back to detected BPM"),
         ("S / V", "Cycle start / brake time"),
         ("Tab", "Browse files; type to filter the folder"),
         ("Ctrl+C", "Quit (cue memory is saved)"),
@@ -335,6 +366,8 @@ struct Wave<'a> {
     start: f64,
     end: f64,
     dim_played: bool,
+    /// Shade the columns where beats and bars start.
+    beats: bool,
 }
 
 impl Widget for Wave<'_> {
@@ -355,6 +388,13 @@ impl Widget for Wave<'_> {
         let loop_range = match (self.s.loop_in, self.s.loop_out) {
             (Some(a), Some(b)) => Some((a / sr, b / sr)),
             _ => None,
+        };
+        let grid = self.s.grid.filter(|g| self.beats && g.period(sr) / sr > 2.0 * per_col);
+        // Whether a beat starts in [t0, t1), and if it is a downbeat.
+        let tick = |t0: f64, t1: f64| -> Option<bool> {
+            let g = grid?;
+            let n = g.beat_at(t0 * sr, sr).ceil();
+            (g.beat_pos(n, sr) < t1 * sr).then_some(n.rem_euclid(4.0) == 0.0)
         };
 
         for x in 0..w {
@@ -385,10 +425,16 @@ impl Widget for Wave<'_> {
                 let fill = eighths.saturating_sub(from_bottom * 8).min(8);
                 if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + row as u16)) {
                     cell.set_char(BARS[fill]).set_fg(color);
-                    if in_loop && self.s.looping {
-                        cell.set_bg(LOOP_BG);
-                    } else if in_loop {
-                        cell.set_bg(Color::Rgb(30, 40, 25));
+                    let bg = match (in_loop, tick(t0, t1)) {
+                        (true, Some(_)) if self.s.looping => Some(Color::Rgb(70, 115, 45)),
+                        (true, _) if self.s.looping => Some(LOOP_BG),
+                        (true, _) => Some(Color::Rgb(30, 40, 25)),
+                        (false, Some(true)) => Some(BAR_BG),
+                        (false, Some(false)) => Some(BEAT_BG),
+                        (false, None) => None,
+                    };
+                    if let Some(bg) = bg {
+                        cell.set_bg(bg);
                     }
                 }
             }

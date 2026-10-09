@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::grid::BeatGrid;
 use crate::track::Track;
 
 const VERSION: u32 = 1;
@@ -34,14 +35,32 @@ pub struct TrackMemory {
     pub memories: Vec<Cue>,
     pub loop_in: Option<f64>,
     pub loop_out: Option<f64>,
-    /// Tapped BPM, overriding detection.
+    /// The beat grid as the user set it, overriding detection.
+    pub grid: Option<BeatGrid>,
+    /// BPM tapped before odj had beat grids; `grid` gives it the detected phase.
     pub bpm: Option<f64>,
+    /// Quantize turned on or off for this track, overriding the default.
+    pub quantize: Option<bool>,
 }
 
 impl TrackMemory {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The track's grid: the user's, else the detected one with any old tapped BPM.
+    pub fn grid(&self, track: &Track) -> Option<BeatGrid> {
+        user_grid(self.grid, self.bpm, track)
+    }
+}
+
+/// The grid of a track given the user's grid and old tapped BPM from its memory.
+pub fn user_grid(grid: Option<BeatGrid>, tapped_bpm: Option<f64>, track: &Track) -> Option<BeatGrid> {
+    grid.or_else(|| {
+        let bpm = tapped_bpm?;
+        let anchor = track.grid.map_or(track.first_sound, |g| g.anchor);
+        Some(BeatGrid { bpm, anchor })
+    })
 }
 
 /// A track's entry in the library, as its file stores it.
@@ -80,8 +99,14 @@ struct TrackFile {
     title: String,
     artist: Option<String>,
     sample_rate: u32,
-    #[serde(default)]
+    /// Only written once the user has corrected the detected grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grid: Option<BeatGrid>,
+    /// Tapped BPM of older versions, read into `grid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     bpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quantize: Option<bool>,
     /// Hot cues and memory points, by position.
     #[serde(default)]
     cues: Vec<CueEntry>,
@@ -114,7 +139,9 @@ impl TrackFile {
             title: track.title.clone(),
             artist: track.artist.clone(),
             sample_rate: track.sample_rate,
+            grid: mem.grid,
             bpm: mem.bpm,
+            quantize: mem.quantize,
             cues,
             current_loop: mem.loop_in.map(|pos| Cue { pos, loop_out: mem.loop_out }),
         }
@@ -122,7 +149,9 @@ impl TrackFile {
 
     fn memory(&self) -> TrackMemory {
         let mut mem = TrackMemory {
+            grid: self.grid,
             bpm: self.bpm,
+            quantize: self.quantize,
             loop_in: self.current_loop.map(|l| l.pos),
             loop_out: self.current_loop.and_then(|l| l.loop_out),
             ..TrackMemory::default()
@@ -282,7 +311,9 @@ mod tests {
             memories: vec![Cue { pos: 10.0, loop_out: None }, Cue { pos: 200.0, loop_out: Some(300.0) }],
             loop_in: Some(200.0),
             loop_out: Some(300.0),
-            bpm: Some(124.0),
+            grid: Some(BeatGrid { bpm: 124.5, anchor: 1_234.5 }),
+            bpm: None,
+            quantize: Some(false),
         }
     }
 
@@ -302,6 +333,25 @@ mod tests {
         assert_eq!(cues, [(10.0, None), (50.0, Some(2)), (100.0, Some(0)), (200.0, None)]);
         let json = serde_json::to_string(&file).unwrap();
         assert!(json.contains(r#""loop":{"pos":200.0,"loop_out":300.0}"#), "{json}");
+    }
+
+    #[test]
+    fn old_tapped_bpm_gets_the_detected_phase() {
+        let json = r#"{"version":1,"id":"ab88","path":"/a","title":"T","artist":null,"sample_rate":44100,"bpm":126.0}"#;
+        let file: TrackFile = serde_json::from_str(json).unwrap();
+        let mem = file.memory();
+        let mut t = track("ab88", "/a");
+        t.grid = Some(BeatGrid { bpm: 125.7, anchor: 300.0 });
+        assert_eq!(mem.grid(&t), Some(BeatGrid { bpm: 126.0, anchor: 300.0 }));
+        t.grid = None;
+        t.first_sound = 42.0;
+        assert_eq!(mem.grid(&t), Some(BeatGrid { bpm: 126.0, anchor: 42.0 }));
+        // Once the deck saves it as a grid, the old field is gone.
+        let saved = TrackMemory { grid: mem.grid(&t), bpm: None, ..mem };
+        let json = serde_json::to_string(&TrackFile::new(&t, &saved)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["grid"], serde_json::json!({"bpm": 126.0, "anchor": 42.0}));
+        assert!(v.get("bpm").is_none(), "{json}");
     }
 
     #[test]

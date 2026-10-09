@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use odj_core::audio::Source;
+use odj_core::grid::BeatGrid;
 use odj_core::memory::{Cue, MAX_MEMORIES, TrackMemory};
 use odj_core::track::Track;
 
@@ -17,6 +18,8 @@ const XFADE: usize = 96;
 const MAX_BLOCK: usize = 4096;
 /// CD frames per second, the unit of the paused jog and the time display.
 pub const CD_FRAMES: f64 = 75.0;
+/// A quantized jump pressed this soon after a beat goes at once, as if on it.
+const LATE_SECONDS: f64 = 0.02;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TempoRange {
@@ -55,6 +58,16 @@ impl TempoRange {
     }
 }
 
+/// A jump waiting for the next beat, so a quantized deck stays in phase.
+#[derive(Clone, Copy)]
+struct Pending {
+    to: f64,
+    /// Loops from `to` to here once there.
+    loop_out: Option<f64>,
+    /// The hot cue that asked for it.
+    hot: Option<usize>,
+}
+
 /// What the UI needs to draw a frame, copied out so rendering never holds the lock.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -79,7 +92,15 @@ pub struct Snapshot {
     pub start_time: f64,
     pub brake_time: f64,
     pub bpm: Option<f64>,
-    pub bpm_tapped: bool,
+    pub grid: Option<BeatGrid>,
+    /// The grid was set by hand rather than detected.
+    pub grid_edited: bool,
+    /// The beats are worth drawing: steady, or the user cares about the grid.
+    pub show_grid: bool,
+    pub grid_adjust: bool,
+    pub quantize: bool,
+    /// A hot cue waiting for the next beat.
+    pub pending_hot: Option<usize>,
     pub loop_beats: Option<f64>,
 }
 
@@ -111,7 +132,13 @@ pub struct Deck {
     loop_adjust: bool,
     pub start_time: f64,
     pub brake_time: f64,
-    bpm_override: Option<f64>,
+    /// The user's grid, overriding detection.
+    grid_override: Option<BeatGrid>,
+    /// Quantize as the user set it for this track, overriding the default.
+    quantize_override: Option<bool>,
+    /// The jog keys shift the grid and the tempo keys change its BPM.
+    grid_adjust: bool,
+    pending: Option<Pending>,
     xfade: Option<(f64, usize)>,
     gain: f32,
     stretch: Option<Stretcher>,
@@ -148,7 +175,10 @@ impl Deck {
             loop_adjust: false,
             start_time: 0.0,
             brake_time: 0.25,
-            bpm_override: None,
+            grid_override: None,
+            quantize_override: None,
+            grid_adjust: false,
+            pending: None,
             xfade: None,
             gain: 0.0,
             stretch: Stretcher::new(out_rate, MAX_BLOCK),
@@ -184,7 +214,16 @@ impl Deck {
             start_time: self.start_time,
             brake_time: self.brake_time,
             bpm: self.bpm(),
-            bpm_tapped: self.bpm_override.is_some(),
+            grid: self.grid(),
+            grid_edited: self.grid_override.is_some(),
+            show_grid: self.grid().is_some()
+                && (self.track.as_ref().is_some_and(|t| t.steady)
+                    || self.grid_override.is_some()
+                    || self.quantize()
+                    || self.grid_adjust),
+            grid_adjust: self.grid_adjust,
+            quantize: self.quantize(),
+            pending_hot: self.pending.and_then(|p| p.hot),
             loop_beats: self.loop_beats(),
         }
     }
@@ -198,7 +237,10 @@ impl Deck {
         self.memories = mem.memories.clone();
         self.loop_in = mem.loop_in;
         self.loop_out = mem.loop_out;
-        self.bpm_override = mem.bpm;
+        self.grid_override = mem.grid(&track);
+        self.quantize_override = mem.quantize;
+        self.grid_adjust = false;
+        self.pending = None;
         self.looping = false;
         self.loop_adjust = false;
         self.playing = false;
@@ -216,12 +258,22 @@ impl Deck {
             memories: self.memories.clone(),
             loop_in: self.loop_in,
             loop_out: self.loop_out,
-            bpm: self.bpm_override,
+            grid: self.grid_override,
+            bpm: None,
+            quantize: self.quantize_override,
         }
     }
 
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    pub fn is_reverse(&self) -> bool {
+        self.reverse
+    }
+
+    pub fn position(&self) -> f64 {
+        self.pos
     }
 
     fn sample_rate(&self) -> f64 {
@@ -240,26 +292,30 @@ impl Deck {
         1.0 + self.tempo / 100.0
     }
 
-    /// The track's own BPM (tapped or detected), before the pitch fader.
+    /// The beat grid: the user's, else the detected one.
+    pub fn grid(&self) -> Option<BeatGrid> {
+        self.grid_override.or(self.track.as_ref()?.grid)
+    }
+
+    /// The track's own BPM, before the pitch fader.
     pub fn bpm(&self) -> Option<f64> {
-        self.bpm_override.or(self.track.as_ref().and_then(|t| t.bpm))
-    }
-
-    /// Sets the BPM from a tapped tempo, which is heard after the pitch fader.
-    pub fn set_tapped_bpm(&mut self, heard: f64) {
-        self.bpm_override = Some(heard / self.tempo_factor());
-    }
-
-    pub fn clear_tapped_bpm(&mut self) {
-        self.bpm_override = None;
+        self.grid().map(|g| g.bpm)
     }
 
     fn beat_frames(&self) -> Option<f64> {
-        self.bpm().map(|bpm| 60.0 / bpm * self.sample_rate())
+        self.grid().map(|g| g.period(self.sample_rate()))
     }
 
     pub fn stretch_latency_ms(&self) -> Option<f64> {
         self.stretch.as_ref().map(|s| s.latency() as f64 * 1000.0 / self.out_rate as f64)
+    }
+
+    /// Where a quantized action lands: the nearest beat, or `pos` itself.
+    fn snap(&self, pos: f64) -> f64 {
+        match self.grid() {
+            Some(g) if self.quantize() => g.nearest(pos, self.sample_rate()).clamp(0.0, self.last_frame()),
+            _ => pos,
+        }
     }
 
     fn jump(&mut self, to: f64) {
@@ -292,6 +348,9 @@ impl Deck {
             return;
         }
         self.playing = !self.playing;
+        if !self.playing {
+            self.pending = None;
+        }
     }
 
     /// The cue button. `can_hold` is false when key releases can't be seen,
@@ -300,6 +359,7 @@ impl Deck {
         if self.track.is_none() || self.cue_preview {
             return;
         }
+        self.pending = None;
         if self.playing {
             self.jump(self.cue);
             self.stop_now();
@@ -310,7 +370,8 @@ impl Deck {
                 self.start_now();
             }
         } else {
-            self.cue = self.pos;
+            self.cue = self.snap(self.pos);
+            self.pos = self.cue;
         }
     }
 
@@ -337,9 +398,17 @@ impl Deck {
         }
     }
 
-    pub fn step_beats_paused(&mut self, beats: f64) {
-        let frames = self.beat_frames().unwrap_or(self.sample_rate());
-        self.step_paused(beats * frames * CD_FRAMES / self.sample_rate());
+    /// Moves the paused playhead by beats: along the grid when quantizing.
+    pub fn step_beats_paused(&mut self, beats: i64) {
+        match self.grid() {
+            Some(g) if self.quantize() && !self.playing => {
+                self.pos = g.step(self.pos, beats, self.sample_rate()).clamp(0.0, self.last_frame());
+            }
+            _ => {
+                let frames = self.beat_frames().unwrap_or(self.sample_rate());
+                self.step_paused(beats as f64 * frames * CD_FRAMES / self.sample_rate());
+            }
+        }
     }
 
     // --- Hot cues ----------------------------------------------------------
@@ -351,25 +420,53 @@ impl Deck {
         }
         self.hot[i] = Some(match (self.looping, self.loop_in, self.loop_out) {
             (true, Some(pos), Some(out)) => Cue { pos, loop_out: Some(out) },
-            _ => Cue { pos: self.pos, loop_out: None },
+            _ => Cue { pos: self.snap(self.pos), loop_out: None },
         });
     }
 
     /// Jumps to a hot cue and plays. Returns false if the slot is empty.
+    /// Quantized while playing, the jump waits for the next beat.
     pub fn hot_cue(&mut self, i: usize) -> bool {
         let Some(h) = self.hot[i] else { return false };
         self.cue_preview = false;
-        self.jump(h.pos);
-        if let Some(out) = h.loop_out {
-            self.loop_in = Some(h.pos);
-            self.loop_out = Some(out);
-            self.looping = true;
-        } else {
-            self.looping = false;
-        }
         self.loop_adjust = false;
-        self.start_now();
+        if self.playing {
+            self.jump_in_phase(h.pos, h.loop_out, Some(i));
+        } else {
+            self.pending = None;
+            self.enter(h.pos, h.loop_out, 0.0);
+            self.start_now();
+        }
         true
+    }
+
+    /// Jumps now, or when quantizing, on the next beat; a beat that has only
+    /// just gone counts as now, the jump landing as far past `to`.
+    fn jump_in_phase(&mut self, to: f64, loop_out: Option<f64>, hot: Option<usize>) {
+        self.pending = None;
+        if let Some(g) = self.grid().filter(|_| self.quantize()) {
+            let sr = self.sample_rate();
+            let late = self.pos - g.beat_pos(g.beat_at(self.pos, sr).floor(), sr);
+            if self.reverse || late >= LATE_SECONDS * sr {
+                self.pending = Some(Pending { to, loop_out, hot });
+                return;
+            }
+            return self.enter(to, loop_out, late);
+        }
+        self.enter(to, loop_out, 0.0);
+    }
+
+    /// Goes to `to` plus `offset`, looping to `loop_out` if given.
+    fn enter(&mut self, to: f64, loop_out: Option<f64>, offset: f64) {
+        match loop_out {
+            Some(out) => {
+                self.loop_in = Some(to);
+                self.loop_out = Some(out);
+                self.looping = true;
+            }
+            None => self.looping = false,
+        }
+        self.jump(to + offset);
     }
 
     pub fn clear_hot_cue(&mut self, i: usize) {
@@ -405,6 +502,7 @@ impl Deck {
         };
         let m = self.memories[i];
         self.cue_preview = false;
+        self.pending = None;
         self.jump(m.pos);
         self.stop_now();
         self.cue = m.pos;
@@ -431,47 +529,69 @@ impl Deck {
         if self.track.is_none() {
             return;
         }
-        self.loop_in = Some(self.pos);
+        let at = self.snap(self.pos);
+        self.loop_in = Some(at);
         self.loop_out = None;
         self.looping = false;
         self.loop_adjust = false;
-        self.cue = self.pos;
+        self.cue = at;
     }
 
     /// Sets the loop out point, or while looping toggles out-point adjustment.
+    /// Quantized, it goes on the nearest beat at least a beat after the in point.
     pub fn loop_out(&mut self) {
         if self.looping && self.loop_out.is_some() {
             self.loop_adjust = !self.loop_adjust;
+            self.grid_adjust &= !self.loop_adjust;
             return;
         }
         let Some(start) = self.loop_in else { return };
-        if self.pos > start + self.sample_rate() * 0.01 {
-            self.loop_out = Some(self.pos);
-            self.looping = true;
-            self.jump(start);
+        match self.beat_frames().filter(|_| self.quantize()) {
+            Some(beat) => {
+                if self.pos + beat / 2.0 < start || start + beat > self.last_frame() {
+                    return;
+                }
+                let end = self.snap(self.pos).max(start + beat);
+                self.loop_out = Some(end);
+                self.looping = true;
+                // Past the out point already: carry on from as far into the loop.
+                if self.pos >= end {
+                    self.jump(start + (self.pos - end));
+                }
+            }
+            None if self.pos > start + self.sample_rate() * 0.01 => {
+                self.loop_out = Some(self.pos);
+                self.looping = true;
+                self.jump(start);
+            }
+            None => {}
         }
     }
 
+    /// Exits the loop, or goes back into the last one (on the beat when quantizing).
     pub fn reloop_exit(&mut self) {
         self.loop_adjust = false;
         if self.looping {
             self.looping = false;
-        } else if let (Some(start), Some(_)) = (self.loop_in, self.loop_out) {
-            self.looping = true;
-            self.jump(start);
+            self.pending = None;
+        } else if let (Some(start), Some(end)) = (self.loop_in, self.loop_out) {
+            if self.playing {
+                self.jump_in_phase(start, Some(end), None);
+            } else {
+                self.enter(start, Some(end), 0.0);
+            }
         }
     }
 
+    /// A loop of `beats` from the playhead, or quantized, from the nearest beat.
     pub fn auto_loop(&mut self, beats: f64) -> bool {
         let Some(beat) = self.beat_frames() else { return false };
-        if self.track.is_none() {
-            return false;
-        }
-        let end = (self.pos + beats * beat).min(self.last_frame());
-        self.loop_in = Some(self.pos);
+        let start = self.snap(self.pos);
+        let end = (start + beats * beat).min(self.last_frame());
+        self.loop_in = Some(start);
         self.loop_out = Some(end);
         self.looping = true;
-        self.cue = self.pos;
+        self.cue = start;
         true
     }
 
@@ -509,6 +629,100 @@ impl Deck {
     pub fn loop_beats(&self) -> Option<f64> {
         let (start, end) = (self.loop_in?, self.loop_out?);
         Some((end - start) / self.beat_frames()?)
+    }
+
+    // --- Beat grid and quantize ------------------------------------------------
+
+    pub fn quantize(&self) -> bool {
+        let steady = self.track.as_ref().is_some_and(|t| t.steady);
+        self.grid().is_some() && self.quantize_override.unwrap_or(steady)
+    }
+
+    /// Turns quantize on or off for this track; None without a grid.
+    pub fn toggle_quantize(&mut self) -> Option<bool> {
+        self.grid()?;
+        let on = !self.quantize();
+        self.quantize_override = Some(on);
+        if !on {
+            self.pending = None;
+        }
+        Some(on)
+    }
+
+    /// Sets the BPM from a tempo tapped while paused, heard after the pitch
+    /// fader; the beat nearest the playhead stays where it is.
+    pub fn set_tapped_bpm(&mut self, heard: f64) {
+        let bpm = heard / self.tempo_factor();
+        let sr = self.sample_rate();
+        let grid = match self.grid() {
+            Some(g) => g.with_bpm(bpm, self.pos, sr),
+            None => BeatGrid { bpm, anchor: self.pos },
+        };
+        self.grid_override = Some(grid);
+    }
+
+    /// Sets the grid from taps along the track, at least two, the last on a
+    /// beat; the bars keep their place. Returns the BPM as heard.
+    pub fn set_tapped_beats(&mut self, taps: &[f64]) -> Option<f64> {
+        let n = taps.len() as f64;
+        let mk = (n - 1.0) / 2.0;
+        let mt = taps.iter().sum::<f64>() / n;
+        let var: f64 = (0..taps.len()).map(|k| (k as f64 - mk).powi(2)).sum();
+        let cov: f64 = taps.iter().enumerate().map(|(k, t)| (k as f64 - mk) * (t - mt)).sum();
+        let period = cov / var;
+        if !period.is_finite() || period <= 0.0 {
+            return None;
+        }
+        let sr = self.sample_rate();
+        let last = mt + period * (n - 1.0 - mk);
+        let bpm = 60.0 * sr / period;
+        let bar_phase = self.grid().map_or(0.0, |g| g.beat_at(last, sr).round().rem_euclid(4.0));
+        self.grid_override = Some(BeatGrid { bpm, anchor: last - bar_phase * period });
+        Some(bpm * self.tempo_factor())
+    }
+
+    /// Makes the playhead beat 1 of a bar. False without a grid.
+    pub fn set_downbeat(&mut self) -> bool {
+        let Some(g) = self.grid() else { return false };
+        self.grid_override = Some(BeatGrid { anchor: self.pos, ..g });
+        true
+    }
+
+    /// Back to the detected grid.
+    pub fn reset_grid(&mut self) {
+        self.grid_override = None;
+    }
+
+    /// Enters or leaves grid adjustment; false without a grid.
+    pub fn toggle_grid_adjust(&mut self) -> bool {
+        if self.grid().is_none() {
+            self.grid_adjust = false;
+            return false;
+        }
+        self.grid_adjust = !self.grid_adjust;
+        self.loop_adjust &= !self.grid_adjust;
+        true
+    }
+
+    pub fn is_adjusting_grid(&self) -> bool {
+        self.grid_adjust
+    }
+
+    /// Moves the grid later (positive) or earlier.
+    pub fn shift_grid(&mut self, ms: f64) {
+        if let Some(g) = self.grid() {
+            self.grid_override = Some(g.shifted(ms * self.sample_rate() / 1000.0));
+        }
+    }
+
+    /// Changes the grid's BPM, keeping the beat nearest the playhead in place.
+    pub fn nudge_grid_bpm(&mut self, delta: f64) {
+        if let Some(g) = self.grid() {
+            let bpm = ((g.bpm + delta) * 1000.0).round() / 1000.0;
+            if bpm > 20.0 {
+                self.grid_override = Some(g.with_bpm(bpm, self.pos, self.sample_rate()));
+            }
+        }
     }
 
     // --- Tempo ---------------------------------------------------------------
@@ -630,6 +844,8 @@ impl Deck {
             if seconds <= 0.0 { f64::INFINITY } else { 1.0 / (seconds * self.out_rate as f64) }
         };
         let (up, down) = (ramp(self.start_time), ramp(self.brake_time));
+        let grid = self.grid();
+        let track_rate = track.sample_rate as f64;
 
         for i in 0..l.len() {
             if self.speed != target {
@@ -663,6 +879,15 @@ impl Deck {
 
             let prev = self.pos;
             self.pos += step;
+            if let (Some(p), Some(g)) = (self.pending, grid) {
+                let (b0, b1) = (g.beat_at(prev, track_rate).floor(), g.beat_at(self.pos, track_rate).floor());
+                if b0 != b1 {
+                    let beat = g.beat_pos(b0.max(b1), track_rate);
+                    self.pending = None;
+                    self.enter(p.to, p.loop_out, self.pos - beat);
+                    continue;
+                }
+            }
             if self.looping
                 && let (Some(start), Some(end)) = (self.loop_in, self.loop_out)
             {
@@ -718,12 +943,181 @@ mod tests {
 
     const SR: u32 = 48_000;
 
+    /// A steady 120 BPM track, beats at 0.25 s + n × 0.5 s, unquantized.
     fn deck() -> Deck {
+        deck_with(Some(false))
+    }
+
+    fn deck_with(quantize: Option<bool>) -> Deck {
         let samples = click_track(120.0, 20.0, SR);
         let track = Track::from_samples("t".into(), "t".into(), None, SR, samples);
         let mut d = Deck::new(SR);
-        d.load(Arc::new(track), &TrackMemory::default(), false);
+        d.load(Arc::new(track), &TrackMemory { quantize, ..TrackMemory::default() }, false);
         d
+    }
+
+    /// Frame of beat `n` of the test track.
+    fn beat(n: f64) -> f64 {
+        (0.25 + 0.5 * n) * SR as f64
+    }
+
+    /// Distance from `pos` to the nearest beat, in ms.
+    fn off_beat(pos: f64) -> f64 {
+        let b = ((pos / SR as f64 - 0.25) / 0.5).round();
+        (pos - beat(b)) / SR as f64 * 1000.0
+    }
+
+    #[test]
+    fn steady_tracks_quantize_by_default() {
+        let mut d = deck_with(None);
+        assert!(d.track.as_ref().unwrap().steady && d.quantize());
+        assert_eq!(d.toggle_quantize(), Some(false));
+        assert_eq!(d.memory().quantize, Some(false), "the choice is remembered");
+        let mut d = Deck::new(SR);
+        assert_eq!(d.toggle_quantize(), None, "nothing to quantize to");
+    }
+
+    #[test]
+    fn quantized_cues_and_loops_land_on_beats() {
+        let mut d = deck_with(Some(true));
+        d.step_paused(80.0); // 1.067 s, nearest beat 1.25 s
+        d.cue_down(true);
+        assert!(off_beat(d.cue).abs() < 1.0 && d.pos == d.cue, "cue {}", d.cue);
+        d.step_paused(-10.0);
+        d.set_hot_cue(0);
+        assert!(off_beat(d.hot[0].unwrap().pos).abs() < 1.0);
+
+        d.step_paused(37.0);
+        d.play_pause();
+        d.loop_in();
+        assert!(off_beat(d.loop_in.unwrap()).abs() < 1.0);
+        run(&mut d, 30_000); // less than a beat on: the loop is still a beat long
+        d.loop_out();
+        assert!((d.loop_beats().unwrap() - 1.0).abs() < 1e-3, "{:?}", d.loop_beats());
+        d.reloop_exit();
+        d.step_paused(0.0);
+        assert!(d.auto_loop(4.0));
+        assert!(off_beat(d.loop_in.unwrap()).abs() < 1.0);
+        assert!((d.loop_beats().unwrap() - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn quantized_beat_steps_follow_the_grid() {
+        let mut d = deck_with(Some(true));
+        d.step_beats_paused(1);
+        assert!(off_beat(d.pos).abs() < 1.0 && (d.pos - beat(0.0)).abs() < 50.0, "pos {}", d.pos);
+        d.step_beats_paused(2);
+        assert!((d.pos - beat(2.0)).abs() < 50.0);
+        d.step_beats_paused(-1);
+        assert!((d.pos - beat(1.0)).abs() < 50.0);
+    }
+
+    #[test]
+    fn quantized_hot_cue_waits_for_the_beat() {
+        let mut d = deck_with(Some(true));
+        d.step_paused(150.0);
+        d.set_hot_cue(0); // 2.25 s
+        let cue = d.hot[0].unwrap().pos;
+        d.step_paused(-150.0);
+        d.play_pause();
+        run(&mut d, 30_000); // 0.625 s: past beat 0.25 s, before 0.75 s
+        assert!(d.hot_cue(0));
+        assert_eq!(d.snapshot().pending_hot, Some(0));
+        assert!(d.pos < beat(1.0), "nothing happens before the beat");
+        run(&mut d, 12_000); // 0.875 s: the beat at 0.75 s went by
+        assert_eq!(d.snapshot().pending_hot, None);
+        // Landed on the cue at the beat and played on in phase.
+        let expected = cue + (0.875 - 0.75) * SR as f64;
+        assert!((d.pos - expected).abs() < 2.0, "pos {} expected {expected}", d.pos);
+        assert!(off_beat(d.pos - (expected - cue)).abs() < 1.0);
+    }
+
+    #[test]
+    fn quantized_hot_cue_just_after_a_beat_goes_at_once() {
+        let mut d = deck_with(Some(true));
+        d.step_paused(150.0);
+        d.set_hot_cue(0);
+        let cue = d.hot[0].unwrap().pos;
+        d.step_paused(-150.0);
+        d.play_pause();
+        run(&mut d, 12_480); // 0.26 s: 10 ms after the beat at 0.25 s
+        assert!(d.hot_cue(0));
+        assert!(d.pending.is_none());
+        assert!((d.pos - (cue + 480.0)).abs() < 2.0, "pos {}", d.pos);
+    }
+
+    #[test]
+    fn unquantized_hot_cue_jumps_at_once() {
+        let mut d = deck();
+        d.step_paused(150.0);
+        d.set_hot_cue(0);
+        d.step_paused(-150.0);
+        d.play_pause();
+        run(&mut d, 30_000);
+        d.hot_cue(0);
+        assert_eq!(d.pos, 2.0 * SR as f64);
+    }
+
+    #[test]
+    fn pending_jump_is_dropped_by_pause_and_cue() {
+        let mut d = deck_with(Some(true));
+        d.step_paused(150.0);
+        d.set_hot_cue(0);
+        d.step_paused(-150.0);
+        d.play_pause();
+        run(&mut d, 30_000);
+        d.hot_cue(0);
+        d.play_pause();
+        assert!(d.pending.is_none());
+        d.play_pause();
+        d.hot_cue(0);
+        d.cue_down(true);
+        assert!(d.pending.is_none());
+    }
+
+    #[test]
+    fn grid_edits_move_the_beats() {
+        let mut d = deck();
+        let detected = d.grid().unwrap();
+        d.step_paused(100.0);
+        assert!(d.set_downbeat());
+        let g = d.grid().unwrap();
+        assert_eq!(g.bar_beat(d.pos, SR as f64), (1, 1));
+        assert_eq!(g.bpm, detected.bpm);
+        assert_eq!(d.memory().grid, Some(g), "edits are saved");
+
+        assert!(d.toggle_grid_adjust());
+        d.shift_grid(10.0);
+        assert!((d.grid().unwrap().anchor - (g.anchor + 480.0)).abs() < 1e-6);
+        d.nudge_grid_bpm(0.5);
+        assert_eq!(d.grid().unwrap().bpm, detected.bpm + 0.5);
+        d.reset_grid();
+        assert_eq!(d.grid(), Some(detected));
+        assert_eq!(d.memory().grid, None);
+    }
+
+    #[test]
+    fn taps_while_playing_place_the_beats() {
+        let mut d = deck();
+        // Taps at 100 BPM, 20 ms after the beats of the 120 BPM track would be.
+        let taps: Vec<f64> = (0..6).map(|k| 1.0 * SR as f64 + k as f64 * 0.6 * SR as f64).collect();
+        d.move_tempo(200.0); // heard 10% faster
+        let heard = d.set_tapped_beats(&taps).unwrap();
+        assert!((heard - 110.0).abs() < 1e-6);
+        let g = d.grid().unwrap();
+        assert!((g.bpm - 100.0).abs() < 1e-6);
+        assert!((g.nearest(taps[5], SR as f64) - taps[5]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn old_tapped_bpm_keeps_the_detected_phase() {
+        let samples = click_track(120.0, 20.0, SR);
+        let track = Arc::new(Track::from_samples("t".into(), "t".into(), None, SR, samples));
+        let mut d = Deck::new(SR);
+        d.load(track.clone(), &TrackMemory { bpm: Some(121.0), ..TrackMemory::default() }, false);
+        let g = d.grid().unwrap();
+        assert_eq!((g.bpm, g.anchor), (121.0, track.grid.unwrap().anchor));
+        assert_eq!((d.memory().grid, d.memory().bpm), (Some(g), None));
     }
 
     fn run(d: &mut Deck, frames: usize) -> Vec<f32> {
@@ -875,6 +1269,13 @@ mod tests {
         assert!(d.hot_cue(0));
         assert!(d.playing);
         assert_eq!(d.pos, 2.0 * SR as f64);
+    }
+
+    #[test]
+    fn detected_grid_matches_the_track() {
+        let d = deck();
+        assert!(off_beat(d.grid().unwrap().anchor).abs() < 2.0);
+        assert_eq!(d.bpm(), Some(120.0));
     }
 
     #[test]

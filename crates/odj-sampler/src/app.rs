@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use odj_core::grid::{BAR, BeatGrid};
 use odj_core::library::fuzzy_match;
-use odj_core::memory::{Cue, Memory};
+use odj_core::memory::{Cue, Memory, user_grid};
 use odj_core::track::Track;
 
 use crate::engine::{MAX_GAIN_DB, MIN_GAIN_DB, Mode, PADS, Props, Sample, Sampler, cut};
@@ -53,8 +54,10 @@ pub struct CueEntry {
     pub title: String,
     pub artist: Option<String>,
     pub sample_rate: u32,
-    /// Tapped BPM stored with the track.
-    pub bpm: Option<f64>,
+    /// The grid the user set in the player, if any.
+    pub grid: Option<BeatGrid>,
+    /// BPM tapped by an older player.
+    pub tapped_bpm: Option<f64>,
     pub kind: String,
     pub cue: Cue,
     /// What the filter matches: "artist – title".
@@ -102,7 +105,9 @@ impl Picker {
 pub struct Editor {
     pub pad: usize,
     pub source: PadSource,
-    /// Tapped BPM, which wins over the detected one.
+    /// The user's grid from the player, which wins over the detected one.
+    pub user_grid: Option<BeatGrid>,
+    /// BPM tapped by an older player, on the detected phase.
     pub tapped_bpm: Option<f64>,
     pub track: Option<Arc<Track>>,
     loading: Option<mpsc::Receiver<anyhow::Result<Track>>>,
@@ -116,13 +121,19 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn bpm(&self) -> Option<f64> {
-        self.tapped_bpm.or(self.track.as_ref().and_then(|t| t.bpm))
+    pub fn grid(&self) -> Option<BeatGrid> {
+        let track = self.track.as_ref()?;
+        user_grid(self.user_grid, self.tapped_bpm, track).or(track.grid)
+    }
+
+    /// The grid is the user's rather than detected.
+    pub fn grid_edited(&self) -> bool {
+        self.user_grid.is_some() || self.tapped_bpm.is_some()
     }
 
     /// Frames per beat at the track's rate.
     pub fn beat(&self) -> Option<f64> {
-        self.bpm().map(|bpm| 60.0 / bpm * self.source.sample_rate as f64)
+        self.grid().map(|g| g.period(self.source.sample_rate as f64))
     }
 
     pub fn len(&self) -> f64 {
@@ -143,6 +154,15 @@ impl Editor {
     /// Moves whichever end is being edited.
     fn move_edge(&mut self, frames: f64) {
         if self.editing_start { self.move_start(frames) } else { self.move_end(frames) }
+    }
+
+    /// Moves whichever end is being edited `beats` along the grid, onto beats;
+    /// by seconds (a tenth each) without one.
+    fn step_edge(&mut self, beats: i64) {
+        let sr = self.source.sample_rate as f64;
+        let Some(g) = self.grid() else { return self.move_edge(beats as f64 * 0.1 * sr) };
+        let from = if self.editing_start { self.source.start } else { self.source.end };
+        self.move_edge(g.step(from, beats, sr) - from);
     }
 
     fn set_len(&mut self, len: f64) {
@@ -366,11 +386,18 @@ impl App {
                 self.save_kit();
                 self.screen = Screen::Pads;
             }
-            None => self.open_editor(pad, source, e.bpm, false),
+            None => self.open_editor(pad, source, e.grid, e.tapped_bpm, false),
         }
     }
 
-    fn open_editor(&mut self, pad: usize, source: PadSource, tapped_bpm: Option<f64>, end_known: bool) {
+    fn open_editor(
+        &mut self,
+        pad: usize,
+        source: PadSource,
+        user_grid: Option<BeatGrid>,
+        tapped_bpm: Option<f64>,
+        end_known: bool,
+    ) {
         let (tx, rx) = mpsc::channel();
         let path = source.path.clone();
         thread::spawn(move || {
@@ -379,6 +406,7 @@ impl App {
         self.screen = Screen::Editor(Box::new(Editor {
             pad,
             source,
+            user_grid,
             tapped_bpm,
             track: None,
             loading: Some(rx),
@@ -396,8 +424,9 @@ impl App {
             self.set_status(format!("Pad {} is empty, press Enter to assign a cue", i + 1));
             return;
         };
-        let tapped = Memory::load().tracks().into_iter().find(|t| t.id == source.track_id).and_then(|t| t.memory.bpm);
-        self.open_editor(i, source, tapped, true);
+        let mem = Memory::load().tracks().into_iter().find(|t| t.id == source.track_id).map(|t| t.memory);
+        let (grid, bpm) = mem.map_or((None, None), |m| (m.grid, m.bpm));
+        self.open_editor(i, source, grid, bpm, true);
     }
 
     fn finish_editor_load(&mut self) {
@@ -622,18 +651,17 @@ impl App {
             return;
         }
         let sr = ed.source.sample_rate as f64;
-        // Beats and bars with a BPM, tenths and whole seconds without.
-        let (small, big) = match ed.beat() {
-            Some(beat) => (beat, 4.0 * beat),
-            None => (0.1 * sr, sr),
-        };
+        // Beats and bars on the grid, tenths and whole seconds without.
+        let beats = if shift { BAR } else { 1 };
         match code {
             KeyCode::Tab => {
                 ed.editing_start = !ed.editing_start;
                 return;
             }
-            KeyCode::Left => ed.move_edge(-if shift { big } else { small }),
-            KeyCode::Right => ed.move_edge(if shift { big } else { small }),
+            KeyCode::Left if shift && ed.grid().is_none() => ed.move_edge(-sr),
+            KeyCode::Right if shift && ed.grid().is_none() => ed.move_edge(sr),
+            KeyCode::Left => ed.step_edge(-beats),
+            KeyCode::Right => ed.step_edge(beats),
             KeyCode::Char(',') => ed.move_edge(-if shift { 0.001 } else { 0.01 } * sr),
             KeyCode::Char('.') => ed.move_edge(if shift { 0.001 } else { 0.01 } * sr),
             KeyCode::Char('[') => ed.set_len(ed.len() / 2.0),
@@ -683,7 +711,8 @@ fn cue_entries() -> Vec<CueEntry> {
                 title: t.title.clone(),
                 artist: t.artist.clone(),
                 sample_rate: t.sample_rate,
-                bpm: mem.bpm,
+                grid: mem.grid,
+                tapped_bpm: mem.bpm,
                 kind,
                 cue,
                 name: name.clone(),
@@ -840,7 +869,8 @@ mod tests {
         let mut ed = Editor {
             pad: 0,
             source: PadSource { start: 48_000.0, end: 48_000.0, ..source() },
-            tapped_bpm: Some(120.0),
+            user_grid: Some(BeatGrid { bpm: 120.0, anchor: 0.0 }),
+            tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
             end_known: false,
@@ -864,7 +894,8 @@ mod tests {
         let mut ed = Editor {
             pad: 0,
             source: PadSource { start: 48_000.0, end: 96_000.0, ..source() },
-            tapped_bpm: Some(120.0),
+            user_grid: Some(BeatGrid { bpm: 120.0, anchor: 0.0 }),
+            tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
             end_known: true,
@@ -883,6 +914,36 @@ mod tests {
         ed.source.start = 24_000.0;
         ed.set_len(ed.len() / 2.0);
         assert_eq!((ed.source.start, ed.source.end), (24_000.0, 60_000.0));
+    }
+
+    #[test]
+    fn editor_steps_land_on_the_grid() {
+        let track = Track::from_samples("t".into(), "t".into(), None, 48_000, vec![0.0; 48_000 * 20 * 2]);
+        // 120 BPM, a beat every 24 000 frames, from frame 1 000.
+        let mut ed = Editor {
+            pad: 0,
+            source: PadSource { start: 49_000.0, end: 60_000.0, ..source() },
+            user_grid: Some(BeatGrid { bpm: 120.0, anchor: 1_000.0 }),
+            tapped_bpm: None,
+            track: Some(Arc::new(track)),
+            loading: None,
+            end_known: true,
+            editing_start: false,
+            previewing: false,
+            preview_bytes: 0,
+        };
+        ed.step_edge(1);
+        assert_eq!(ed.source.end, 73_000.0, "off the grid, the first step goes to the next beat");
+        ed.step_edge(BAR);
+        assert_eq!(ed.source.end, 169_000.0);
+        ed.step_edge(-1);
+        assert_eq!(ed.source.end, 145_000.0);
+        ed.editing_start = true;
+        ed.step_edge(-1);
+        assert_eq!(ed.source.start, 25_000.0);
+        ed.user_grid = None;
+        ed.step_edge(1);
+        assert_eq!(ed.source.start, 29_800.0, "a tenth of a second without a grid");
     }
 
     /// Draws every screen at a roomy and a cramped size; shown with --nocapture.
@@ -906,7 +967,8 @@ mod tests {
             title: "Title".into(),
             artist: Some("Artist".into()),
             sample_rate: 48_000,
-            bpm: None,
+            grid: None,
+            tapped_bpm: None,
             kind: kind.into(),
             cue,
             name: "Artist – Title".into(),
@@ -919,6 +981,7 @@ mod tests {
         let mut ed = Editor {
             pad: 3,
             source: PadSource { start: 48_000.0, end: 48_000.0, ..source() },
+            user_grid: None,
             tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,

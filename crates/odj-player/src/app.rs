@@ -48,7 +48,8 @@ pub struct App {
     bend_up: Option<Hold>,
     search_back: Option<Hold>,
     search_fwd: Option<Hold>,
-    taps: Vec<Instant>,
+    /// Recent taps, with the playhead at each while playing forward.
+    taps: Vec<(Instant, Option<f64>)>,
     pub quit: bool,
 }
 
@@ -145,7 +146,7 @@ impl App {
             Ok(track) => {
                 self.remember();
                 let mem = self.memory.get(&track);
-                let msg = match track.bpm {
+                let msg = match track.bpm() {
                     Some(bpm) => format!("Loaded {} ({bpm:.1} BPM)", track.title),
                     None => format!("Loaded {} (no BPM found)", track.title),
                 };
@@ -225,12 +226,18 @@ impl App {
         self.apply_holds();
     }
 
+    /// Taps the tempo. While playing, the taps also place the beats, the last
+    /// tap on one; while paused only the BPM changes.
     fn tap(&mut self) {
         let now = Instant::now();
-        if self.taps.last().is_some_and(|&t| now - t > Duration::from_secs(2)) {
+        let pos = {
+            let deck = self.deck();
+            (deck.is_playing() && !deck.is_reverse()).then(|| deck.position())
+        };
+        if self.taps.last().is_some_and(|&(t, p)| now - t > Duration::from_secs(2) || p.is_some() != pos.is_some()) {
             self.taps.clear();
         }
-        self.taps.push(now);
+        self.taps.push((now, pos));
         if self.taps.len() > 8 {
             self.taps.remove(0);
         }
@@ -238,10 +245,21 @@ impl App {
             self.set_status(format!("Tap… {}", self.taps.len()));
             return;
         }
-        let span = (now - self.taps[0]).as_secs_f64();
-        let bpm = 60.0 * (self.taps.len() - 1) as f64 / span;
-        self.deck().set_tapped_bpm(bpm);
-        self.set_status(format!("Tapped {bpm:.1} BPM"));
+        let positions: Option<Vec<f64>> = self.taps.iter().map(|&(_, p)| p).collect();
+        let bpm = match positions {
+            Some(positions) => self.deck().set_tapped_beats(&positions),
+            None => {
+                let span = (now - self.taps[0].0).as_secs_f64();
+                let bpm = 60.0 * (self.taps.len() - 1) as f64 / span;
+                self.deck().set_tapped_bpm(bpm);
+                Some(bpm)
+            }
+        };
+        match bpm {
+            Some(bpm) if pos.is_some() => self.set_status(format!("Tapped {bpm:.1} BPM, beats on the taps")),
+            Some(bpm) => self.set_status(format!("Tapped {bpm:.1} BPM")),
+            None => self.set_status("Tap again"),
+        }
     }
 
     // --- Keys --------------------------------------------------------------------
@@ -312,8 +330,12 @@ impl App {
         // Keys that toggle or trigger ignore auto-repeat; steppers accept it.
         let once = !repeat;
         match code {
-            KeyCode::Char('q') => self.set_status("Press Ctrl+C to quit"),
-            KeyCode::Esc => self.show_help = false,
+            KeyCode::Esc => {
+                self.show_help = false;
+                if self.deck().is_adjusting_grid() {
+                    self.deck().toggle_grid_adjust();
+                }
+            }
             KeyCode::Char('/') if once => self.show_help = !self.show_help,
             KeyCode::Tab if once => self.browser.open = true,
 
@@ -382,6 +404,10 @@ impl App {
             KeyCode::Char('[') => self.deck().scale_loop(0.5),
             KeyCode::Char(']') => self.deck().scale_loop(2.0),
 
+            KeyCode::Up | KeyCode::Down if self.deck().is_adjusting_grid() => {
+                let sign = if code == KeyCode::Up { 1.0 } else { -1.0 };
+                self.deck().nudge_grid_bpm(sign * if shift { 0.1 } else { 0.01 });
+            }
             KeyCode::Up => self.deck().move_tempo(if shift { 10.0 } else { 1.0 }),
             KeyCode::Down => self.deck().move_tempo(if shift { -10.0 } else { -1.0 }),
             KeyCode::Char('0') if once => self.deck().reset_tempo(),
@@ -400,16 +426,18 @@ impl App {
 
             KeyCode::Char(c @ (',' | '.')) => {
                 let sign = if c == ',' { -1.0 } else { 1.0 };
-                let (playing, adjusting) = {
+                let (playing, adjusting, adjusting_grid) = {
                     let deck = self.deck();
-                    (deck.is_playing(), deck.is_adjusting_loop())
+                    (deck.is_playing(), deck.is_adjusting_loop(), deck.is_adjusting_grid())
                 };
-                if adjusting {
+                if adjusting_grid {
+                    self.deck().shift_grid(sign * if shift { 10.0 } else { 1.0 });
+                } else if adjusting {
                     self.deck().adjust_loop_out(sign * if shift { 10.0 } else { 1.0 });
                 } else if !playing {
                     let mut deck = self.deck();
                     if shift {
-                        deck.step_beats_paused(sign);
+                        deck.step_beats_paused(sign as i64);
                     } else {
                         deck.step_paused(sign);
                     }
@@ -437,11 +465,37 @@ impl App {
             }
             KeyCode::Char('t') if once => self.show_remaining = !self.show_remaining,
             KeyCode::Char('a') if once && shift => {
-                self.deck().clear_tapped_bpm();
+                self.deck().reset_grid();
                 self.taps.clear();
-                self.set_status("BPM reset to detected");
+                self.set_status("Beat grid reset to detected");
             }
             KeyCode::Char('a') if once => self.tap(),
+            KeyCode::Char('q') if once => {
+                let on = self.deck().toggle_quantize();
+                match on {
+                    Some(true) => self.set_status("Quantize on for this track"),
+                    Some(false) => self.set_status("Quantize off for this track"),
+                    None => self.set_status("Quantize needs a beat grid (tap the BPM with A)"),
+                }
+            }
+            KeyCode::Char('d') if once => {
+                if self.deck().set_downbeat() {
+                    self.set_status("Beat 1 of a bar is here now");
+                } else {
+                    self.set_status("No beat grid (tap the BPM with A)");
+                }
+            }
+            KeyCode::Char('y') if once => {
+                let on = {
+                    let mut deck = self.deck();
+                    deck.toggle_grid_adjust().then(|| deck.is_adjusting_grid())
+                };
+                match on {
+                    Some(true) => self.set_status("Grid adjust: , / . shift the beats 1 ms (Shift 10), ↑/↓ BPM ±0.01 (Shift 0.1), Y to finish"),
+                    Some(false) => self.set_status("Grid adjust done"),
+                    None => self.set_status("No beat grid (tap the BPM with A)"),
+                }
+            }
             KeyCode::Char('v') if once => {
                 let mut deck = self.deck();
                 deck.brake_time = next_preset(BRAKE_TIMES, deck.brake_time);
@@ -503,7 +557,8 @@ mod tests {
         }
         let track = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
-        deck.lock().unwrap().load(Arc::new(track), &TrackMemory::default(), false);
+        let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
+        deck.lock().unwrap().load(Arc::new(track), &mem, false);
         App::new(deck, Browser::new(dir), true, String::new())
     }
 
@@ -563,5 +618,59 @@ mod tests {
         assert!(app.deck().is_adjusting_loop());
         press(&mut app, KeyCode::Char('.'), true);
         assert_eq!(app.deck().snapshot().loop_out, Some(48_000.0 + 6_400.0));
+    }
+
+    #[test]
+    fn grid_keys() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('q'), false);
+        assert!(app.deck().quantize());
+        app.deck().step_paused(10.0);
+        press(&mut app, KeyCode::Char('d'), false);
+        let g = app.deck().grid().unwrap();
+        assert_eq!(g.anchor, 6_400.0);
+
+        press(&mut app, KeyCode::Char('y'), false);
+        press(&mut app, KeyCode::Char('.'), true);
+        press(&mut app, KeyCode::Up, false);
+        let adjusted = app.deck().grid().unwrap();
+        assert_eq!(adjusted.bpm, g.bpm + 0.01);
+        assert_eq!(app.deck().snapshot().tempo, 0.0, "the tempo fader stays");
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.deck().is_adjusting_grid());
+
+        press(&mut app, KeyCode::Char('a'), true);
+        assert_eq!(app.deck().memory().grid, None);
+    }
+
+    /// Draws the deck with the grid showing; shown with --nocapture.
+    #[test]
+    fn draws_the_grid() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        press(&mut app, KeyCode::Char('q'), false);
+        press(&mut app, KeyCode::Char('e'), false);
+        app.deck().step_paused(200.0);
+        press(&mut app, KeyCode::Char('1'), false);
+        press(&mut app, KeyCode::Char('e'), false);
+        app.deck().step_paused(-100.0);
+        press(&mut app, KeyCode::Char('l'), false);
+        press(&mut app, KeyCode::Char('y'), false);
+        press(&mut app, KeyCode::Char(' '), false);
+        app.deck().render(&mut [0.0; 2 * 9_000]);
+        press(&mut app, KeyCode::Char('1'), false);
+        assert_eq!(app.deck().snapshot().pending_hot, Some(0));
+        for (w, h) in [(160, 24), (60, 12)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+            if w > 100 {
+                println!("{}", t.backend());
+                let bars = t.backend().buffer().content.iter().filter(|c| c.bg == crate::ui::BAR_BG).count();
+                assert!(bars > 0, "bar lines are drawn");
+            }
+        }
     }
 }

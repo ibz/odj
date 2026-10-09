@@ -25,8 +25,23 @@ Use a terminal with the kitty keyboard protocol (Ghostty, kitty, foot,
 Alacritty, WezTerm) and run it outside tmux. Hold-to-preview cue, jog nudges
 and search need key-release events; elsewhere those holds fall back to timers.
 
-Press `?` in the app for all keys. Memory points, hot cues, loops and tapped
-BPMs are remembered per track, one JSON file each under
+### Beat grid and quantize
+
+odj-player finds where each track's beats and bars fall, not just its tempo,
+and shows them as lines on the waveform with a bar.beat counter. When the
+grid is off, fix it: `D` makes the playhead beat 1 of a bar, `A` taps the
+tempo (while playing the beats also move onto your taps), and `Y` enters grid
+adjust, where `,` / `.` shift the beats by 1 ms and `↑` / `↓` change the BPM by
+0.01. `Shift+A` goes back to the detected grid.
+
+With quantize on (`Q`), cues, hot cues, loop in and out and auto loops go on
+the nearest beat, the paused beat jog steps along the grid, and a hot cue or
+reloop pressed while playing waits for the next beat, so the music stays in
+phase. Quantize is set per track. It starts on for tracks whose beats keep
+to the grid, such as most electronic music, and off for loosely played ones.
+
+Press `?` in the app for all keys. Memory points, hot cues, loops, beat grid
+corrections and quantize are remembered per track, one JSON file each under
 `~/.local/share/odj/tracks/`. Files are named by a fingerprint of the audio, so
 cues survive renaming, moving and retagging. Settings such as Auto Cue live in
 `~/.config/odj/settings.json`.
@@ -36,8 +51,8 @@ cues survive renaming, moving and retagging. Settings such as Auto Cue live in
 Sixteen pads on the keys `1234 / QWER / ASDF / ZXCV`. Press Enter to put one
 of your stored cues (hot cues, memory points, last loops) on the selected pad.
 A loop goes on as it is. A cue without an end opens the sample editor, which
-starts at 4 bars and lets you move the start and the end by beats, bars or
-milliseconds and preview it; `T` brings a pad back into it. Each pad can be one-shot, gate (plays while held) or toggle, loop
+starts at 4 bars and lets you move the start and the end along the beat grid
+by beats or bars, or by milliseconds, and preview it; `T` brings a pad back into it. Each pad can be one-shot, gate (plays while held) or toggle, loop
 or not, and has its own gain.
 
 A pad holds its own copy of the audio, cut out and converted to the output

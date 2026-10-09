@@ -1,0 +1,17 @@
+[package]
+name = "odj-sampler"
+description = "Plays the cues stored by odj-player from 16 pads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+odj-core.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+odj-core = { workspace = true, features = ["test-util"] }

@@ -1,0 +1,17 @@
+[package]
+name = "odj-player"
+description = "Keyboard-driven DJ player for the terminal, inspired by the Pioneer CDJ-800"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+publish = false
+
+[dependencies]
+odj-core.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+odj-core = { workspace = true, features = ["test-util"] }

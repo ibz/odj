@@ -1,0 +1,21 @@
+[package]
+name = "odj-core"
+description = "Shared code of the odj apps: decoding, the cue library, audio output, file browsing, terminal UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# Test helpers (synthetic tracks) for the apps' own tests.
+test-util = []
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+cpal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+symphonia.workspace = true
+ratatui.workspace = true

@@ -7,17 +7,17 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
 
+use odj_core::track::{Track, WAVE_RATE};
+use odj_core::tui::{AMBER, DIM, centered};
+
 use crate::app::App;
 use crate::engine::{CD_FRAMES, Snapshot};
-use crate::track::{Track, WAVE_RATE};
 
-const AMBER: Color = Color::Rgb(255, 170, 30);
 const CUE_COLOR: Color = Color::Rgb(255, 140, 0);
 const HOT_COLOR: Color = Color::Rgb(60, 220, 100);
 const PLAYHEAD: Color = Color::Rgb(210, 40, 40);
 const MEMORY_COLOR: Color = Color::Rgb(255, 70, 70);
 const LOOP_BG: Color = Color::Rgb(40, 70, 25);
-const DIM: Color = Color::DarkGray;
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
 
@@ -232,7 +232,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
         None => Line::from(Span::styled(
-            " Space play  C cue  1-3 hot cue  I/O/P loop  L auto loop  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Shift+Q quit",
+            " Space play  C cue  1-3 hot cue  I/O/P loop  L auto loop  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
             Style::new().fg(DIM),
         )),
     };
@@ -281,30 +281,6 @@ fn draw_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Startup list of sound card outputs, shown when there is more than one stereo out.
-/// Unavailable entries (`false`) are dimmed.
-pub fn draw_output_picker(f: &mut Frame, items: &[(String, bool)], selected: usize) {
-    let area = centered(f.area(), 70, 70);
-    f.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" Audio output ")
-        .title_bottom(" ↑↓ select  Enter use  Esc quit ")
-        .border_style(Style::new().fg(AMBER));
-    let items: Vec<ListItem> = items
-        .iter()
-        .map(|(label, ok)| {
-            let item = ListItem::new(label.as_str());
-            if *ok { item } else { item.fg(DIM) }
-        })
-        .collect();
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().fg(Color::Black).bg(AMBER))
-        .highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, area, &mut state);
-}
-
 fn draw_help(f: &mut Frame) {
     let rows: &[(&str, &str)] = &[
         ("Space", "Play / Pause"),
@@ -329,7 +305,7 @@ fn draw_help(f: &mut Frame) {
         ("A / Shift+A", "Tap BPM / back to detected BPM"),
         ("S / V", "Cycle start / brake time"),
         ("Tab", "Browse files; type to filter the folder"),
-        ("Shift+Q, Ctrl+C", "Quit (cue memory is saved)"),
+        ("Ctrl+C", "Quit (cue memory is saved)"),
     ];
     let lines: Vec<Line> = rows
         .iter()
@@ -476,20 +452,4 @@ fn fmt_beats(n: f64) -> String {
     } else {
         format!("{n:.2}")
     }
-}
-
-fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
-    let [_, mid, _] = Layout::vertical([
-        Constraint::Percentage((100 - pct_y) / 2),
-        Constraint::Percentage(pct_y),
-        Constraint::Percentage((100 - pct_y) / 2),
-    ])
-    .areas(area);
-    let [_, center, _] = Layout::horizontal([
-        Constraint::Percentage((100 - pct_x) / 2),
-        Constraint::Percentage(pct_x),
-        Constraint::Percentage((100 - pct_x) / 2),
-    ])
-    .areas(mid);
-    center
 }

@@ -1250,7 +1250,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "odj"
+name = "odj-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1260,6 +1260,25 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+]
+
+[[package]]
+name = "odj-player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "odj-core",
+ "ratatui",
+]
+
+[[package]]
+name = "odj-sampler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "odj-core",
+ "ratatui",
+ "serde",
 ]
 
 [[package]]

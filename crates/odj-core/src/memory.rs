@@ -11,10 +11,20 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Cue, MAX_MEMORIES};
 use crate::track::Track;
 
 const VERSION: u32 = 1;
+/// Most memory points kept per track.
+pub const MAX_MEMORIES: usize = 100;
+
+/// A cue point, or a loop when it has an out point. Positions are frames at the
+/// track's sample rate.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Cue {
+    pub pos: f64,
+    /// Set when the cue stores a loop.
+    pub loop_out: Option<f64>,
+}
 
 /// A track's cues as the deck uses them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -32,6 +42,18 @@ impl TrackMemory {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// A track's entry in the library, as its file stores it.
+#[derive(Debug)]
+pub struct LibraryTrack {
+    pub id: String,
+    /// Where the track was last loaded from; it may have moved since.
+    pub path: PathBuf,
+    pub title: String,
+    pub artist: Option<String>,
+    pub sample_rate: u32,
+    pub memory: TrackMemory,
 }
 
 /// Player settings that survive a restart.
@@ -132,7 +154,7 @@ pub struct Memory {
 
 impl Memory {
     pub fn load() -> Self {
-        let data_dir = xdg_dir("XDG_DATA_HOME", ".local/share");
+        let data_dir = data_dir();
         let config_dir = xdg_dir("XDG_CONFIG_HOME", ".config");
         let settings = read_json(&config_dir.join("settings.json"))
             .or_else(|| read_json(&data_dir.join("settings.json")))
@@ -161,6 +183,28 @@ impl Memory {
         legacy.get(&key(&track.path)).cloned().unwrap_or_default()
     }
 
+    /// Every track in the library, in no particular order; unreadable files are skipped.
+    pub fn tracks(&self) -> Vec<LibraryTrack> {
+        let Ok(shards) = fs::read_dir(&self.tracks_dir) else { return Vec::new() };
+        shards
+            .flatten()
+            .filter_map(|shard| fs::read_dir(shard.path()).ok())
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|file| file.extension().is_some_and(|e| e == "json"))
+            .filter_map(|file| read_json::<TrackFile>(&file))
+            .map(|file| LibraryTrack {
+                memory: file.memory(),
+                id: file.id,
+                path: file.path,
+                title: file.title,
+                artist: file.artist,
+                sample_rate: file.sample_rate,
+            })
+            .collect()
+    }
+
     /// Writes the track's file; skipped for a track that never had cues.
     pub fn save_track(&self, track: &Track, mem: &TrackMemory) -> std::io::Result<()> {
         if track.id.is_empty() {
@@ -180,6 +224,11 @@ impl Memory {
     }
 }
 
+/// Where odj keeps its data, `$XDG_DATA_HOME/odj`.
+pub fn data_dir() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
+}
+
 fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
@@ -188,12 +237,12 @@ fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
         .join("odj")
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(file: &Path) -> Option<T> {
+pub fn read_json<T: serde::de::DeserializeOwned>(file: &Path) -> Option<T> {
     fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
 
 /// Writes through a temporary file so a crash never leaves a half-written file.
-fn write_json<T: Serialize>(file: &Path, value: &T) -> std::io::Result<()> {
+pub fn write_json<T: Serialize>(file: &Path, value: &T) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     let tmp = file.with_extension(format!("json.{}.tmp", std::process::id()));
     fs::write(&tmp, json)?;
@@ -260,6 +309,19 @@ mod tests {
         let mut m = memory("moved");
         m.save_track(&track("ab11", "/old/place.mp3"), &sample()).unwrap();
         assert_eq!(m.get(&track("ab11", "/new/place.mp3")), sample());
+    }
+
+    #[test]
+    fn lists_every_track_in_the_library() {
+        let m = memory("list");
+        m.save_track(&track("ab55", "/music/a.flac"), &sample()).unwrap();
+        m.save_track(&track("cd66", "/music/b.flac"), &sample()).unwrap();
+        // Half-written leftovers of a crash are not tracks.
+        fs::write(m.tracks_dir.join("ab/ab77.json.1.tmp"), "{").unwrap();
+        let mut ids: Vec<String> = m.tracks().into_iter().map(|t| t.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["ab55", "cd66"]);
+        assert_eq!(m.tracks()[0].memory, sample());
     }
 
     #[test]

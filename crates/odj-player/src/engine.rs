@@ -5,18 +5,16 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use odj_core::audio::Source;
+use odj_core::memory::{Cue, MAX_MEMORIES, TrackMemory};
+use odj_core::track::Track;
 
-use crate::memory::TrackMemory;
 use crate::stretch::Stretcher;
-use crate::track::Track;
 
 /// Length of the crossfade used to hide clicks on jumps and loop wraps.
 const XFADE: usize = 96;
 /// Largest block fed to the time stretcher.
 const MAX_BLOCK: usize = 4096;
-/// Most memory points kept per track.
-pub const MAX_MEMORIES: usize = 100;
 /// CD frames per second, the unit of the paused jog and the time display.
 pub const CD_FRAMES: f64 = 75.0;
 
@@ -55,13 +53,6 @@ impl TempoRange {
             Self::Wide => Self::R6,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Cue {
-    pub pos: f64,
-    /// Set when the cue stores a loop.
-    pub loop_out: Option<f64>,
 }
 
 /// What the UI needs to draw a frame, copied out so rendering never holds the lock.
@@ -714,10 +705,16 @@ fn sample(s: &[f32], frames: usize, pos: f64) -> (f32, f32) {
     (cubic(0), cubic(1))
 }
 
+impl Source for Deck {
+    fn render(&mut self, out: &mut [f32]) {
+        Deck::render(self, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::track::tests::click_track;
+    use odj_core::track::test_util::click_track;
 
     const SR: u32 = 48_000;
 

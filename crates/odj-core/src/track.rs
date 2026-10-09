@@ -1,5 +1,5 @@
-//! Decoding a file fully into memory, plus the analysis the display shows:
-//! waveform, BPM and the auto-cue point.
+//! Decoding a file fully into memory, plus the analysis the player's display
+//! shows: waveform, BPM and the auto-cue point.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,17 @@ pub struct Track {
     pub first_sound: f64,
 }
 
+/// A file's audio and tags, without any analysis.
+pub struct Decoded {
+    /// Fingerprint of the encoded audio, see `Track::id`.
+    pub id: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub sample_rate: u32,
+    /// Interleaved stereo.
+    pub samples: Vec<f32>,
+}
+
 impl Track {
     pub fn frames(&self) -> usize {
         self.samples.len() / 2
@@ -51,88 +62,9 @@ impl Track {
     }
 
     pub fn load(path: &Path) -> Result<Track> {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-        let mut format = symphonia::default::get_probe()
-            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-            .map_err(|e| anyhow!("unsupported file: {e}"))?;
-
-        let (mut title, mut artist) = (None, None);
-        if let Some(rev) = format.metadata().skip_to_latest() {
-            let tags = rev
-                .media
-                .tags
-                .iter()
-                .chain(rev.per_track.iter().flat_map(|t| t.metadata.tags.iter()));
-            for tag in tags {
-                match &tag.std {
-                    Some(StandardTag::TrackTitle(s)) => title = Some(s.to_string()),
-                    Some(StandardTag::Artist(s)) => artist = Some(s.to_string()),
-                    _ => {}
-                }
-            }
-        }
-
-        let track = format
-            .default_track(TrackType::Audio)
-            .ok_or_else(|| anyhow!("no audio track"))?;
-        let params = track
-            .codec_params
-            .as_ref()
-            .and_then(|p| p.audio())
-            .ok_or_else(|| anyhow!("no audio codec parameters"))?;
-        let mut decoder = symphonia::default::get_codecs()
-            .make_audio_decoder(params, &AudioDecoderOptions::default())
-            .map_err(|e| anyhow!("unsupported codec: {e}"))?;
-        let track_id = track.id;
-
-        let mut samples = Vec::new();
-        let mut packet_buf: Vec<f32> = Vec::new();
-        // Hashing the packets rather than the file keeps the ID stable across tag edits,
-        // and rather than decoded samples, across decoder changes.
-        let mut hasher = blake3::Hasher::new();
-        let mut sample_rate = 0;
-        loop {
-            let packet = match format.next_packet() {
-                Ok(Some(p)) => p,
-                Ok(None) => break,
-                // A broken tail shouldn't make the whole track unplayable.
-                Err(_) if !samples.is_empty() => break,
-                Err(e) => return Err(anyhow!("read error: {e}")),
-            };
-            if packet.track_id != track_id {
-                continue;
-            }
-            hasher.update(&packet.data);
-            let buf = match decoder.decode(&packet) {
-                Ok(buf) => buf,
-                Err(SymError::DecodeError(_)) => continue,
-                Err(e) => return Err(anyhow!("decode error: {e}")),
-            };
-            sample_rate = buf.spec().rate();
-            let channels = buf.spec().channels().count().max(1);
-            packet_buf.resize(buf.samples_interleaved(), 0.0);
-            buf.copy_to_slice_interleaved(&mut packet_buf);
-            for frame in packet_buf.chunks_exact(channels) {
-                let l = frame[0];
-                let r = if channels > 1 { frame[1] } else { l };
-                samples.push(l);
-                samples.push(r);
-            }
-        }
-        if samples.is_empty() || sample_rate == 0 {
-            return Err(anyhow!("no audio decoded"));
-        }
-
-        let title = title.unwrap_or_else(|| {
-            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-        });
-        let mut track = Track::from_samples(path.to_path_buf(), title, artist, sample_rate, samples);
-        track.id = fingerprint(hasher);
+        let d = decode(path)?;
+        let mut track = Track::from_samples(path.to_path_buf(), d.title, d.artist, d.sample_rate, d.samples);
+        track.id = d.id;
         Ok(track)
     }
 
@@ -161,6 +93,91 @@ impl Track {
             first_sound,
         }
     }
+}
+
+/// Decodes a whole file to interleaved stereo at its own sample rate.
+pub fn decode(path: &Path) -> Result<Decoded> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+        .map_err(|e| anyhow!("unsupported file: {e}"))?;
+
+    let (mut title, mut artist) = (None, None);
+    if let Some(rev) = format.metadata().skip_to_latest() {
+        let tags = rev
+            .media
+            .tags
+            .iter()
+            .chain(rev.per_track.iter().flat_map(|t| t.metadata.tags.iter()));
+        for tag in tags {
+            match &tag.std {
+                Some(StandardTag::TrackTitle(s)) => title = Some(s.to_string()),
+                Some(StandardTag::Artist(s)) => artist = Some(s.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| anyhow!("no audio track"))?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| anyhow!("no audio codec parameters"))?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|e| anyhow!("unsupported codec: {e}"))?;
+    let track_id = track.id;
+
+    let mut samples = Vec::new();
+    let mut packet_buf: Vec<f32> = Vec::new();
+    // Hashing the packets rather than the file keeps the ID stable across tag edits,
+    // and rather than decoded samples, across decoder changes.
+    let mut hasher = blake3::Hasher::new();
+    let mut sample_rate = 0;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            // A broken tail shouldn't make the whole track unplayable.
+            Err(_) if !samples.is_empty() => break,
+            Err(e) => return Err(anyhow!("read error: {e}")),
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        hasher.update(&packet.data);
+        let buf = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            Err(SymError::DecodeError(_)) => continue,
+            Err(e) => return Err(anyhow!("decode error: {e}")),
+        };
+        sample_rate = buf.spec().rate();
+        let channels = buf.spec().channels().count().max(1);
+        packet_buf.resize(buf.samples_interleaved(), 0.0);
+        buf.copy_to_slice_interleaved(&mut packet_buf);
+        for frame in packet_buf.chunks_exact(channels) {
+            let l = frame[0];
+            let r = if channels > 1 { frame[1] } else { l };
+            samples.push(l);
+            samples.push(r);
+        }
+    }
+    if samples.is_empty() || sample_rate == 0 {
+        return Err(anyhow!("no audio decoded"));
+    }
+
+    let title = title.unwrap_or_else(|| {
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    });
+    Ok(Decoded { id: fingerprint(hasher), title, artist, sample_rate, samples })
 }
 
 /// 128 bits of the hash as hex: plenty to tell tracks apart, short as a file name.
@@ -296,10 +313,8 @@ pub fn detect_bpm(mono: &[f32], sample_rate: u32) -> Option<f64> {
     Some((bpm * 10.0).round() / 10.0)
 }
 
-#[cfg(test)]
-pub mod tests {
-    use super::*;
-
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util {
     /// A synthetic four-on-the-floor kick pattern with off-beat hats.
     pub fn click_track(bpm: f64, seconds: f64, sample_rate: u32) -> Vec<f32> {
         let frames = (seconds * sample_rate as f64) as usize;
@@ -333,6 +348,12 @@ pub mod tests {
         }
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::click_track;
+    use super::*;
 
     #[test]
     fn detects_common_tempos() {

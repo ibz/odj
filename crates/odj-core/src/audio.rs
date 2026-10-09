@@ -1,4 +1,4 @@
-//! Audio output through cpal: PipeWire when it runs, so several odj instances can share
+//! Audio output through cpal: PipeWire when it runs, so several odj apps can share
 //! a sound card; otherwise straight to the ALSA hardware.
 
 use std::sync::{Arc, Mutex};
@@ -7,11 +7,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::platform::PipeWireHost;
 use cpal::{
-    BufferSize, Device, DeviceDirection, ErrorKind, FromSample, Host, HostId, SampleFormat, SizedSample,
-    Stream, StreamConfig,
+    BufferSize, Device, DeviceDirection, ErrorKind, FromSample, HostId, SampleFormat, SizedSample, Stream,
+    StreamConfig,
 };
 
-use crate::engine::Deck;
+pub use cpal::Host;
+
+/// Whatever produces the sound: the audio callback asks it for each block.
+pub trait Source: Send + 'static {
+    /// Fills `out` with interleaved stereo samples.
+    fn render(&mut self, out: &mut [f32]);
+}
 
 /// Requested buffer size; small enough for cue/hot-cue response to feel immediate.
 const BUFFER_FRAMES: u32 = 512;
@@ -247,33 +253,34 @@ impl Output {
         self.config.sample_rate
     }
 
-    pub fn start(&self, deck: Arc<Mutex<Deck>>) -> Result<Stream> {
+    pub fn start<S: Source>(&self, source: Arc<Mutex<S>>) -> Result<Stream> {
         let mut config = self.config;
         config.buffer_size = BufferSize::Fixed(BUFFER_FRAMES);
-        let stream = self.build(&config, deck.clone()).or_else(|_| {
+        let stream = self.build(&config, source.clone()).or_else(|_| {
             config.buffer_size = BufferSize::Default;
-            self.build(&config, deck)
+            self.build(&config, source)
         })?;
         stream.play().context("starting audio stream")?;
         Ok(stream)
     }
 
-    fn build(&self, config: &StreamConfig, deck: Arc<Mutex<Deck>>) -> Result<Stream> {
+    fn build<S: Source>(&self, config: &StreamConfig, source: Arc<Mutex<S>>) -> Result<Stream> {
         let route = self.route;
         match self.format {
-            SampleFormat::F32 => build::<f32>(&self.device, config, route, deck),
-            SampleFormat::F64 => build::<f64>(&self.device, config, route, deck),
-            SampleFormat::I16 => build::<i16>(&self.device, config, route, deck),
-            SampleFormat::I32 => build::<i32>(&self.device, config, route, deck),
-            SampleFormat::U16 => build::<u16>(&self.device, config, route, deck),
+            SampleFormat::F32 => build::<f32, S>(&self.device, config, route, source),
+            SampleFormat::F64 => build::<f64, S>(&self.device, config, route, source),
+            SampleFormat::I16 => build::<i16, S>(&self.device, config, route, source),
+            SampleFormat::I32 => build::<i32, S>(&self.device, config, route, source),
+            SampleFormat::U16 => build::<u16, S>(&self.device, config, route, source),
             other => Err(anyhow!("unsupported sample format {other}")),
         }
     }
 }
 
-fn build<T>(device: &Device, config: &StreamConfig, route: Route, deck: Arc<Mutex<Deck>>) -> Result<Stream>
+fn build<T, S>(device: &Device, config: &StreamConfig, route: Route, source: Arc<Mutex<S>>) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32>,
+    S: Source,
 {
     let channels = config.channels as usize;
     let mut stereo = vec![0.0f32; 8192];
@@ -284,7 +291,7 @@ where
             if stereo.len() < frames * 2 {
                 stereo.resize(frames * 2, 0.0);
             }
-            deck.lock()
+            source.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .render(&mut stereo[..frames * 2]);
             for (frame, lr) in data.chunks_exact_mut(channels).zip(stereo.chunks_exact(2)) {

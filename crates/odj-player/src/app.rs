@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use odj_core::library::{Browser, siblings};
+use odj_core::memory::Memory;
+use odj_core::track::Track;
+
 use crate::engine::Deck;
-use crate::library::{Browser, siblings};
-use crate::memory::Memory;
-use crate::track::Track;
 
 /// Without key-release events a hold lasts this long after the last key event.
 const HOLD_FALLBACK: Duration = Duration::from_millis(500);
@@ -311,8 +312,7 @@ impl App {
         // Keys that toggle or trigger ignore auto-repeat; steppers accept it.
         let once = !repeat;
         match code {
-            KeyCode::Char('q') if shift => self.quit = true,
-            KeyCode::Char('q') => self.set_status("Press Shift+Q to quit"),
+            KeyCode::Char('q') => self.set_status("Press Ctrl+C to quit"),
             KeyCode::Esc => self.show_help = false,
             KeyCode::Char('/') if once => self.show_help = !self.show_help,
             KeyCode::Tab if once => self.browser.open = true,
@@ -490,8 +490,8 @@ fn normalize(key: &KeyEvent) -> (KeyCode, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::TrackMemory;
-    use crate::track::tests::click_track;
+    use odj_core::memory::TrackMemory;
+    use odj_core::track::test_util::click_track;
     use ratatui::crossterm::event::KeyEventState;
 
     fn app() -> App {

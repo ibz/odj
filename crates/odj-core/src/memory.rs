@@ -81,11 +81,15 @@ pub struct LibraryTrack {
 pub struct Settings {
     /// Cue to the first sound on load instead of the very start.
     pub auto_cue: bool,
+    /// Beatjump size, in beats.
+    pub jump_beats: f64,
+    /// Size of the next beatloop, in beats.
+    pub loop_beats: f64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_cue: true }
+        Self { auto_cue: true, jump_beats: 4.0, loop_beats: 4.0 }
     }
 }
 

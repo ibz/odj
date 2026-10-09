@@ -40,6 +40,15 @@ reloop pressed while playing waits for the next beat, so the music stays in
 phase. Quantize is set per track. It starts on for tracks whose beats keep
 to the grid, such as most electronic music, and off for loosely played ones.
 
+On the grid you can also beatjump (`-` / `=`, Shift to change the size from 1
+to 64 beats; while looping, the loop moves along), make beat loops of 1/32 to
+64 beats (`L`, with `[` / `]` setting the size), and hold `;` for a loop roll
+of that size; tapping `[` / `]` while holding it halves or doubles the roll
+for a stutter build-up. A roll stops when you let go, and the track goes
+on from where it would have been had you never rolled. Slip mode (`Z`) does the same
+for loops, reverse, held hot cues and pause: the track keeps going
+underneath, shown as a purple line on the waveform, and comes back in time.
+
 Press `?` in the app for all keys. Memory points, hot cues, loops, beat grid
 corrections and quantize are remembered per track, one JSON file each under
 `~/.local/share/odj/tracks/`. Files are named by a fingerprint of the audio, so

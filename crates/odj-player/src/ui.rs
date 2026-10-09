@@ -22,6 +22,9 @@ const GRID_COLOR: Color = Color::Rgb(90, 200, 230);
 /// Backgrounds of the columns a beat or a bar starts in.
 const BEAT_BG: Color = Color::Rgb(38, 38, 44);
 pub const BAR_BG: Color = Color::Rgb(75, 75, 88);
+const SLIP_COLOR: Color = Color::Rgb(200, 110, 255);
+/// The column of the slip ghost, where the track would be.
+pub const GHOST_BG: Color = Color::Rgb(95, 50, 125);
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
 
@@ -188,6 +191,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         (false, false) => Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
     };
     spans.push(Span::styled(" QUANTIZE ", q_style));
+    spans.push(Span::raw(" "));
+    let slip_style = if s.slip { Style::new().fg(Color::Black).bg(SLIP_COLOR).bold() } else { Style::new().fg(DIM) };
+    spans.push(Span::styled(" SLIP ", slip_style));
 
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
@@ -227,6 +233,9 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     if s.grid_adjust {
         spans.push(Span::styled(" GRID ADJ ", Style::new().fg(Color::Black).bg(GRID_COLOR).bold()));
     }
+    if let Some(beats) = s.roll {
+        spans.push(Span::styled(format!(" ROLL {} ", fmt_beats(beats)), Style::new().fg(Color::Black).bg(SLIP_COLOR).bold()));
+    }
     match (s.loop_in, s.loop_out) {
         (Some(a), Some(b)) => {
             let len = match s.loop_beats {
@@ -236,8 +245,11 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
             spans.push(Span::raw(format!(" {} → {}  {len}", short_time(a / sr), short_time(b / sr))));
         }
         (Some(a), None) => spans.push(Span::raw(format!(" IN {} …", short_time(a / sr)))),
-        _ => spans.push(Span::styled(" --", Style::new().fg(DIM))),
+        _ => spans.push(Span::styled(format!(" L: {} beats", fmt_beats(s.loop_size)), Style::new().fg(DIM))),
     }
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled("JUMP ", Style::new().fg(DIM)));
+    spans.push(Span::raw(fmt_beats(s.jump_beats)));
 
     spans.push(Span::raw("    "));
     spans.push(Span::styled("MEM ", Style::new().fg(DIM)));
@@ -260,7 +272,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
         None => Line::from(Span::styled(
-            " Space play  C cue  1-3 hot cue  I/O/P loop  L auto loop  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
+            " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
             Style::new().fg(DIM),
         )),
     };
@@ -319,9 +331,13 @@ fn draw_help(f: &mut Frame) {
         ("Shift+1 2 3", "Clear hot cue (REC mode only)"),
         ("I / O / P", "Loop in / Loop out / Reloop-Exit"),
         ("O while looping", "Loop out adjust: , / . move the out point, O to finish"),
-        ("L", "Auto beat loop (4 beats)"),
+        ("L", "Beat loop of the loop size / exit the loop"),
+        ("- / =", "Beatjump back / forward (moves the loop while looping)"),
+        ("Shift+- / =", "Beatjump size 1 … 64 beats"),
+        ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),
+        ("Z", "Slip: loops, reverse, held hot cues and pause carry on underneath"),
         ("W / J / K / X", "Memory: store cue or loop / call previous / call next / delete"),
-        ("[ / ]", "Halve / double loop"),
+        ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
         ("↑ / ↓", "Tempo fader (Shift: ×10)"),
         ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
         ("M", "Master Tempo (key lock)"),
@@ -461,6 +477,13 @@ impl Widget for Wave<'_> {
         }
         marker(self.s.cue / sr, '▼', CUE_COLOR);
 
+        if let Some(x) = self.s.ghost.and_then(|g| col_of(g / sr)) {
+            for row in 0..area.height {
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + row)) {
+                    cell.set_bg(GHOST_BG);
+                }
+            }
+        }
         if let Some(x) = col_of(now) {
             for row in 0..area.height {
                 if let Some(cell) = buf.cell_mut((area.x + x, area.y + row)) {

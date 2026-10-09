@@ -11,7 +11,7 @@ use odj_core::library::{Browser, siblings};
 use odj_core::memory::Memory;
 use odj_core::track::Track;
 
-use crate::engine::Deck;
+use crate::engine::{Deck, JUMP_SIZES, MAX_LOOP_BEATS, MIN_LOOP_BEATS};
 
 /// Without key-release events a hold lasts this long after the last key event.
 const HOLD_FALLBACK: Duration = Duration::from_millis(500);
@@ -48,6 +48,8 @@ pub struct App {
     bend_up: Option<Hold>,
     search_back: Option<Hold>,
     search_fwd: Option<Hold>,
+    /// The loop roll key held down.
+    roll: Option<Hold>,
     /// Recent taps, with the playhead at each while playing forward.
     taps: Vec<(Instant, Option<f64>)>,
     pub quit: bool,
@@ -60,10 +62,18 @@ impl App {
         key_release: bool,
         output_name: String,
     ) -> Self {
+        let memory = Memory::load();
+        {
+            let mut d = deck.lock().unwrap_or_else(|e| e.into_inner());
+            if JUMP_SIZES.contains(&memory.settings.jump_beats) {
+                d.jump_beats = memory.settings.jump_beats;
+            }
+            d.loop_size = memory.settings.loop_beats.clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
+        }
         Self {
             deck,
             browser,
-            memory: Memory::load(),
+            memory,
             loading: None,
             status: None,
             show_help: false,
@@ -76,6 +86,7 @@ impl App {
             bend_up: None,
             search_back: None,
             search_fwd: None,
+            roll: None,
             taps: Vec::new(),
             quit: false,
         }
@@ -94,6 +105,22 @@ impl App {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < STATUS_TIME)
             .map(|(msg, _)| msg.as_str())
+    }
+
+    /// Keeps the beatjump and beatloop sizes for next time.
+    fn save_sizes(&mut self) {
+        let (jump, size) = {
+            let deck = self.deck();
+            (deck.jump_beats, deck.loop_size)
+        };
+        let s = &mut self.memory.settings;
+        if (s.jump_beats, s.loop_beats) == (jump, size) {
+            return;
+        }
+        (s.jump_beats, s.loop_beats) = (jump, size);
+        if let Err(e) = self.memory.save_settings() {
+            self.set_status(format!("Could not save settings: {e}"));
+        }
     }
 
     pub fn auto_cue(&self) -> bool {
@@ -204,6 +231,9 @@ impl App {
                 *hold = None;
             }
         }
+        if self.roll.take_if(|h| h.until.is_some_and(|t| now >= t)).is_some() {
+            self.deck().roll_up();
+        }
         let amount = |h: &Option<Hold>| match h {
             Some(h) if h.strong => BEND_STRONG,
             Some(_) => BEND,
@@ -289,6 +319,11 @@ impl App {
             KeyCode::Char('.') => self.bend_up = None,
             KeyCode::Left => self.search_back = None,
             KeyCode::Right => self.search_fwd = None,
+            KeyCode::Char(c @ '1'..='3') => self.deck().hot_cue_up((c as u8 - b'1') as usize),
+            KeyCode::Char(';') if self.roll.is_some() => {
+                self.roll = None;
+                self.deck().roll_up();
+            }
             _ => {}
         }
     }
@@ -350,7 +385,7 @@ impl App {
                 if !self.hot_rec {
                     if shift {
                         self.set_status("Hot cues can only be cleared in REC mode (E)");
-                    } else if !self.deck().hot_cue(i) {
+                    } else if !self.deck().hot_cue(i, self.key_release) {
                         self.set_status(format!("Hot cue {letter} is empty, press E for REC mode to store it"));
                     }
                 } else if shift {
@@ -397,12 +432,44 @@ impl App {
             }
             KeyCode::Char('p') if once => self.deck().reloop_exit(),
             KeyCode::Char('l') if once => {
-                if !self.deck().auto_loop(4.0) {
-                    self.set_status("Auto loop needs a BPM (tap one with A)");
+                if !self.deck().beat_loop() {
+                    self.set_status("Beat loops need a beat grid (tap the BPM with A)");
                 }
             }
-            KeyCode::Char('[') => self.deck().scale_loop(0.5),
-            KeyCode::Char(']') => self.deck().scale_loop(2.0),
+            KeyCode::Char(c @ ('[' | ']')) => {
+                self.deck().resize_loop(if c == '[' { 0.5 } else { 2.0 });
+                self.save_sizes();
+            }
+            KeyCode::Char(c @ ('-' | '=')) if shift => {
+                self.deck().resize_jump(c == '=');
+                self.save_sizes();
+            }
+            KeyCode::Char(c @ ('-' | '=')) => {
+                if !self.deck().beat_jump(if c == '-' { -1.0 } else { 1.0 }) {
+                    self.set_status("Beatjump needs a beat grid (tap the BPM with A)");
+                }
+            }
+            KeyCode::Char(';') if once || !self.key_release => {
+                let held = self.roll.is_some();
+                self.roll = self.hold(false);
+                if !held {
+                    let (ok, size) = {
+                        let mut deck = self.deck();
+                        let size = deck.loop_size;
+                        (deck.roll_down(size), size)
+                    };
+                    if !ok {
+                        self.roll = None;
+                        self.set_status("Loop roll needs a beat grid (tap the BPM with A)");
+                    } else if size > 1.0 {
+                        self.set_status("Rolling; [ / ] change the size while held");
+                    }
+                }
+            }
+            KeyCode::Char('z') if once => {
+                let on = self.deck().toggle_slip();
+                self.set_status(if on { "Slip on" } else { "Slip off" });
+            }
 
             KeyCode::Up | KeyCode::Down if self.deck().is_adjusting_grid() => {
                 let sign = if code == KeyCode::Up { 1.0 } else { -1.0 };
@@ -530,6 +597,9 @@ fn normalize(key: &KeyEvent) -> (KeyCode, bool) {
                 '}' => ']',
                 '?' => '/',
                 ')' => '0',
+                '_' => '-',
+                '+' => '=',
+                ':' => ';',
                 c => c.to_ascii_lowercase(),
             };
             shift |= base != c;
@@ -662,15 +732,65 @@ mod tests {
         app.deck().render(&mut [0.0; 2 * 9_000]);
         press(&mut app, KeyCode::Char('1'), false);
         assert_eq!(app.deck().snapshot().pending_hot, Some(0));
+        press(&mut app, KeyCode::Char('z'), false);
+        app.deck().loop_size = 0.25;
+        press(&mut app, KeyCode::Char(';'), false);
+        app.deck().render(&mut [0.0; 2 * 30_000]);
         for (w, h) in [(160, 24), (60, 12)] {
             let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
             let snapshot = app.deck().snapshot();
             t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
             if w > 100 {
                 println!("{}", t.backend());
-                let bars = t.backend().buffer().content.iter().filter(|c| c.bg == crate::ui::BAR_BG).count();
-                assert!(bars > 0, "bar lines are drawn");
+                let cells = &t.backend().buffer().content;
+                assert!(cells.iter().any(|c| c.bg == crate::ui::BAR_BG), "bar lines are drawn");
+                assert!(cells.iter().any(|c| c.bg == crate::ui::GHOST_BG), "the ghost is drawn");
+                let text: String = cells.iter().map(|c| c.symbol()).collect();
+                for label in ["ROLL 1/4", "SLIP", "JUMP 4"] {
+                    assert!(text.contains(label), "{label}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn jump_roll_and_slip_keys() {
+        let mut app = app();
+        // The tests share a settings file; start from the defaults.
+        (app.deck().jump_beats, app.deck().loop_size) = (4.0, 4.0);
+        press(&mut app, KeyCode::Char('+'), true);
+        assert_eq!(app.deck().jump_beats, 8.0);
+        assert_eq!(app.memory.settings.jump_beats, 8.0, "kept for next time");
+        press(&mut app, KeyCode::Char('_'), true);
+        press(&mut app, KeyCode::Char('='), false);
+        assert_eq!(app.deck().position(), 4.0 * 24_000.0);
+
+        press(&mut app, KeyCode::Char(' '), false);
+        press(&mut app, KeyCode::Char(';'), false);
+        assert_eq!(app.deck().snapshot().roll, Some(4.0));
+        press(&mut app, KeyCode::Char('['), false);
+        assert_eq!(app.deck().snapshot().roll, Some(2.0), "[ halves the roll while held");
+        key(&mut app, KeyCode::Char(';'), false, KeyEventKind::Release);
+        assert_eq!(app.deck().snapshot().roll, None);
+        assert_eq!(app.memory.settings.loop_beats, 2.0);
+
+        press(&mut app, KeyCode::Char('z'), false);
+        assert!(app.deck().snapshot().slip);
+    }
+
+    #[test]
+    fn rolls_time_out_without_key_releases() {
+        let mut app = app();
+        app.key_release = false;
+        press(&mut app, KeyCode::Char(' '), false);
+        app.deck().loop_size = 4.0;
+        press(&mut app, KeyCode::Char(';'), false);
+        assert_eq!(app.deck().snapshot().roll, Some(4.0));
+        // Auto-repeat keeps it going.
+        key(&mut app, KeyCode::Char(';'), false, KeyEventKind::Repeat);
+        assert!(app.deck().snapshot().roll.is_some());
+        app.roll.as_mut().unwrap().until = Some(Instant::now());
+        app.tick();
+        assert_eq!(app.deck().snapshot().roll, None);
     }
 }

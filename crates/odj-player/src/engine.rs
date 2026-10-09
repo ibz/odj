@@ -20,6 +20,11 @@ const MAX_BLOCK: usize = 4096;
 pub const CD_FRAMES: f64 = 75.0;
 /// A quantized jump pressed this soon after a beat goes at once, as if on it.
 const LATE_SECONDS: f64 = 0.02;
+/// Beatjump sizes, in beats; whole beats keep the jump in phase.
+pub const JUMP_SIZES: [f64; 7] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
+/// Range of beatloop sizes, in beats.
+pub const MIN_LOOP_BEATS: f64 = 1.0 / 32.0;
+pub const MAX_LOOP_BEATS: f64 = 64.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TempoRange {
@@ -68,6 +73,34 @@ struct Pending {
     hot: Option<usize>,
 }
 
+/// Slip mode: while a slipped action runs, a ghost position carries on where
+/// the track would be, and the deck goes back to it when the last one ends.
+#[derive(Clone, Copy, Default)]
+struct Slip {
+    ghost: Option<f64>,
+    looping: bool,
+    reverse: bool,
+    /// A hot cue held down.
+    hot: Option<usize>,
+    paused: bool,
+}
+
+impl Slip {
+    fn active(&self) -> bool {
+        self.looping || self.reverse || self.hot.is_some() || self.paused
+    }
+}
+
+/// A loop roll held down. It always slips, with its own ghost, which keeps
+/// looping in the loop that was on before the roll.
+#[derive(Clone, Copy)]
+struct Roll {
+    beats: f64,
+    ghost: f64,
+    /// Loop in, loop out and looping before the roll.
+    saved: (Option<f64>, Option<f64>, bool),
+}
+
 /// What the UI needs to draw a frame, copied out so rendering never holds the lock.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -102,6 +135,13 @@ pub struct Snapshot {
     /// A hot cue waiting for the next beat.
     pub pending_hot: Option<usize>,
     pub loop_beats: Option<f64>,
+    pub slip: bool,
+    /// Where the track would be while slipping or rolling.
+    pub ghost: Option<f64>,
+    /// The size of the loop roll held down.
+    pub roll: Option<f64>,
+    pub jump_beats: f64,
+    pub loop_size: f64,
 }
 
 pub struct Deck {
@@ -139,6 +179,13 @@ pub struct Deck {
     /// The jog keys shift the grid and the tempo keys change its BPM.
     grid_adjust: bool,
     pending: Option<Pending>,
+    slip_mode: bool,
+    slip: Slip,
+    roll: Option<Roll>,
+    /// Beatjump size, in beats.
+    pub jump_beats: f64,
+    /// Size of the next beatloop, in beats.
+    pub loop_size: f64,
     xfade: Option<(f64, usize)>,
     gain: f32,
     stretch: Option<Stretcher>,
@@ -179,6 +226,11 @@ impl Deck {
             quantize_override: None,
             grid_adjust: false,
             pending: None,
+            slip_mode: false,
+            slip: Slip::default(),
+            roll: None,
+            jump_beats: 4.0,
+            loop_size: 4.0,
             xfade: None,
             gain: 0.0,
             stretch: Stretcher::new(out_rate, MAX_BLOCK),
@@ -224,6 +276,11 @@ impl Deck {
             grid_adjust: self.grid_adjust,
             quantize: self.quantize(),
             pending_hot: self.pending.and_then(|p| p.hot),
+            slip: self.slip_mode,
+            ghost: self.roll.map(|r| r.ghost).or(self.slip.ghost),
+            roll: self.roll.map(|r| r.beats),
+            jump_beats: self.jump_beats,
+            loop_size: self.loop_size,
             loop_beats: self.loop_beats(),
         }
     }
@@ -241,6 +298,7 @@ impl Deck {
         self.quantize_override = mem.quantize;
         self.grid_adjust = false;
         self.pending = None;
+        self.cancel_slips();
         self.looping = false;
         self.loop_adjust = false;
         self.playing = false;
@@ -350,6 +408,9 @@ impl Deck {
         self.playing = !self.playing;
         if !self.playing {
             self.pending = None;
+            self.begin_slip(|s| s.paused = true);
+        } else if self.slip.paused {
+            self.end_slip(|s| s.paused = false, true);
         }
     }
 
@@ -360,6 +421,7 @@ impl Deck {
             return;
         }
         self.pending = None;
+        self.cancel_slips();
         if self.playing {
             self.jump(self.cue);
             self.stop_now();
@@ -386,8 +448,14 @@ impl Deck {
         }
     }
 
+    /// Reverse; in slip mode, going forward again goes back to the ghost.
     pub fn toggle_reverse(&mut self) {
         self.reverse = !self.reverse;
+        if self.reverse && self.playing {
+            self.begin_slip(|s| s.reverse = true);
+        } else if !self.reverse {
+            self.end_slip(|s| s.reverse = false, true);
+        }
     }
 
     /// Moves the paused playhead, like turning the jog in pause mode.
@@ -425,12 +493,17 @@ impl Deck {
     }
 
     /// Jumps to a hot cue and plays. Returns false if the slot is empty.
-    /// Quantized while playing, the jump waits for the next beat.
-    pub fn hot_cue(&mut self, i: usize) -> bool {
+    /// Quantized while playing, the jump waits for the next beat. In slip
+    /// mode a `held` hot cue plays until `hot_cue_up`, then back to the ghost.
+    pub fn hot_cue(&mut self, i: usize, held: bool) -> bool {
         let Some(h) = self.hot[i] else { return false };
         self.cue_preview = false;
         self.loop_adjust = false;
+        self.roll = None;
         if self.playing {
+            if held {
+                self.begin_slip(|s| s.hot = Some(i));
+            }
             self.jump_in_phase(h.pos, h.loop_out, Some(i));
         } else {
             self.pending = None;
@@ -456,17 +529,126 @@ impl Deck {
         self.enter(to, loop_out, 0.0);
     }
 
+    /// The hot cue key let go: in slip, back to where the track would be.
+    pub fn hot_cue_up(&mut self, i: usize) {
+        if self.slip.hot != Some(i) {
+            return;
+        }
+        if self.pending.is_some_and(|p| p.hot == Some(i)) {
+            // Let go before the beat: nothing happened yet.
+            self.pending = None;
+            return self.end_slip(|s| s.hot = None, false);
+        }
+        // Leave a loop the hot cue started too.
+        self.looping = false;
+        self.end_slip(
+            |s| {
+                s.hot = None;
+                s.looping = false;
+            },
+            true,
+        );
+    }
+
     /// Goes to `to` plus `offset`, looping to `loop_out` if given.
     fn enter(&mut self, to: f64, loop_out: Option<f64>, offset: f64) {
         match loop_out {
             Some(out) => {
                 self.loop_in = Some(to);
                 self.loop_out = Some(out);
-                self.looping = true;
+                self.set_looping(true, false);
             }
-            None => self.looping = false,
+            None => self.set_looping(false, false),
         }
         self.jump(to + offset);
+    }
+
+    // --- Slip --------------------------------------------------------------------
+
+    pub fn toggle_slip(&mut self) -> bool {
+        self.slip_mode = !self.slip_mode;
+        if !self.slip_mode {
+            self.slip = Slip::default();
+        }
+        self.slip_mode
+    }
+
+    /// Starts a slipped action, the ghost starting here unless already running.
+    fn begin_slip(&mut self, mark: impl FnOnce(&mut Slip)) {
+        if !self.slip_mode {
+            return;
+        }
+        self.slip.ghost.get_or_insert(self.pos);
+        mark(&mut self.slip);
+    }
+
+    /// Ends a slipped action; once none is left, back to the ghost if `back`.
+    fn end_slip(&mut self, clear: impl FnOnce(&mut Slip), back: bool) {
+        clear(&mut self.slip);
+        if self.slip.active() {
+            return;
+        }
+        if let Some(ghost) = self.slip.ghost.take()
+            && back
+        {
+            self.jump(ghost);
+        }
+    }
+
+    /// Drops any slip and roll without going back.
+    fn cancel_slips(&mut self) {
+        self.slip = Slip::default();
+        self.roll = None;
+    }
+
+    /// Turns the loop on or off; in slip mode a loop slips, and leaving it
+    /// goes back to the ghost if `back`.
+    fn set_looping(&mut self, on: bool, back: bool) {
+        if on && !self.looping && self.playing {
+            self.begin_slip(|s| s.looping = true);
+        } else if !on && self.looping {
+            self.end_slip(|s| s.looping = false, back);
+        }
+        self.looping = on;
+    }
+
+    /// Holds a loop roll of `beats` from the last step of that size before
+    /// where the track is; another size while held switches to it.
+    /// False without a grid.
+    pub fn roll_down(&mut self, beats: f64) -> bool {
+        let Some(g) = self.grid() else { return false };
+        if !self.playing {
+            return true;
+        }
+        self.pending = None;
+        let ghost = match &mut self.roll {
+            Some(r) => {
+                r.beats = beats;
+                r.ghost
+            }
+            None => {
+                let saved = (self.loop_in, self.loop_out, self.looping);
+                self.roll = Some(Roll { beats, ghost: self.pos, saved });
+                self.pos
+            }
+        };
+        let step = g.period(self.sample_rate()) * beats;
+        let start = g.anchor + ((ghost - g.anchor) / step).floor() * step;
+        self.loop_in = Some(start);
+        self.loop_out = Some(start + step);
+        self.looping = true;
+        if self.pos < start || self.pos >= start + step {
+            self.jump(ghost);
+        }
+        true
+    }
+
+    /// Lets go of the roll: the loop from before comes back and the deck goes
+    /// to where the track would be.
+    pub fn roll_up(&mut self) {
+        let Some(roll) = self.roll.take() else { return };
+        (self.loop_in, self.loop_out, self.looping) = roll.saved;
+        self.jump(roll.ghost);
     }
 
     pub fn clear_hot_cue(&mut self, i: usize) {
@@ -503,6 +685,7 @@ impl Deck {
         let m = self.memories[i];
         self.cue_preview = false;
         self.pending = None;
+        self.cancel_slips();
         self.jump(m.pos);
         self.stop_now();
         self.cue = m.pos;
@@ -532,7 +715,7 @@ impl Deck {
         let at = self.snap(self.pos);
         self.loop_in = Some(at);
         self.loop_out = None;
-        self.looping = false;
+        self.set_looping(false, false);
         self.loop_adjust = false;
         self.cue = at;
     }
@@ -553,7 +736,7 @@ impl Deck {
                 }
                 let end = self.snap(self.pos).max(start + beat);
                 self.loop_out = Some(end);
-                self.looping = true;
+                self.set_looping(true, false);
                 // Past the out point already: carry on from as far into the loop.
                 if self.pos >= end {
                     self.jump(start + (self.pos - end));
@@ -561,7 +744,7 @@ impl Deck {
             }
             None if self.pos > start + self.sample_rate() * 0.01 => {
                 self.loop_out = Some(self.pos);
-                self.looping = true;
+                self.set_looping(true, false);
                 self.jump(start);
             }
             None => {}
@@ -572,7 +755,7 @@ impl Deck {
     pub fn reloop_exit(&mut self) {
         self.loop_adjust = false;
         if self.looping {
-            self.looping = false;
+            self.set_looping(false, true);
             self.pending = None;
         } else if let (Some(start), Some(end)) = (self.loop_in, self.loop_out) {
             if self.playing {
@@ -583,16 +766,80 @@ impl Deck {
         }
     }
 
-    /// A loop of `beats` from the playhead, or quantized, from the nearest beat.
+    /// A loop of `beats` from the playhead, or quantized, from the nearest
+    /// beat, or for loops under a beat, the nearest step of their size.
     pub fn auto_loop(&mut self, beats: f64) -> bool {
         let Some(beat) = self.beat_frames() else { return false };
-        let start = self.snap(self.pos);
+        let start = match self.grid() {
+            Some(g) if self.quantize() => {
+                let step = beat * beats.min(1.0);
+                (g.anchor + ((self.pos - g.anchor) / step).round() * step).max(0.0)
+            }
+            _ => self.pos,
+        };
         let end = (start + beats * beat).min(self.last_frame());
         self.loop_in = Some(start);
         self.loop_out = Some(end);
-        self.looping = true;
+        self.set_looping(true, false);
         self.cue = start;
         true
+    }
+
+    /// The L key: a beatloop of the loop size, or out of the loop.
+    pub fn beat_loop(&mut self) -> bool {
+        if self.looping {
+            self.set_looping(false, true);
+            self.pending = None;
+            return true;
+        }
+        self.auto_loop(self.loop_size)
+    }
+
+    /// Halves (0.5) or doubles (2.0) the roll held down or the running loop,
+    /// else the next beatloop. The loop size follows.
+    pub fn resize_loop(&mut self, factor: f64) {
+        if let Some(r) = self.roll {
+            self.loop_size = (r.beats * factor).clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
+            self.roll_down(self.loop_size);
+            return;
+        }
+        if !self.looping {
+            self.loop_size = (self.loop_size * factor).clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
+            return;
+        }
+        self.scale_loop(factor);
+        // A loop of a power-of-two beats becomes the size of the next one.
+        if let Some(beats) = self.loop_beats() {
+            let p = beats.log2().round();
+            if (beats - p.exp2()).abs() < 1e-3 && (MIN_LOOP_BEATS..=MAX_LOOP_BEATS).contains(&p.exp2()) {
+                self.loop_size = p.exp2();
+            }
+        }
+    }
+
+    /// Jumps `dir` (±1) times the beatjump size; while looping the loop moves
+    /// along. False without a grid.
+    pub fn beat_jump(&mut self, dir: f64) -> bool {
+        let Some(beat) = self.beat_frames() else { return false };
+        let d = dir * self.jump_beats * beat;
+        if self.looping
+            && let (Some(a), Some(b)) = (self.loop_in, self.loop_out)
+        {
+            if a + d < 0.0 || b + d > self.last_frame() {
+                return true;
+            }
+            self.loop_in = Some(a + d);
+            self.loop_out = Some(b + d);
+        }
+        self.jump(self.pos + d);
+        true
+    }
+
+    /// Next (up) or previous beatjump size.
+    pub fn resize_jump(&mut self, up: bool) {
+        let i = JUMP_SIZES.iter().position(|&s| s == self.jump_beats).unwrap_or(2);
+        let i = if up { (i + 1).min(JUMP_SIZES.len() - 1) } else { i.saturating_sub(1) };
+        self.jump_beats = JUMP_SIZES[i];
     }
 
     /// Halves (0.5) or doubles (2.0) the current loop from its in point.
@@ -846,8 +1093,31 @@ impl Deck {
         let (up, down) = (ramp(self.start_time), ramp(self.brake_time));
         let grid = self.grid();
         let track_rate = track.sample_rate as f64;
+        // The ghosts move on at playing speed, forward unless the deck was
+        // already in reverse before the slip.
+        let ghost_step = pitch * sr_ratio;
+        let dir = self.direction();
+        let slip_dir = if self.slip.reverse { 1.0 } else { dir };
 
         for i in 0..l.len() {
+            if (self.playing || self.slip.paused)
+                && let Some(g) = self.slip.ghost.as_mut()
+            {
+                *g = (*g + slip_dir * ghost_step).clamp(0.0, last);
+            }
+            if self.playing
+                && let Some(r) = self.roll.as_mut()
+            {
+                let prev = r.ghost;
+                r.ghost += dir * ghost_step;
+                if let (Some(a), Some(b), true) = r.saved
+                    && prev < b
+                    && r.ghost >= b
+                {
+                    r.ghost -= b - a;
+                }
+                r.ghost = r.ghost.clamp(0.0, last);
+            }
             if self.speed != target {
                 let slowing = target.abs() < self.speed.abs() || target * self.speed < 0.0;
                 let d = if slowing { down } else { up };
@@ -968,6 +1238,172 @@ mod tests {
     }
 
     #[test]
+    fn beatjump_moves_whole_beats() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, 30_000);
+        assert!(d.beat_jump(1.0));
+        assert_eq!(d.pos, 30_000.0 + 4.0 * 24_000.0);
+        d.jump_beats = 1.0;
+        d.beat_jump(-1.0);
+        assert_eq!(d.pos, 30_000.0 + 3.0 * 24_000.0);
+        d.play_pause();
+        d.beat_jump(-1.0);
+        assert_eq!(d.pos, 30_000.0 + 2.0 * 24_000.0, "paused too");
+
+        let silent = Track::from_samples("t".into(), "t".into(), None, SR, vec![0.0; SR as usize * 10]);
+        let mut d = Deck::new(SR);
+        d.load(Arc::new(silent), &TrackMemory::default(), false);
+        assert!(!d.beat_jump(1.0), "no grid, no beatjump");
+    }
+
+    #[test]
+    fn beatjump_moves_the_loop_along() {
+        let mut d = deck();
+        d.auto_loop(4.0); // 0 .. 96 000
+        d.play_pause();
+        run(&mut d, 30_000);
+        d.beat_jump(1.0);
+        assert_eq!((d.loop_in, d.loop_out), (Some(96_000.0), Some(192_000.0)));
+        assert_eq!(d.pos, 126_000.0);
+        d.beat_jump(-1.0);
+        d.beat_jump(-1.0);
+        assert_eq!(d.loop_in, Some(0.0), "not past the start");
+    }
+
+    #[test]
+    fn beatjump_sizes() {
+        let mut d = deck();
+        d.resize_jump(true);
+        assert_eq!(d.jump_beats, 8.0);
+        for _ in 0..9 {
+            d.resize_jump(true);
+        }
+        assert_eq!(d.jump_beats, 64.0);
+        for _ in 0..9 {
+            d.resize_jump(false);
+        }
+        assert_eq!(d.jump_beats, 1.0);
+    }
+
+    #[test]
+    fn beat_loop_sizes_and_toggle() {
+        let mut d = deck_with(Some(true));
+        d.resize_loop(0.5);
+        d.resize_loop(0.5);
+        d.resize_loop(0.5);
+        assert_eq!(d.loop_size, 0.5);
+        d.resize_loop(0.5);
+        d.step_paused(41.0); // between steps of a quarter beat
+        assert!(d.beat_loop());
+        assert!(d.looping);
+        assert!((d.loop_beats().unwrap() - 0.25).abs() < 1e-9);
+        let steps = (d.loop_in.unwrap() - beat(0.0)) / 6_000.0;
+        assert!((steps - steps.round()).abs() < 1e-6, "on a quarter beat: {steps}");
+        // While looping, [ ] change the loop and the size follows.
+        d.resize_loop(2.0);
+        assert_eq!((d.loop_size, d.loop_beats().map(|b| (b * 1e6).round() / 1e6)), (0.5, Some(0.5)));
+        assert!(d.beat_loop());
+        assert!(!d.looping, "L again leaves the loop");
+        for _ in 0..12 {
+            d.resize_loop(2.0);
+        }
+        assert_eq!(d.loop_size, MAX_LOOP_BEATS);
+    }
+
+    #[test]
+    fn slip_loop_comes_back_where_the_track_would_be() {
+        let mut d = deck();
+        assert!(d.toggle_slip());
+        d.play_pause();
+        run(&mut d, 24_000);
+        d.auto_loop(1.0); // 24 000 .. 48 000
+        run(&mut d, 72_000);
+        assert!(d.pos < 48_000.0);
+        assert_eq!(d.snapshot().ghost, Some(96_000.0));
+        d.reloop_exit();
+        assert_eq!(d.pos, 96_000.0);
+        assert_eq!(d.snapshot().ghost, None);
+    }
+
+    #[test]
+    fn slip_reverse_and_pause_come_back() {
+        let mut d = deck();
+        d.toggle_slip();
+        d.play_pause();
+        run(&mut d, 24_000);
+        d.toggle_reverse();
+        run(&mut d, 12_000);
+        d.toggle_reverse();
+        assert_eq!(d.pos, 36_000.0);
+
+        d.play_pause();
+        run(&mut d, 24_000);
+        assert!(d.pos < 48_000.0, "braked");
+        d.play_pause();
+        assert_eq!(d.pos, 60_000.0);
+        assert!(d.playing);
+    }
+
+    #[test]
+    fn held_hot_cue_slips_only_in_slip_mode() {
+        let mut d = deck();
+        d.step_paused(150.0);
+        d.set_hot_cue(0); // 96 000
+        d.step_paused(-150.0);
+        d.toggle_slip();
+        d.play_pause();
+        run(&mut d, 24_000);
+        d.hot_cue(0, true);
+        assert_eq!(d.pos, 96_000.0);
+        run(&mut d, 12_000);
+        d.hot_cue_up(0);
+        assert_eq!(d.pos, 36_000.0);
+
+        d.toggle_slip();
+        d.hot_cue(0, true);
+        run(&mut d, 12_000);
+        d.hot_cue_up(0);
+        assert_eq!(d.pos, 108_000.0, "no slip, no going back");
+    }
+
+    #[test]
+    fn roll_comes_back_even_without_slip_mode() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, 30_000);
+        assert!(d.roll_down(0.5));
+        // Half-beat steps from the beat at 12 000: the roll is 24 000 .. 36 000.
+        assert_eq!((d.loop_in, d.loop_out), (Some(24_000.0), Some(36_000.0)));
+        run(&mut d, 24_000);
+        assert!(d.pos >= 24_000.0 && d.pos < 36_000.0);
+        // Halving while rolling keeps the one ghost, and sets the loop size.
+        d.resize_loop(0.5);
+        assert_eq!((d.snapshot().roll, d.loop_size), (Some(0.25), 0.25));
+        assert!((d.loop_beats().unwrap() - 0.25).abs() < 1e-9);
+        d.roll_up();
+        assert_eq!(d.pos, 54_000.0);
+        assert!(!d.looping && d.loop_in.is_none());
+    }
+
+    #[test]
+    fn roll_inside_a_slip_loop_returns_into_the_loop() {
+        let mut d = deck();
+        d.toggle_slip();
+        d.play_pause();
+        run(&mut d, 24_000);
+        d.auto_loop(2.0); // 24 000 .. 72 000
+        run(&mut d, 30_000); // at 54 000
+        d.roll_down(0.25);
+        run(&mut d, 24_000); // the roll's ghost wraps in the loop: 78 000 → 30 000
+        d.roll_up();
+        assert_eq!(d.pos, 30_000.0);
+        assert_eq!((d.loop_in, d.loop_out, d.looping), (Some(24_000.0), Some(72_000.0), true));
+        d.reloop_exit();
+        assert_eq!(d.pos, 24_000.0 + 54_000.0, "the slip's ghost ran on through it all");
+    }
+
+    #[test]
     fn steady_tracks_quantize_by_default() {
         let mut d = deck_with(None);
         assert!(d.track.as_ref().unwrap().steady && d.quantize());
@@ -1021,7 +1457,7 @@ mod tests {
         d.step_paused(-150.0);
         d.play_pause();
         run(&mut d, 30_000); // 0.625 s: past beat 0.25 s, before 0.75 s
-        assert!(d.hot_cue(0));
+        assert!(d.hot_cue(0, false));
         assert_eq!(d.snapshot().pending_hot, Some(0));
         assert!(d.pos < beat(1.0), "nothing happens before the beat");
         run(&mut d, 12_000); // 0.875 s: the beat at 0.75 s went by
@@ -1041,7 +1477,7 @@ mod tests {
         d.step_paused(-150.0);
         d.play_pause();
         run(&mut d, 12_480); // 0.26 s: 10 ms after the beat at 0.25 s
-        assert!(d.hot_cue(0));
+        assert!(d.hot_cue(0, false));
         assert!(d.pending.is_none());
         assert!((d.pos - (cue + 480.0)).abs() < 2.0, "pos {}", d.pos);
     }
@@ -1054,7 +1490,7 @@ mod tests {
         d.step_paused(-150.0);
         d.play_pause();
         run(&mut d, 30_000);
-        d.hot_cue(0);
+        d.hot_cue(0, false);
         assert_eq!(d.pos, 2.0 * SR as f64);
     }
 
@@ -1066,11 +1502,11 @@ mod tests {
         d.step_paused(-150.0);
         d.play_pause();
         run(&mut d, 30_000);
-        d.hot_cue(0);
+        d.hot_cue(0, false);
         d.play_pause();
         assert!(d.pending.is_none());
         d.play_pause();
-        d.hot_cue(0);
+        d.hot_cue(0, false);
         d.cue_down(true);
         assert!(d.pending.is_none());
     }
@@ -1262,11 +1698,11 @@ mod tests {
     #[test]
     fn hot_cue_stores_then_jumps_and_plays() {
         let mut d = deck();
-        assert!(!d.hot_cue(0), "empty slots do nothing");
+        assert!(!d.hot_cue(0, false), "empty slots do nothing");
         d.step_paused(150.0);
         d.set_hot_cue(0);
         d.step_paused(-150.0);
-        assert!(d.hot_cue(0));
+        assert!(d.hot_cue(0, false));
         assert!(d.playing);
         assert_eq!(d.pos, 2.0 * SR as f64);
     }

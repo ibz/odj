@@ -27,6 +27,8 @@ pub struct WaveBin {
 }
 
 pub struct Track {
+    /// Fingerprint of the encoded audio, independent of tags, file name and folder.
+    pub id: String,
     pub path: PathBuf,
     pub title: String,
     pub artist: Option<String>,
@@ -90,6 +92,9 @@ impl Track {
 
         let mut samples = Vec::new();
         let mut packet_buf: Vec<f32> = Vec::new();
+        // Hashing the packets rather than the file keeps the ID stable across tag edits,
+        // and rather than decoded samples, across decoder changes.
+        let mut hasher = blake3::Hasher::new();
         let mut sample_rate = 0;
         loop {
             let packet = match format.next_packet() {
@@ -102,6 +107,7 @@ impl Track {
             if packet.track_id != track_id {
                 continue;
             }
+            hasher.update(&packet.data);
             let buf = match decoder.decode(&packet) {
                 Ok(buf) => buf,
                 Err(SymError::DecodeError(_)) => continue,
@@ -125,7 +131,9 @@ impl Track {
         let title = title.unwrap_or_else(|| {
             path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
-        Ok(Track::from_samples(path.to_path_buf(), title, artist, sample_rate, samples))
+        let mut track = Track::from_samples(path.to_path_buf(), title, artist, sample_rate, samples);
+        track.id = fingerprint(hasher);
+        Ok(track)
     }
 
     pub fn from_samples(
@@ -141,6 +149,8 @@ impl Track {
             .position(|f| f[0].abs().max(f[1].abs()) > AUTO_CUE_LEVEL)
             .unwrap_or(0) as f64;
         Track {
+            // Set by `load`; tracks built from bare samples have no file to fingerprint.
+            id: String::new(),
             wave: waveform(&mono, sample_rate),
             bpm: detect_bpm(&mono, sample_rate),
             path,
@@ -151,6 +161,11 @@ impl Track {
             first_sound,
         }
     }
+}
+
+/// 128 bits of the hash as hex: plenty to tell tracks apart, short as a file name.
+fn fingerprint(hasher: blake3::Hasher) -> String {
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 fn lowpass_coef(cutoff: f64, sample_rate: u32) -> f32 {
@@ -327,6 +342,62 @@ pub mod tests {
             let got = detect_bpm(&mono, 44_100).expect("bpm");
             assert!((got - bpm).abs() < 0.15, "expected {bpm}, got {got}");
         }
+    }
+
+    /// A 16-bit stereo WAV, optionally with a LIST/INFO title tag before the audio.
+    fn write_wav(path: &Path, samples: &[i16], title: Option<&str>) {
+        let mut info = Vec::new();
+        if let Some(t) = title {
+            let mut text = t.as_bytes().to_vec();
+            text.push(0);
+            if text.len() % 2 == 1 {
+                text.push(0);
+            }
+            info.extend_from_slice(b"INFOINAM");
+            info.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            info.extend_from_slice(&text);
+        }
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut riff = b"WAVE".to_vec();
+        riff.extend_from_slice(b"fmt ");
+        riff.extend_from_slice(&16u32.to_le_bytes());
+        for v in [1u16, 2] {
+            riff.extend_from_slice(&v.to_le_bytes());
+        }
+        riff.extend_from_slice(&44_100u32.to_le_bytes());
+        riff.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+        for v in [4u16, 16] {
+            riff.extend_from_slice(&v.to_le_bytes());
+        }
+        if !info.is_empty() {
+            riff.extend_from_slice(b"LIST");
+            riff.extend_from_slice(&(info.len() as u32).to_le_bytes());
+            riff.extend_from_slice(&info);
+        }
+        riff.extend_from_slice(b"data");
+        riff.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        riff.extend_from_slice(&data);
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(riff.len() as u32).to_le_bytes());
+        file.extend_from_slice(&riff);
+        std::fs::write(path, file).unwrap();
+    }
+
+    #[test]
+    fn fingerprint_ignores_tags_and_name_but_not_audio() {
+        let dir = std::env::temp_dir().join(format!("odj-fingerprint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio: Vec<i16> = (0..44_100 * 2).map(|i| ((i * 37) % 20_000) as i16 - 10_000).collect();
+        let mut other = audio.clone();
+        other[1000] += 1;
+        write_wav(&dir.join("plain.wav"), &audio, None);
+        write_wav(&dir.join("tagged copy.wav"), &audio, Some("Some Title"));
+        write_wav(&dir.join("changed.wav"), &other, None);
+        let id = |name: &str| Track::load(&dir.join(name)).unwrap().id;
+        assert_eq!(id("plain.wav").len(), 32);
+        assert_eq!(id("plain.wav"), id("tagged copy.wav"));
+        assert_ne!(id("plain.wav"), id("changed.wav"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

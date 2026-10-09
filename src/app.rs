@@ -121,13 +121,12 @@ impl App {
 
     /// Stores the loaded track's cues so they come back next time.
     pub fn remember(&mut self) {
-        let (path, mem) = {
+        let (track, mem) = {
             let deck = self.deck();
             let Some(track) = deck.track.as_ref() else { return };
-            (track.path.clone(), deck.memory())
+            (track.clone(), deck.memory())
         };
-        self.memory.set(&path, mem);
-        if let Err(e) = self.memory.save() {
+        if let Err(e) = self.memory.save_track(&track, &mem) {
             self.set_status(format!("Could not save cue memory: {e}"));
         }
     }
@@ -144,7 +143,7 @@ impl App {
         match result {
             Ok(track) => {
                 self.remember();
-                let mem = self.memory.get(&track.path);
+                let mem = self.memory.get(&track);
                 let msg = match track.bpm {
                     Some(bpm) => format!("Loaded {} ({bpm:.1} BPM)", track.title),
                     None => format!("Loaded {} (no BPM found)", track.title),
@@ -432,7 +431,7 @@ impl App {
                     "Auto Cue {} (applies from the next load)",
                     if on { "on" } else { "off" }
                 ));
-                if let Err(e) = self.memory.save() {
+                if let Err(e) = self.memory.save_settings() {
                     self.set_status(format!("Could not save settings: {e}"));
                 }
             }
@@ -498,7 +497,10 @@ mod tests {
     fn app() -> App {
         let dir = std::env::temp_dir().join(format!("odj-test-{}", std::process::id()));
         // Keep tests away from the real cue memory.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
         let track = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         deck.lock().unwrap().load(Arc::new(track), &TrackMemory::default(), false);

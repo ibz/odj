@@ -16,7 +16,7 @@ const XFADE: usize = 96;
 /// Largest block fed to the time stretcher.
 const MAX_BLOCK: usize = 4096;
 /// Most memory points kept per track.
-const MAX_MEMORIES: usize = 100;
+pub const MAX_MEMORIES: usize = 100;
 /// CD frames per second, the unit of the paused jog and the time display.
 pub const CD_FRAMES: f64 = 75.0;
 
@@ -58,9 +58,9 @@ impl TempoRange {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HotCue {
+pub struct Cue {
     pub pos: f64,
-    /// Set when the hot cue stores a loop.
+    /// Set when the cue stores a loop.
     pub loop_out: Option<f64>,
 }
 
@@ -79,8 +79,8 @@ pub struct Snapshot {
     pub bend: f64,
     pub cue: f64,
     pub cue_preview: bool,
-    pub hot: [Option<HotCue>; 3],
-    pub memories: Vec<HotCue>,
+    pub hot: [Option<Cue>; 3],
+    pub memories: Vec<Cue>,
     pub loop_in: Option<f64>,
     pub loop_out: Option<f64>,
     pub looping: bool,
@@ -110,9 +110,9 @@ pub struct Deck {
     cue: f64,
     cue_preview: bool,
     cue_latched: bool,
-    hot: [Option<HotCue>; 3],
+    hot: [Option<Cue>; 3],
     /// Stored cue/loop points, sorted by position (MEMORY/CALL).
-    memories: Vec<HotCue>,
+    memories: Vec<Cue>,
     loop_in: Option<f64>,
     loop_out: Option<f64>,
     looping: bool,
@@ -359,8 +359,8 @@ impl Deck {
             return;
         }
         self.hot[i] = Some(match (self.looping, self.loop_in, self.loop_out) {
-            (true, Some(pos), Some(out)) => HotCue { pos, loop_out: Some(out) },
-            _ => HotCue { pos: self.pos, loop_out: None },
+            (true, Some(pos), Some(out)) => Cue { pos, loop_out: Some(out) },
+            _ => Cue { pos: self.pos, loop_out: None },
         });
     }
 
@@ -391,8 +391,8 @@ impl Deck {
     pub fn store_memory(&mut self) -> Option<usize> {
         self.track.as_ref()?;
         let entry = match (self.looping, self.loop_in, self.loop_out) {
-            (true, Some(pos), Some(out)) => HotCue { pos, loop_out: Some(out) },
-            _ => HotCue { pos: self.cue, loop_out: None },
+            (true, Some(pos), Some(out)) => Cue { pos, loop_out: Some(out) },
+            _ => Cue { pos: self.cue, loop_out: None },
         };
         if self.memories.len() >= MAX_MEMORIES
             || self.memories.iter().any(|m| (m.pos - entry.pos).abs() < 1.0)

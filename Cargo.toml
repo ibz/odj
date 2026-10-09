@@ -9,6 +9,7 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
+blake3 = "1.8.7"
 cpal = { version = "0.18.2", features = ["pipewire"] }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }

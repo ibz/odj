@@ -674,18 +674,27 @@ impl Deck {
         self.memories.iter().position(|m| *m == entry).map(|i| i + 1)
     }
 
-    /// Calls the next (dir > 0) or previous memory point: it becomes the cue
-    /// point and the deck waits there, paused, with any stored loop armed.
+    /// Calls the next (dir > 0) or previous memory point. Playing, the deck
+    /// jumps there and plays on, on the next beat when quantizing; paused, it
+    /// becomes the cue point and the deck waits there. A stored loop loops.
     pub fn call_memory(&mut self, dir: i32) -> Option<usize> {
+        // From a jump still waiting for its beat, so presses add up.
+        let from = self.pending.map_or(self.pos, |p| p.to);
         let i = if dir > 0 {
-            self.memories.iter().position(|m| m.pos > self.pos + 1.0)?
+            self.memories.iter().position(|m| m.pos > from + 1.0)?
         } else {
-            self.memories.iter().rposition(|m| m.pos < self.pos - 1.0)?
+            self.memories.iter().rposition(|m| m.pos < from - 1.0)?
         };
         let m = self.memories[i];
+        self.loop_adjust = false;
+        self.cancel_slips();
+        if self.playing && !self.cue_preview {
+            self.jump_in_phase(m.pos, m.loop_out, None);
+            return Some(i + 1);
+        }
+        // Paused, or previewing the cue: that ends here.
         self.cue_preview = false;
         self.pending = None;
-        self.cancel_slips();
         self.jump(m.pos);
         self.stop_now();
         self.cue = m.pos;
@@ -693,7 +702,6 @@ impl Deck {
             self.loop_in = Some(m.pos);
             self.loop_out = Some(out);
             self.looping = true;
-            self.loop_adjust = false;
         }
         Some(i + 1)
     }
@@ -1469,6 +1477,30 @@ mod tests {
     }
 
     #[test]
+    fn quantized_memory_call_waits_for_the_beat() {
+        let mut d = deck_with(Some(true));
+        d.step_paused(150.0);
+        d.cue_down(true); // 2.25 s
+        let at = d.cue;
+        d.store_memory();
+        d.step_paused(150.0);
+        d.cue_down(true); // 4.25 s
+        d.store_memory();
+        d.step_paused(-300.0);
+        d.cue_down(true); // snaps to the beat at 0.25 s
+        d.play_pause();
+        run(&mut d, 18_000); // 0.625 s: past beat 0.25 s, before 0.75 s
+        assert_eq!(d.call_memory(1), Some(1));
+        assert!(d.pos < beat(1.0), "nothing happens before the beat");
+        assert_eq!(d.call_memory(1), Some(2), "a second press goes on from the first");
+        assert_eq!(d.call_memory(-1), Some(1));
+        run(&mut d, 12_000); // 0.875 s: the beat at 0.75 s went by
+        let expected = at + (0.875 - 0.75) * SR as f64;
+        assert!(d.playing);
+        assert!((d.pos - expected).abs() < 2.0, "pos {} expected {expected}", d.pos);
+    }
+
+    #[test]
     fn quantized_hot_cue_just_after_a_beat_goes_at_once() {
         let mut d = deck_with(Some(true));
         d.step_paused(150.0);
@@ -1668,17 +1700,26 @@ mod tests {
         assert_eq!(d.store_memory(), Some(3), "the loop is stored at its in point");
         assert_eq!(d.memories[2].loop_out, Some(2.5 * SR as f64));
 
-        // Calling while playing jumps there and waits in pause.
+        // Calling while playing jumps there and plays on, looping a stored loop.
         d.reloop_exit();
         run(&mut d, 200_000);
+        let cue = d.cue;
         assert_eq!(d.call_memory(-1), Some(3));
-        assert!(!d.playing && d.looping);
+        assert!(d.playing && d.looping);
         assert_eq!(d.pos, 2.0 * SR as f64);
+        assert_eq!(d.cue, cue, "the cue point stays");
         assert_eq!(d.call_memory(-1), Some(2));
-        assert_eq!(d.cue, SR as f64);
+        assert!(d.playing && !d.looping);
+        assert_eq!(d.pos, SR as f64);
+
+        // Paused, it becomes the cue point and the deck waits there.
+        d.play_pause();
         assert_eq!(d.call_memory(-1), Some(1));
+        assert!(!d.playing);
+        assert_eq!((d.pos, d.cue), (0.0, 0.0));
         assert_eq!(d.call_memory(-1), None);
         assert_eq!(d.call_memory(1), Some(2));
+        assert_eq!(d.cue, SR as f64);
 
         assert!(d.delete_memory());
         assert_eq!(d.memories.len(), 2);

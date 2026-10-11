@@ -13,12 +13,15 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 
+use crate::key::Key;
+
 /// Deck numbers go from 1 to this.
 pub const MAX_DECKS: u8 = 4;
 /// A deck not heard from for this long, in seconds, is gone.
 const TIMEOUT: f64 = 0.5;
-const MAGIC: &[u8; 4] = b"odj1";
-const SIZE: usize = 4 + 2 + 5 * 8;
+// odj2 added the key; decks of older builds ignore the newer packets.
+const MAGIC: &[u8; 4] = b"odj2";
+const SIZE: usize = 4 + 2 + 5 * 8 + 1;
 
 /// Seconds on the system's monotonic clock, the same in every process.
 pub fn now() -> f64 {
@@ -47,6 +50,8 @@ pub struct Packet {
     /// Beats per second actually heard at `time`, jog included.
     pub rate: f64,
     pub time: f64,
+    /// The key as heard, shifted by the tempo without Master Tempo.
+    pub key: Option<Key>,
 }
 
 impl Packet {
@@ -67,6 +72,7 @@ impl Packet {
         for (i, x) in floats.iter().enumerate() {
             b[6 + i * 8..14 + i * 8].copy_from_slice(&x.to_le_bytes());
         }
+        b[46] = Key::to_byte(self.key);
         b
     }
 
@@ -89,6 +95,7 @@ impl Packet {
             beat: f(2),
             rate: f(3),
             time: f(4),
+            key: Key::from_byte(b[46]),
         })
     }
 
@@ -272,6 +279,7 @@ mod tests {
             beat: 0.0,
             rate: 128.0 / 60.0,
             time: 0.0,
+            key: Some(Key { tonic: 9, minor: true }),
         }
     }
 
@@ -279,7 +287,7 @@ mod tests {
     fn packets_survive_the_round_trip() {
         let p = Packet { playing: true, master: true, running: true, beat: -3.25, time: 1234.5678, ..packet(2) };
         assert_eq!(Packet::decode(&p.encode()), Some(p));
-        let none = Packet { bpm: None, ..p };
+        let none = Packet { bpm: None, key: None, ..p };
         assert_eq!(Packet::decode(&none.encode()), Some(none));
         assert_eq!(Packet::decode(&[]), None);
         assert_eq!(Packet::decode(&[0; SIZE]), None);

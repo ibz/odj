@@ -13,6 +13,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag};
 
 use crate::grid::{BAR, BeatGrid};
+use crate::key::{Key, detect_key};
 
 /// Waveform bins per second of audio.
 pub const WAVE_RATE: f64 = 100.0;
@@ -54,6 +55,8 @@ pub struct Track {
     pub grid: Option<BeatGrid>,
     /// The beats keep to the grid, so quantizing makes sense.
     pub steady: bool,
+    /// Detected musical key, if the track has one.
+    pub key: Option<Key>,
     /// First audible frame, used as the default cue point.
     pub first_sound: f64,
 }
@@ -101,8 +104,13 @@ impl Track {
             .as_chunks::<2>().0.iter()
             .position(|f| f[0].abs().max(f[1].abs()) > AUTO_CUE_LEVEL)
             .unwrap_or(0) as f64;
-        let (grid, steady) = detect_grid(&mono, sample_rate).map_or((None, false), |(g, s)| (Some(g), s));
-        let wave = waveform(&mono, &samples, sample_rate);
+        // The key on its own thread, while the grid and the waveform are worked out.
+        let (key, (grid, steady), wave) = std::thread::scope(|scope| {
+            let key = scope.spawn(|| detect_key(&mono, sample_rate));
+            let grid = detect_grid(&mono, sample_rate).map_or((None, false), |(g, s)| (Some(g), s));
+            let wave = waveform(&mono, &samples, sample_rate);
+            (key.join().expect("key detection panicked"), grid, wave)
+        });
         Track {
             // Set by `load`; tracks built from bare samples have no file to fingerprint.
             id: String::new(),
@@ -110,6 +118,7 @@ impl Track {
             wave,
             grid,
             steady,
+            key,
             path,
             title,
             artist,

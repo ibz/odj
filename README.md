@@ -50,6 +50,15 @@ on from where it would have been had you never rolled. Slip mode (`Z`) does the 
 for loops, reverse, held hot cues and pause: the track keeps going
 underneath, shown as a purple line on the waveform, and comes back in time.
 
+### Key
+
+odj-player finds each track's musical key and shows it after the BPM, as its
+Camelot code and name (`KEY 8A Am`). Without Master Tempo the pitch moves with
+the tempo, so the key shown is the one you hear, with how many semitones it
+has moved (`+1`). With other decks running, the sync row shows their keys too,
+in green where they mix well with this one: the same number on the Camelot
+wheel, or the same letter a step either way.
+
 ### Sync
 
 Run one odj-player per deck and they find each other: each takes a deck

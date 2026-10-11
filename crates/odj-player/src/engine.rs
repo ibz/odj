@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use odj_core::audio::Source;
 use odj_core::grid::BeatGrid;
+use odj_core::key::Key;
 use odj_core::link::{self, Packet};
 use odj_core::memory::{Cue, MAX_MEMORIES, TrackMemory};
 use odj_core::track::Track;
@@ -181,6 +182,8 @@ pub struct Snapshot {
     pub range: TempoRange,
     pub master_tempo: bool,
     pub master_tempo_available: bool,
+    /// The key as heard, and the semitones the tempo moves it.
+    pub key: Option<(Key, i32)>,
     pub bend: f64,
     pub cue: f64,
     pub cue_preview: bool,
@@ -360,6 +363,7 @@ impl Deck {
             range: self.range,
             master_tempo: self.master_tempo,
             master_tempo_available: self.stretch.is_some(),
+            key: self.heard_key(),
             bend: self.bend,
             cue: self.cue,
             cue_preview: self.cue_preview,
@@ -466,6 +470,14 @@ impl Deck {
 
     fn direction(&self) -> f64 {
         if self.reverse { -1.0 } else { 1.0 }
+    }
+
+    /// The track's key as heard, and how many semitones the tempo moves it:
+    /// without Master Tempo, the pitch goes with the speed.
+    pub fn heard_key(&self) -> Option<(Key, i32)> {
+        let key = self.track.as_ref()?.key?;
+        let shift = if self.master_tempo { 0 } else { (12.0 * self.tempo_factor().log2()).round() as i32 };
+        Some((key.shifted(shift), shift))
     }
 
     fn tempo_factor(&self) -> f64 {
@@ -1266,6 +1278,7 @@ impl Deck {
             beat: grid.map_or(0.0, |g| g.beat_at(h.pos, self.sample_rate())),
             rate: grid.map_or(0.0, |g| g.bpm / 60.0 * h.rate),
             time: h.time,
+            key: self.heard_key().map(|(k, _)| k),
         }
     }
 
@@ -2055,6 +2068,7 @@ mod tests {
             beat: beat0 + t * bpm / 60.0,
             rate: bpm / 60.0,
             time: t,
+            key: None,
         }
     }
 
@@ -2584,5 +2598,23 @@ mod tests {
             last = d.pos;
         }
         assert!(wrapped, "going back past the loop in comes round to the loop out");
+    }
+
+    #[test]
+    fn the_key_moves_with_the_tempo_unless_master_tempo() {
+        let mut track = Track::from_samples("t".into(), "t".into(), None, SR, click_track(120.0, 5.0, SR));
+        let am = Key { tonic: 9, minor: true };
+        track.key = Some(am);
+        let mut d = Deck::new(SR);
+        d.load(Arc::new(track), &TrackMemory::default(), false);
+        assert_eq!(d.heard_key(), Some((am, 0)));
+        d.tempo = 2.0;
+        assert_eq!(d.heard_key(), Some((am, 0)), "2% is a third of a semitone");
+        d.tempo = 6.0;
+        let up = (Key { tonic: 10, minor: true }, 1);
+        assert_eq!(d.heard_key(), Some(up), "6% is a semitone");
+        assert_eq!(d.packet(0.0).key, Some(up.0), "the other decks hear it too");
+        d.master_tempo = true;
+        assert_eq!(d.heard_key(), Some((am, 0)));
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod grid;
+pub mod key;
 pub mod library;
 pub mod link;
 pub mod memory;

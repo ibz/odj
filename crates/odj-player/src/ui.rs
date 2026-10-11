@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
 
+use odj_core::key::Key;
 use odj_core::track::{Track, WAVE_RATE, WaveBin};
 use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
 
@@ -43,9 +44,11 @@ const PHASE_CELLS: usize = 17;
 const ZOOM_SPAN: f64 = 8.0;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
+    // The status rows wrap inside their box, which grows to fit them.
+    let status_lines = status_lines(app, s, f.area().width.saturating_sub(2) as usize);
     let [header, status, zoom, overview, info, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(4),
+        Constraint::Length(status_lines.len() as u16 + 2),
         Constraint::Min(4),
         // Two rows each side of the centre, and one on top for the markers.
         Constraint::Length(7),
@@ -55,7 +58,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     .areas(f.area());
 
     draw_header(f, header, app, s);
-    draw_status(f, status, app, s);
+    let block = Block::bordered().border_style(Style::new().fg(DIM));
+    f.render_widget(Paragraph::new(status_lines).block(block), status);
 
     let zoom_block = Block::bordered().border_style(Style::new().fg(DIM));
     let overview_block = Block::bordered().border_style(Style::new().fg(DIM));
@@ -121,11 +125,37 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
-    let block = Block::bordered().border_style(Style::new().fg(DIM));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+/// The deck's state, then the sync row, each wrapped to `width`.
+fn status_lines(app: &App, s: &Snapshot, width: usize) -> Vec<Line<'static>> {
+    let heard_bpm = s.bpm.map(|b| b * (1.0 + s.tempo / 100.0));
+    let mut lines = flow(status_groups(app, s), width);
+    lines.extend(flow(sync_groups(&s.sync, heard_bpm, s.key.map(|(k, _)| k)), width));
+    lines
+}
 
+/// Lays `groups` along lines of `width`, each after its gap of spaces,
+/// moving a group that doesn't fit to the next line whole. A line drops the
+/// gap before its first group.
+fn flow(groups: Vec<(usize, Vec<Span<'static>>)>, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    for (gap, spans) in groups {
+        let group: usize = spans.iter().map(Span::width).sum();
+        let line = lines.last_mut().unwrap();
+        if line.width() == 0 {
+            line.spans.extend(spans);
+        } else if line.width() + gap + group <= width {
+            line.push_span(" ".repeat(gap));
+            line.spans.extend(spans);
+        } else {
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+/// The play state, time, tempo, BPM, key, bar and switches, as groups for
+/// [`flow`].
+fn status_groups(app: &App, s: &Snapshot) -> Vec<(usize, Vec<Span<'static>>)> {
     let (state, color) = if s.cue_preview {
         ("● CUE  ", CUE_COLOR)
     } else if s.sync.waiting {
@@ -140,8 +170,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         ("‖ PAUSE", CUE_COLOR)
     };
 
-    let mut spans = vec![Span::styled(format!(" {state} "), Style::new().fg(Color::Black).bg(color).bold()), Span::raw("  ")];
+    let mut groups = vec![(0, vec![Span::styled(format!(" {state} "), Style::new().fg(Color::Black).bg(color).bold())])];
 
+    let mut spans = Vec::new();
     if let Some(t) = &s.track {
         let elapsed = s.pos / t.sample_rate as f64;
         let remaining = (t.duration() - elapsed).max(0.0);
@@ -158,31 +189,28 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     } else {
         spans.push(Span::styled("TIME --:--:--", Style::new().fg(DIM)));
     }
+    groups.push((2, spans));
 
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(
-        " A.CUE ",
-        if app.auto_cue() { Style::new().fg(Color::Black).bg(CUE_COLOR).bold() } else { Style::new().fg(DIM) },
-    ));
-    spans.push(Span::raw("    "));
-    spans.push(Span::styled("TEMPO ", Style::new().fg(DIM)));
+    let a_cue = if app.auto_cue() { Style::new().fg(Color::Black).bg(CUE_COLOR).bold() } else { Style::new().fg(DIM) };
+    groups.push((2, vec![Span::styled(" A.CUE ", a_cue)]));
+
+    let mut spans = vec![Span::styled("TEMPO ", Style::new().fg(DIM))];
     let tempo_style = if s.tempo == 0.0 { Style::new().fg(Color::Green) } else { Style::new().bold() };
     spans.push(Span::styled(format!("{:+.2}%", s.tempo), tempo_style));
     spans.push(Span::styled(format!(" ±{}", s.range.percent()).replace("±100", "WIDE"), Style::new().fg(DIM)));
     if s.bend != 0.0 {
         spans.push(Span::styled(format!(" JOG {:+.0}%", s.bend), Style::new().fg(Color::Cyan)));
     }
+    groups.push((4, spans));
 
-    spans.push(Span::raw("    "));
     let mt_style = match (s.master_tempo, s.master_tempo_available) {
         (true, _) => Style::new().fg(Color::Black).bg(Color::Red).bold(),
         (false, true) => Style::new().fg(DIM),
         (false, false) => Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
     };
-    spans.push(Span::styled(" MT ", mt_style));
+    groups.push((4, vec![Span::styled(" MT ", mt_style)]));
 
-    spans.push(Span::raw("    "));
-    spans.push(Span::styled("BPM ", Style::new().fg(DIM)));
+    let mut spans = vec![Span::styled("BPM ", Style::new().fg(DIM))];
     match s.bpm {
         Some(bpm) => {
             let heard = bpm * (1.0 + s.tempo / 100.0);
@@ -193,43 +221,53 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         }
         None => spans.push(Span::styled("---.-", Style::new().fg(DIM))),
     }
+    groups.push((4, spans));
+    if s.track.is_some() {
+        let mut spans = vec![Span::styled("KEY ", Style::new().fg(DIM))];
+        match s.key {
+            Some((key, shift)) => {
+                spans.push(Span::styled(key.camelot(), Style::new().bold()));
+                spans.push(Span::styled(format!(" {}", key.name()), Style::new().fg(Color::Gray)));
+                if shift != 0 {
+                    spans.push(Span::styled(format!(" {shift:+}"), Style::new().fg(Color::Yellow)));
+                }
+            }
+            None => spans.push(Span::styled("--", Style::new().fg(DIM))),
+        }
+        groups.push((3, spans));
+    }
     if let (Some(g), Some(t)) = (s.grid, &s.track)
         && s.show_grid
     {
         let (bar, beat) = g.bar_beat(s.pos, t.sample_rate as f64);
-        spans.push(Span::styled("   BAR ", Style::new().fg(DIM)));
-        spans.push(Span::styled(format!("{bar}.{beat} "), Style::new().bold()));
+        let mut spans = vec![Span::styled("BAR ", Style::new().fg(DIM)), Span::styled(format!("{bar}.{beat} "), Style::new().bold())];
         for b in 1..=4 {
             let lit = Style::new().fg(if beat == 1 { Color::Red } else { GRID_COLOR });
             spans.push(if b == beat { Span::styled("■", lit) } else { Span::styled("□", Style::new().fg(DIM)) });
         }
+        groups.push((3, spans));
     }
-    spans.push(Span::raw("    "));
     let q_style = match (s.quantize, s.grid.is_some()) {
         (true, _) => Style::new().fg(Color::Black).bg(GRID_COLOR).bold(),
         (false, true) => Style::new().fg(DIM),
         (false, false) => Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
     };
-    spans.push(Span::styled(" QUANTIZE ", q_style));
-    spans.push(Span::raw(" "));
+    groups.push((4, vec![Span::styled(" QUANTIZE ", q_style)]));
     let slip_style = if s.slip { Style::new().fg(Color::Black).bg(SLIP_COLOR).bold() } else { Style::new().fg(DIM) };
-    spans.push(Span::styled(" SLIP ", slip_style));
-
-    let [first, second] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
-    f.render_widget(Paragraph::new(Line::from(spans)), first);
-    f.render_widget(Paragraph::new(sync_line(&s.sync, s.bpm.map(|b| b * (1.0 + s.tempo / 100.0)))), second);
+    groups.push((1, vec![Span::styled(" SLIP ", slip_style)]));
+    groups
 }
 
-/// SYNC and MASTER, the phase meter, and the other decks.
-fn sync_line(sync: &SyncView, heard_bpm: Option<f64>) -> Line<'static> {
+/// SYNC and MASTER, the phase meter, and the other decks: their tempo, and
+/// their key, in green where it mixes with `key`. As groups for [`flow`].
+fn sync_groups(sync: &SyncView, heard_bpm: Option<f64>, key: Option<Key>) -> Vec<(usize, Vec<Span<'static>>)> {
     let badge = |on: bool, color: Color| {
         if on { Style::new().fg(Color::Black).bg(color).bold() } else { Style::new().fg(DIM) }
     };
-    let mut spans = Vec::new();
     if sync.deck.is_none() {
-        spans.push(Span::styled(" SYNC ", Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)));
-        return Line::from(spans);
+        return vec![(0, vec![Span::styled(" SYNC ", Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT))])];
     }
+    let mut spans = Vec::new();
     let label = if sync.synced && sync.leader.is_some() && !sync.phase_lock { " SYNC BPM " } else { " SYNC " };
     spans.push(Span::styled(label, badge(sync.synced, SYNC_COLOR)));
     spans.push(Span::raw(" "));
@@ -239,9 +277,9 @@ fn sync_line(sync: &SyncView, heard_bpm: Option<f64>) -> Line<'static> {
         None if sync.synced && !sync.master => spans.push(Span::styled(" no master yet", Style::new().fg(DIM))),
         None => {}
     }
+    let mut groups = vec![(0, spans)];
 
-    spans.push(Span::raw("    "));
-    spans.push(Span::styled("PHASE ", Style::new().fg(DIM)));
+    let mut spans = vec![Span::styled("PHASE ", Style::new().fg(DIM))];
     match sync.phase {
         Some((deck, beats)) => {
             let ms = heard_bpm.map_or(0.0, |bpm| beats * 60_000.0 / bpm);
@@ -264,22 +302,31 @@ fn sync_line(sync: &SyncView, heard_bpm: Option<f64>) -> Line<'static> {
         }
         None => spans.push(Span::styled(format!("▕{}▏", "·".repeat(PHASE_CELLS)), Style::new().fg(DIM))),
     }
+    groups.push((4, spans));
 
     for p in &sync.others {
-        spans.push(Span::raw("    "));
+        let mut spans = Vec::new();
         let style = if p.master { Style::new().fg(MASTER_COLOR).bold() } else { Style::new().fg(Color::Gray) };
         spans.push(Span::styled(format!("D{} ", p.deck), style));
         spans.push(Span::styled(if p.playing { "▶ " } else { "‖ " }, Style::new().fg(DIM)));
         let bpm = p.bpm.map_or("---.--".to_string(), |b| format!("{b:.2}"));
         spans.push(Span::styled(bpm, style));
+        match p.key {
+            Some(k) => {
+                let mixes = key.is_some_and(|key| key.compatible(k));
+                spans.push(Span::styled(format!(" {}", k.camelot()), if mixes { Style::new().fg(Color::Green).bold() } else { style }));
+            }
+            None => spans.push(Span::styled(" --", Style::new().fg(DIM))),
+        }
         if p.master {
             spans.push(Span::styled(" M", style));
         }
         if p.synced && !p.master {
             spans.push(Span::styled(" S", Style::new().fg(SYNC_COLOR)));
         }
+        groups.push((4, spans));
     }
-    Line::from(spans)
+    groups
 }
 
 fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
@@ -748,5 +795,47 @@ fn fmt_beats(n: f64) -> String {
         format!("1/{}", (1.0 / n).round())
     } else {
         format!("{n:.2}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use odj_core::link::Packet;
+
+    #[test]
+    fn other_decks_keys_are_green_where_they_mix() {
+        let deck = |deck, key| Packet {
+            deck,
+            playing: true,
+            synced: false,
+            master: false,
+            steady: true,
+            running: true,
+            master_since: 0.0,
+            bpm: Some(128.0),
+            beat: 0.0,
+            rate: 128.0 / 60.0,
+            time: 0.0,
+            key,
+        };
+        let em = Key { tonic: 4, minor: true }; // 9A
+        let bbm = Key { tonic: 10, minor: true }; // 3A
+        let sync = SyncView { deck: Some(1), others: vec![deck(2, Some(em)), deck(3, Some(bbm)), deck(4, None)], ..SyncView::default() };
+        let groups = sync_groups(&sync, Some(128.0), Some(Key { tonic: 9, minor: true }));
+        let style = |text: &str| groups.iter().flat_map(|(_, spans)| spans).find(|s| s.content == text).map(|s| s.style.fg).unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(style(" 9A"), Some(Color::Green), "Em mixes with Am");
+        assert_ne!(style(" 3A"), Some(Color::Green), "Bbm doesn't");
+        assert_eq!(style(" --"), Some(DIM), "no key yet");
+    }
+
+    #[test]
+    fn groups_that_dont_fit_go_on_the_next_line_whole() {
+        let group = |gap, text: &'static str| (gap, vec![Span::raw(text)]);
+        let text = |lines: Vec<Line>| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let groups = || vec![group(0, "PLAY"), group(2, "TIME 1:00"), group(4, "BPM 128.0")];
+        assert_eq!(text(flow(groups(), 80)), ["PLAY  TIME 1:00    BPM 128.0"]);
+        assert_eq!(text(flow(groups(), 15)), ["PLAY  TIME 1:00", "BPM 128.0"]);
+        assert_eq!(text(flow(groups(), 5)), ["PLAY", "TIME 1:00", "BPM 128.0"]);
     }
 }

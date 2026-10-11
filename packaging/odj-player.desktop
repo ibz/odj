@@ -2,7 +2,7 @@
 Type=Application
 Name=odj player
 GenericName=DJ Player
-Comment=Keyboard-driven DJ player inspired by the Pioneer CDJ-800
+Comment=Keyboard-driven DJ player inspired by Pioneer CDJ decks
 Exec=odj-player %f
 Terminal=true
 Icon=audio-x-generic

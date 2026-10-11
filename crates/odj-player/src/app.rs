@@ -11,8 +11,9 @@ use odj_core::library::{Browser, siblings};
 use odj_core::link;
 use odj_core::memory::Memory;
 use odj_core::track::Track;
+use odj_core::tui::Help;
 
-use crate::engine::{Deck, JUMP_SIZES, MAX_LOOP_BEATS, MIN_LOOP_BEATS};
+use crate::engine::{Deck, JUMP_SIZES, MAX_LOOP_BEATS, MIN_LOOP_BEATS, MemoryCall};
 
 /// Without key-release events a hold lasts this long after the last key event.
 const HOLD_FALLBACK: Duration = Duration::from_millis(500);
@@ -36,7 +37,7 @@ pub struct App {
     memory: Memory,
     loading: Option<(PathBuf, mpsc::Receiver<anyhow::Result<Track>>)>,
     status: Option<(String, Instant)>,
-    pub show_help: bool,
+    pub help: Help,
     pub show_remaining: bool,
     /// Hot cue REC mode: the hot cue keys store instead of trigger.
     pub hot_rec: bool,
@@ -77,7 +78,7 @@ impl App {
             memory,
             loading: None,
             status: None,
-            show_help: false,
+            help: Help::default(),
             show_remaining: false,
             hot_rec: false,
             track_number: None,
@@ -365,14 +366,18 @@ impl App {
     fn deck_key(&mut self, code: KeyCode, shift: bool, repeat: bool) {
         // Keys that toggle or trigger ignore auto-repeat; steppers accept it.
         let once = !repeat;
+        // Over the deck, the help takes the keys that turn and scroll it.
+        if self.help.is_open() && self.help.key(code, shift, crate::ui::HELP.len()) {
+            return;
+        }
         match code {
             KeyCode::Esc => {
-                self.show_help = false;
+                self.help.close();
                 if self.deck().is_adjusting_grid() {
                     self.deck().toggle_grid_adjust();
                 }
             }
-            KeyCode::Char('/') if once => self.show_help = !self.show_help,
+            KeyCode::Char('/') if once => self.help.toggle(),
             KeyCode::Tab if once => self.browser.open = true,
 
             KeyCode::Char(' ') if once => self.deck().play_pause(),
@@ -410,9 +415,15 @@ impl App {
                 }
             }
             KeyCode::Char(c @ ('j' | 'k')) if once => {
-                let called = self.deck().call_memory(if c == 'j' { -1 } else { 1 });
+                let which = match (c, shift) {
+                    ('j', false) => MemoryCall::Previous,
+                    ('j', true) => MemoryCall::Current,
+                    _ => MemoryCall::Next,
+                };
+                let called = self.deck().call_memory(which);
                 match called {
                     Some(n) => self.set_status(format!("Memory {n} called")),
+                    None if which == MemoryCall::Current => self.set_status("No memory point before the playhead"),
                     None => self.set_status("No more memory points this way"),
                 }
             }
@@ -428,7 +439,7 @@ impl App {
                     deck.is_adjusting_loop()
                 };
                 if adjusting {
-                    self.set_status("Loop out adjust: , / . move the out point (Shift ×10), O to finish");
+                    self.set_status("Loop out adjust: , / . move the out point (Shift: ×10), O to finish");
                 }
             }
             KeyCode::Char('p') if once => self.deck().reloop_exit(),
@@ -588,7 +599,7 @@ impl App {
                     deck.toggle_grid_adjust().then(|| deck.is_adjusting_grid())
                 };
                 match on {
-                    Some(true) => self.set_status("Grid adjust: , / . shift the beats 1 ms (Shift 10), ↑/↓ BPM ±0.01 (Shift 0.1), Y to finish"),
+                    Some(true) => self.set_status("Grid adjust: , / . shift the beats 1 ms (Shift: 10 ms), ↑/↓ BPM ±0.01 (Shift: ±0.1), Y to finish"),
                     Some(false) => self.set_status("Grid adjust done"),
                     None => self.set_status("No beat grid (tap the BPM with A)"),
                 }
@@ -752,6 +763,81 @@ mod tests {
         assert_eq!(app.deck().memory().grid, None);
     }
 
+    #[test]
+    fn help_opens_on_the_basics_and_turns_to_the_other_pages() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        let screen = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>()
+        };
+        press(&mut app, KeyCode::Char('?'), true);
+        assert!(app.help.is_open());
+        let text = screen(&app);
+        assert!(text.contains(" Esc  Close ") && text.contains(" Tab  Next page "));
+        assert!(text.contains(" Basics ") && text.contains(" Beat grid ") && text.contains(" About "));
+        assert!(!text.contains("Make the playhead beat 1"), "the grid keys are on their own page");
+
+        press(&mut app, KeyCode::Tab, false);
+        assert_eq!(app.help.page(), 1);
+        assert!(!app.browser.open, "Tab turns the page instead of browsing");
+        press(&mut app, KeyCode::Tab, true);
+        assert_eq!(app.help.page(), 0, "Shift+Tab goes back");
+        press(&mut app, KeyCode::Left, false);
+        assert_eq!(app.help.page(), crate::ui::HELP.len() - 1);
+        assert!(screen(&app).contains("odj@ibz.me"), "the last page is About");
+
+        press(&mut app, KeyCode::Char('?'), true);
+        assert!(!app.help.is_open());
+        press(&mut app, KeyCode::Char('?'), true);
+        assert_eq!(app.help.page(), 0, "opens on the basics again");
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.help.is_open());
+    }
+
+    /// The README's Keys section mirrors the help: the same pages, each with
+    /// the same keys.
+    #[test]
+    fn the_readme_has_every_help_key() {
+        use odj_core::tui::Page;
+        let readme = include_str!("../../../README.md").replace('`', "");
+        let start = readme.find("### odj-player\n").expect("a section for odj-player");
+        let section = &readme[start..];
+        let section = &section[..section[4..].find("\n### ").map_or(section.len(), |i| i + 4)];
+        for page in crate::ui::HELP {
+            let Page::Keys(title, keys) = page else { continue };
+            let page = section.split("#### ").find(|p| p.starts_with(&format!("{title}\n"))).expect(title);
+            for (k, v) in *keys {
+                assert!(page.contains(&format!("| {k} | {v} |")), "{title}: {k}");
+            }
+        }
+    }
+
+    /// Every key of the old single page is on one of the pages.
+    #[test]
+    fn the_help_pages_have_every_key() {
+        use odj_core::tui::Page;
+        let keys: Vec<&str> = crate::ui::HELP
+            .iter()
+            .flat_map(|p| match p {
+                Page::Keys(_, keys) => keys.iter().map(|(k, _)| *k).collect(),
+                Page::About(_) => Vec::new(),
+            })
+            .collect();
+        for k in [
+            "Space", "C", "Space while holding C", "1 2 3", "E", "Shift+1 2 3", "I / O / P", "O while looping", "L",
+            "- / =", "Shift+- / =", "; (hold)", "Z", "W / J / K / X", "Shift+J", "[ / ]", "↑ / ↓", "0 / G", "M",
+            ", / .", "Q", "F", "Shift+F", "A", "Shift+A", "D", "Y", "← / →", "B / N", "R", "T", "Shift+T", "S / V",
+            "Tab",
+        ] {
+            assert!(keys.contains(&k), "{k}");
+        }
+    }
+
     /// Draws the deck with the grid showing; shown with --nocapture.
     #[test]
     fn draws_the_grid() {
@@ -785,7 +871,7 @@ mod tests {
                 assert!(cells.iter().any(|c| c.bg == crate::ui::BAR_BG), "bar lines are drawn");
                 assert!(cells.iter().any(|c| c.bg == crate::ui::GHOST_BG), "the ghost is drawn");
                 let text: String = cells.iter().map(|c| c.symbol()).collect();
-                for label in ["ROLL 1/4", "SLIP", "JUMP 4"] {
+                for label in ["ROLL 1/4", "SLIP", "JUMP 4", "┃"] {
                     assert!(text.contains(label), "{label}");
                 }
             }

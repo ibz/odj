@@ -6,6 +6,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+authors = ["Ioan Bizău <odj@ibz.me>"]
 repository = "https://github.com/ibz/odj"
 
 [workspace.dependencies]

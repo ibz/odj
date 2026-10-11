@@ -12,6 +12,7 @@ use odj_core::grid::{BAR, BeatGrid};
 use odj_core::library::fuzzy_match;
 use odj_core::memory::{Cue, Memory, user_grid};
 use odj_core::track::Track;
+use odj_core::tui::Help;
 
 use crate::engine::{MAX_GAIN_DB, MIN_GAIN_DB, Mode, PADS, Props, Sample, Sampler, cut};
 use crate::kit::{Kit, KitPad, PadSource};
@@ -199,7 +200,7 @@ pub struct App {
     pub slots: [Slot; PADS],
     pub selected: usize,
     pub screen: Screen,
-    pub show_help: bool,
+    pub help: Help,
     kit_file: PathBuf,
     loader: Loader,
     status: Option<(String, Instant)>,
@@ -228,7 +229,7 @@ impl App {
             slots: kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, generation: 0 }),
             selected: 0,
             screen: Screen::Pads,
-            show_help: false,
+            help: Help::default(),
             kit_file,
             loader: Loader::new(out_rate),
             status: None,
@@ -565,9 +566,13 @@ impl App {
     }
 
     fn pads_key(&mut self, code: KeyCode, shift: bool) {
-        if self.show_help {
-            if matches!(code, KeyCode::Esc | KeyCode::Char('/')) {
-                self.show_help = false;
+        // The help covers the pads; they don't play under it.
+        if self.help.is_open() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('/') => self.help.close(),
+                _ => {
+                    self.help.key(code, shift, crate::ui::HELP.len());
+                }
             }
             return;
         }
@@ -584,7 +589,7 @@ impl App {
         }
         let i = self.selected;
         match code {
-            KeyCode::Char('/') => self.show_help = true,
+            KeyCode::Char('/') => self.help.toggle(),
             KeyCode::Left => self.selected = i - i % 4 + (i % 4 + 3) % 4,
             KeyCode::Right => self.selected = i - i % 4 + (i % 4 + 1) % 4,
             KeyCode::Up => self.selected = (i + PADS - 4) % PADS,
@@ -946,6 +951,44 @@ mod tests {
         assert_eq!(ed.source.start, 29_800.0, "a tenth of a second without a grid");
     }
 
+    #[test]
+    fn help_opens_on_the_basics_and_turns_to_the_other_pages() {
+        let mut a = app("help");
+        key(&mut a, '?', KeyEventKind::Press);
+        assert!(a.help.is_open());
+        key(&mut a, 'q', KeyEventKind::Press);
+        assert!(a.help.is_open(), "pads don't play under the help");
+        a.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!((a.help.page(), a.selected), (1, 0), "→ turns the page, not the pad");
+        a.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        a.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(a.help.page(), crate::ui::HELP.len() - 1, "round to About");
+        key(&mut a, '?', KeyEventKind::Press);
+        assert!(!a.help.is_open());
+        key(&mut a, '?', KeyEventKind::Press);
+        assert_eq!(a.help.page(), 0);
+        a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!a.help.is_open());
+    }
+
+    /// The README's Keys section mirrors the help: the same pages, each with
+    /// the same keys.
+    #[test]
+    fn the_readme_has_every_help_key() {
+        use odj_core::tui::Page;
+        let readme = include_str!("../../../README.md").replace('`', "");
+        let start = readme.find("### odj-sampler\n").expect("a section for odj-sampler");
+        let section = &readme[start..];
+        let section = &section[..section[4..].find("\n### ").map_or(section.len(), |i| i + 4)];
+        for page in crate::ui::HELP {
+            let Page::Keys(title, keys) = page else { continue };
+            let page = section.split("#### ").find(|p| p.starts_with(&format!("{title}\n"))).expect(title);
+            for (k, v) in *keys {
+                assert!(page.contains(&format!("| {k} | {v} |")), "{title}: {k}");
+            }
+        }
+    }
+
     /// Draws every screen at a roomy and a cramped size; shown with --nocapture.
     #[test]
     fn draws_every_screen() {
@@ -1004,8 +1047,8 @@ mod tests {
                 }
             }
         }
-        a.show_help = true;
         a.screen = Screen::Pads;
+        a.help.toggle();
         let mut t = Terminal::new(TestBackend::new(140, 40)).unwrap();
         let snapshot = a.sampler().snapshot();
         t.draw(|f| crate::ui::draw(f, &a, &snapshot)).unwrap();

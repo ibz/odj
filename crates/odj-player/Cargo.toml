@@ -1,9 +1,10 @@
 [package]
 name = "odj-player"
-description = "Keyboard-driven DJ player for the terminal, inspired by the Pioneer CDJ-800"
+description = "Keyboard-driven DJ player for the terminal, inspired by Pioneer CDJ decks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 publish = false

@@ -145,7 +145,28 @@ pub struct SyncView {
     pub waiting: bool,
     /// The deck beatmatched against, and how far off this deck is, in beats.
     pub phase: Option<(u8, f64)>,
+    /// Every other deck, by number, with its beats laid along this deck's
+    /// track for the waveform.
+    pub lanes: Vec<Lane>,
     pub others: Vec<Packet>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Lane {
+    pub deck: u8,
+    pub master: bool,
+    pub playing: bool,
+    /// While both decks run.
+    pub beats: Option<LaneBeats>,
+}
+
+/// Another deck's beats in this deck's track time: its beat `beat` is heard
+/// with this deck's second `at`, and each beat after it `period` seconds on.
+#[derive(Clone, Copy, Debug)]
+pub struct LaneBeats {
+    pub beat: f64,
+    pub at: f64,
+    pub period: f64,
 }
 
 /// What the UI needs to draw a frame, copied out so rendering never holds the lock.
@@ -190,6 +211,16 @@ pub struct Snapshot {
     pub jump_beats: f64,
     pub loop_size: f64,
     pub sync: SyncView,
+}
+
+/// Which memory point to call, from the region the deck is in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MemoryCall {
+    /// The start of the region before this one.
+    Previous,
+    /// The start of this region.
+    Current,
+    Next,
 }
 
 pub struct Deck {
@@ -365,6 +396,7 @@ impl Deck {
                 phase_lock: self.lock_target().is_some(),
                 waiting: self.start_wait,
                 phase: self.phase(),
+                lanes: self.lanes(),
                 others: self.link.others.clone(),
             },
         }
@@ -798,16 +830,18 @@ impl Deck {
         self.memories.iter().position(|m| *m == entry).map(|i| i + 1)
     }
 
-    /// Calls the next (dir > 0) or previous memory point. Playing, the deck
-    /// jumps there and plays on, on the next beat when quantizing; paused, it
-    /// becomes the cue point and the deck waits there. A stored loop loops.
-    pub fn call_memory(&mut self, dir: i32) -> Option<usize> {
+    /// Calls a memory point. Playing, the deck jumps there and plays on, on
+    /// the next beat when quantizing; paused, it becomes the cue point and the
+    /// deck waits there. A stored loop loops.
+    pub fn call_memory(&mut self, which: MemoryCall) -> Option<usize> {
         // From a jump still waiting for its beat, so presses add up.
         let from = self.pending.map_or(self.pos, |p| p.to);
-        let i = if dir > 0 {
-            self.memories.iter().position(|m| m.pos > from + 1.0)?
-        } else {
-            self.memories.iter().rposition(|m| m.pos < from - 1.0)?
+        // The point starting the region the deck is in.
+        let current = self.memories.iter().rposition(|m| m.pos <= from + 1.0);
+        let i = match which {
+            MemoryCall::Previous => current?.checked_sub(1)?,
+            MemoryCall::Current => current?,
+            MemoryCall::Next => self.memories.iter().position(|m| m.pos > from + 1.0)?,
         };
         let m = self.memories[i];
         self.loop_adjust = false;
@@ -1238,19 +1272,44 @@ impl Deck {
     /// How far this deck's beat is from the master's, or else another
     /// playing deck's, in beats: the phase meter, also for beatmatching by ear.
     fn phase(&self) -> Option<(u8, f64)> {
-        let (h, g) = (self.heard?, self.grid()?);
-        let others = &self.link.others;
-        let other = self
-            .leader()
-            .or_else(|| others.iter().find(|p| p.master && p.running))
-            .or_else(|| others.iter().find(|p| p.running))
-            .filter(|p| p.running && self.playing)?;
+        let (h, g, other) = (self.heard?, self.grid()?, self.beatmatched()?);
         let ratio = match self.sync_ratio {
             Some(ratio) => ratio,
             None => link::match_tempo(g.bpm * self.tempo_factor(), other.bpm?).1,
         };
         let beat = g.beat_at(h.pos, self.sample_rate());
         Some((other.deck, link::wrap(beat - ratio * other.beat_at(h.time))))
+    }
+
+    /// The deck to beatmatch against: the leader, else the playing master,
+    /// else any deck playing; only while both play.
+    fn beatmatched(&self) -> Option<&Packet> {
+        let others = &self.link.others;
+        self.leader()
+            .or_else(|| others.iter().find(|p| p.master && p.running))
+            .or_else(|| others.iter().find(|p| p.running))
+            .filter(|p| p.running && self.playing)
+    }
+
+    fn lanes(&self) -> Vec<Lane> {
+        let heard = self.heard.filter(|h| self.playing && h.rate > 0.0);
+        let mut lanes: Vec<Lane> = self
+            .link
+            .others
+            .iter()
+            .map(|p| Lane {
+                deck: p.deck,
+                master: p.master,
+                playing: p.playing,
+                beats: heard.filter(|_| p.running && p.rate > 0.0).map(|h| LaneBeats {
+                    beat: p.beat_at(h.time),
+                    at: h.pos / self.sample_rate(),
+                    period: h.rate / p.rate,
+                }),
+            })
+            .collect();
+        lanes.sort_by_key(|l| l.deck);
+        lanes
     }
 
     /// Where the deck is heard as the block starting at `t` is: behind the
@@ -1879,10 +1938,10 @@ mod tests {
         d.cue_down(true); // snaps to the beat at 0.25 s
         d.play_pause();
         run(&mut d, 18_000); // 0.625 s: past beat 0.25 s, before 0.75 s
-        assert_eq!(d.call_memory(1), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Next), Some(1));
         assert!(d.pos < beat(1.0), "nothing happens before the beat");
-        assert_eq!(d.call_memory(1), Some(2), "a second press goes on from the first");
-        assert_eq!(d.call_memory(-1), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Next), Some(2), "a second press goes on from the first");
+        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1));
         run(&mut d, 12_000); // 0.875 s: the beat at 0.75 s went by
         let expected = at + (0.875 - 0.75) * SR as f64;
         assert!(d.playing);
@@ -2105,6 +2164,40 @@ mod tests {
         d.play_pause();
         follow(&mut d, &mut t, 1.0, &lead);
         assert!(!d.playing && !d.snapshot().sync.waiting);
+    }
+
+    #[test]
+    fn the_lane_puts_the_masters_beats_on_ours() {
+        let mut t = 100.0;
+        let mut d = following(&master(120.0, 0.3), &mut t);
+        let lanes = d.snapshot().sync.lanes;
+        assert_eq!(lanes.len(), 1);
+        assert!(lanes[0].deck == 1 && lanes[0].master);
+        let lane = lanes[0].beats.expect("beats while both play");
+        let (g, sr) = (d.grid().unwrap(), d.sample_rate());
+        assert!((lane.period - g.period(sr) / sr).abs() < 1e-6, "{} s a beat", lane.period);
+        for k in 0..4 {
+            let n = lane.beat.ceil() + k as f64;
+            let ours = g.beat_at((lane.at + (n - lane.beat) * lane.period) * sr, sr);
+            assert!((ours - ours.round()).abs() < 1e-3, "beat {n} lands on {ours}");
+        }
+        d.play_pause();
+        assert!(d.snapshot().sync.lanes[0].beats.is_none(), "no beats while paused");
+    }
+
+    #[test]
+    fn every_other_deck_gets_a_lane() {
+        let mut t = 100.0;
+        let lead = master(120.0, 0.3);
+        let mut d = following(&lead, &mut t);
+        let stopped = Packet { deck: 4, master: false, playing: false, running: false, ..lead(t) };
+        let other = Packet { deck: 2, master: false, ..lead(t) };
+        d.update_link(3, &[stopped, lead(t), other], t);
+        let lanes = d.snapshot().sync.lanes;
+        assert_eq!(lanes.iter().map(|l| l.deck).collect::<Vec<_>>(), [1, 2, 4]);
+        assert!(lanes[0].master && !lanes[1].master);
+        assert!(lanes[0].beats.is_some() && lanes[1].beats.is_some());
+        assert!(!lanes[2].playing && lanes[2].beats.is_none());
     }
 
     #[test]
@@ -2335,6 +2428,27 @@ mod tests {
     }
 
     #[test]
+    fn previous_skips_the_region_the_deck_is_in() {
+        let mut d = deck();
+        for _ in 0..3 {
+            d.store_memory();
+            d.step_paused(75.0);
+            d.cue_down(true);
+        } // points at 0, 1 and 2 s; the deck at 3 s
+        d.play_pause();
+        run(&mut d, SR as usize / 2); // 3.5 s, in the region from 2 s
+        assert_eq!(d.call_memory(MemoryCall::Previous), Some(2));
+        assert_eq!(d.pos, SR as f64);
+        run(&mut d, 1_000);
+        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1), "pressing again goes on back");
+        assert_eq!(d.pos, 0.0);
+        run(&mut d, SR as usize / 2);
+        assert_eq!(d.call_memory(MemoryCall::Current), Some(1), "restarts the region");
+        assert!(d.playing && d.pos == 0.0);
+        assert_eq!(d.call_memory(MemoryCall::Previous), None, "nothing before the first");
+    }
+
+    #[test]
     fn memory_cues_store_call_and_delete() {
         let mut d = deck();
         d.store_memory(); // cue at 0
@@ -2354,21 +2468,22 @@ mod tests {
         d.reloop_exit();
         run(&mut d, 200_000);
         let cue = d.cue;
-        assert_eq!(d.call_memory(-1), Some(3));
+        assert_eq!(d.call_memory(MemoryCall::Current), Some(3));
         assert!(d.playing && d.looping);
         assert_eq!(d.pos, 2.0 * SR as f64);
         assert_eq!(d.cue, cue, "the cue point stays");
-        assert_eq!(d.call_memory(-1), Some(2));
+        assert_eq!(d.call_memory(MemoryCall::Previous), Some(2));
         assert!(d.playing && !d.looping);
         assert_eq!(d.pos, SR as f64);
 
         // Paused, it becomes the cue point and the deck waits there.
         d.play_pause();
-        assert_eq!(d.call_memory(-1), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1));
         assert!(!d.playing);
         assert_eq!((d.pos, d.cue), (0.0, 0.0));
-        assert_eq!(d.call_memory(-1), None);
-        assert_eq!(d.call_memory(1), Some(2));
+        assert_eq!(d.call_memory(MemoryCall::Previous), None);
+        assert_eq!(d.call_memory(MemoryCall::Current), Some(1), "paused on a point, it stays");
+        assert_eq!(d.call_memory(MemoryCall::Next), Some(2));
         assert_eq!(d.cue, SR as f64);
 
         assert!(d.delete_memory());
@@ -2448,5 +2563,26 @@ mod tests {
         d.play_pause();
         run(&mut d, 4800);
         assert!((d.pos - (2.0 * SR as f64 - 4800.0)).abs() < 2.0);
+    }
+
+    #[test]
+    fn reverse_in_a_loop_plays_the_loop_backwards() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, 24_000);
+        d.loop_in();
+        run(&mut d, 24_000);
+        d.loop_out();
+        let (a, b) = (d.loop_in.unwrap(), d.loop_out.unwrap());
+        d.toggle_reverse();
+        let mut wrapped = false;
+        let mut last = d.pos;
+        for _ in 0..40 {
+            run(&mut d, 4800);
+            assert!(d.looping && d.pos >= a && d.pos < b, "{} outside {a}..{b}", d.pos);
+            wrapped |= d.pos > last;
+            last = d.pos;
+        }
+        assert!(wrapped, "going back past the loop in comes round to the loop out");
     }
 }

@@ -4,6 +4,7 @@ description = "Shared code of the odj apps: decoding, the cue library, audio out
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
 publish = false
 

@@ -17,6 +17,10 @@ use crate::grid::{BAR, BeatGrid};
 /// Waveform bins per second of audio.
 pub const WAVE_RATE: f64 = 100.0;
 
+/// Samples in a row at full scale that make a clip. Decoded MP3s overshoot
+/// full scale on single samples, which isn't clipping in the master.
+const CLIP_RUN: u32 = 5;
+
 /// Auto-cue threshold, -48 dB.
 const AUTO_CUE_LEVEL: f32 = 0.004;
 
@@ -24,8 +28,14 @@ const AUTO_CUE_LEVEL: f32 = 0.004;
 pub struct WaveBin {
     /// Peak level of the full signal.
     pub peak: f32,
-    /// Peak level of the low (bass) band, used for colouring.
+    /// Peak level of the low (bass) band, below 150 Hz.
     pub low: f32,
+    /// Peak level of the mids, 150 Hz to 2.5 kHz.
+    pub mid: f32,
+    /// Peak level of the highs, above 2.5 kHz.
+    pub high: f32,
+    /// Either channel is flat at full scale, for [`CLIP_RUN`] samples or more.
+    pub clipped: bool,
 }
 
 pub struct Track {
@@ -38,6 +48,8 @@ pub struct Track {
     /// Interleaved stereo.
     pub samples: Vec<f32>,
     pub wave: Vec<WaveBin>,
+    /// The level drawn at full height: the loudest 1% of the bins reach it.
+    pub wave_scale: f32,
     /// Detected beat grid; the user's corrections live in the track's memory.
     pub grid: Option<BeatGrid>,
     /// The beats keep to the grid, so quantizing makes sense.
@@ -90,10 +102,12 @@ impl Track {
             .position(|f| f[0].abs().max(f[1].abs()) > AUTO_CUE_LEVEL)
             .unwrap_or(0) as f64;
         let (grid, steady) = detect_grid(&mono, sample_rate).map_or((None, false), |(g, s)| (Some(g), s));
+        let wave = waveform(&mono, &samples, sample_rate);
         Track {
             // Set by `load`; tracks built from bare samples have no file to fingerprint.
             id: String::new(),
-            wave: waveform(&mono, sample_rate),
+            wave_scale: wave_scale(&wave),
+            wave,
             grid,
             steady,
             path,
@@ -200,21 +214,46 @@ fn lowpass_coef(cutoff: f64, sample_rate: u32) -> f32 {
     (1.0 - (-2.0 * std::f64::consts::PI * cutoff / sample_rate as f64).exp()) as f32
 }
 
-fn waveform(mono: &[f32], sample_rate: u32) -> Vec<WaveBin> {
+fn waveform(mono: &[f32], stereo: &[f32], sample_rate: u32) -> Vec<WaveBin> {
     let bin = ((sample_rate as f64 / WAVE_RATE) as usize).max(1);
     let a = lowpass_coef(150.0, sample_rate);
-    let mut lp = 0.0f32;
+    let a_mid = lowpass_coef(2500.0, sample_rate);
+    let (mut lp, mut lp_mid) = (0.0f32, 0.0f32);
+    // Samples in a row at full scale on each channel, signed by the side.
+    let mut runs = [0i32; 2];
     mono.chunks(bin)
-        .map(|chunk| {
+        .zip(stereo.chunks(bin * 2))
+        .map(|(chunk, frames)| {
             let mut b = WaveBin::default();
             for &x in chunk {
                 lp += a * (x - lp);
+                lp_mid += a_mid * (x - lp_mid);
                 b.peak = b.peak.max(x.abs());
                 b.low = b.low.max(lp.abs());
+                b.mid = b.mid.max((lp_mid - lp).abs());
+                b.high = b.high.max((x - lp_mid).abs());
+            }
+            for frame in frames.as_chunks::<2>().0 {
+                for (run, &x) in runs.iter_mut().zip(frame) {
+                    *run = match x {
+                        x if x >= 0.99 => (*run).max(0) + 1,
+                        x if x <= -0.99 => (*run).min(0) - 1,
+                        _ => 0,
+                    };
+                    b.clipped |= run.unsigned_abs() >= CLIP_RUN;
+                }
             }
             b
         })
         .collect()
+}
+
+fn wave_scale(wave: &[WaveBin]) -> f32 {
+    let mut peaks: Vec<f32> = wave.iter().map(|b| b.peak).collect();
+    peaks.sort_by(f32::total_cmp);
+    let loud = peaks.get(peaks.len() * 99 / 100).copied().unwrap_or(0.0);
+    // Near-silent tracks aren't blown up into noise.
+    loud.max(0.05)
 }
 
 /// Bins per second of the energy envelopes the beat analysis works on.
@@ -556,6 +595,25 @@ mod tests {
     fn grid_of(samples: &[f32]) -> Option<(BeatGrid, bool)> {
         let mono: Vec<f32> = samples.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
         detect_grid(&mono, 44_100)
+    }
+
+    #[test]
+    fn flat_tops_clip_and_single_overs_dont() {
+        let sr = 44_100;
+        // Ten seconds of quiet tone, with a flat top on the right and a lone over.
+        let mut samples: Vec<f32> = (0..10 * sr).flat_map(|i| [0.1 * (i as f32 * 0.05).sin(); 2]).collect();
+        let (top, over) = (3_000, 30_000);
+        for i in top..top + CLIP_RUN as usize {
+            samples[2 * i + 1] = 1.0;
+        }
+        samples[2 * over] = 1.05;
+        let track = Track::from_samples(PathBuf::new(), String::new(), None, sr as u32, samples);
+        let bin = |frame: usize| (frame as f64 / sr as f64 * WAVE_RATE) as usize;
+        let clipped: Vec<usize> = (0..track.wave.len()).filter(|&i| track.wave[i].clipped).collect();
+        assert_eq!(clipped, [bin(top)]);
+        // The peak is of the mono mix, so the over on one side shows at half.
+        assert!(track.wave[bin(over)].peak > 0.4 && !track.wave[bin(over)].clipped);
+        assert!((track.wave_scale - 0.1).abs() < 0.01, "the loud 1% is the tone: {}", track.wave_scale);
     }
 
     #[test]

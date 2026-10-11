@@ -6,11 +6,11 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, centered};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
 
 use crate::app::{App, Editor, PAD_KEYS, PadStatus, Picker, Screen, Slot};
 use crate::engine::{Mode, PADS, PadState, Snapshot, TAIL};
@@ -39,8 +39,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 
     if let Screen::Picker(p) = &app.screen {
         draw_picker(f, p);
-    } else if app.show_help {
-        draw_help(f);
+    } else if app.help.is_open() {
+        draw_help(f, &app.help, HELP);
     }
 }
 
@@ -227,13 +227,14 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Screen::Pads => {
             " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  ? help  Ctrl+C quit"
         }
-        Screen::Picker(_) => " type to filter  ↑↓ select  Enter assign  Esc clear/close",
+        Screen::Picker(_) => " type to filter  ↑↓ PgUp PgDn Home End select  Enter assign  Esc clear/close",
         Screen::Editor(_) => {
             " Tab start/end  ←/→ beat (Shift: bar)  ,/. ±10 ms (Shift: 1 ms)  [ ] halve/double  Space preview  Enter keep  Esc cancel"
         }
     };
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
+        None if matches!(app.screen, Screen::Pads) => key_line(hints, area.width),
         None => Line::from(Span::styled(hints, Style::new().fg(DIM))),
     };
     f.render_widget(Paragraph::new(line), area);
@@ -241,11 +242,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_picker(f: &mut Frame, p: &Picker) {
     let area = centered(f.area(), 80, 80);
-    f.render_widget(Clear, area);
-    let mut block = Block::bordered()
-        .title(format!(" Assign a cue to pad {} ", p.pad + 1))
-        .title_bottom(" type to filter  ↑↓ select  Enter assign (a cue without an end opens the editor)  Esc clear/close ")
-        .border_style(Style::new().fg(AMBER));
+    let mut block =
+        Block::bordered().title(format!(" Assign a cue to pad {} ", p.pad + 1)).border_style(Style::new().fg(AMBER));
     if !p.query.is_empty() {
         block = block.title(Line::from(format!(" filter: {}▏", p.query)).right_aligned().bold());
     }
@@ -282,12 +280,16 @@ fn draw_picker(f: &mut Frame, p: &Picker) {
             })
             .collect()
     };
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().fg(Color::Black).bg(AMBER))
-        .highlight_symbol("› ");
+    let hints = [
+        "type to filter",
+        "↑↓ PgUp PgDn Home End select",
+        "Enter assign (a cue without an end opens the editor)",
+        "Esc clear/close",
+    ];
+    let list_area = hinted_box(f, area, block, &hints);
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(p.selected));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u32) {
@@ -455,45 +457,44 @@ impl Widget for Wave<'_> {
     }
 }
 
-fn draw_help(f: &mut Frame) {
-    let rows: &[(&str, &str)] = &[
-        ("1 2 3 4 / Q W E R", "Pads 1–8 (press to play, also selects)"),
-        ("A S D F / Z X C V", "Pads 9–16"),
-        ("Shift+pad", "Stop that pad"),
-        ("Space", "Stop all pads"),
-        ("← → ↑ ↓", "Select a pad"),
-        ("Enter", "Assign a stored cue to the selected pad"),
-        ("T", "Trim: open the selected pad in the sample editor"),
-        ("M", "Mode: one-shot · gate (plays while held) · toggle"),
-        ("L", "Loop on/off"),
-        ("G", "Retrigger: a one-shot press while playing restarts or is ignored"),
-        ("- / = / 0", "Gain down / up / 0 dB"),
-        ("Delete", "Clear the selected pad"),
-        ("Editor Tab", "Switch between moving the start and the end"),
-        ("Editor ← / →", "Move it to the next beat of the grid (Shift: 4 beats); seconds without a BPM"),
-        ("Editor , / .", "Move it ±10 ms (Shift: ±1 ms)"),
-        ("Editor [ / ]", "Halve / double the length"),
-        ("Editor Space", "Preview (loops)"),
-        ("Editor Enter / Esc", "Put it on the pad / cancel"),
-        ("Ctrl+C", "Quit (the kit is saved as you go)"),
-    ];
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(k, v)| {
-            Line::from(vec![Span::styled(format!("{k:>20}  "), Style::new().fg(AMBER).bold()), Span::raw(*v)])
-        })
-        .collect();
-    let height = lines.len() as u16 + 2;
-    let area = centered(f.area(), 90, 100);
-    let area = Rect { y: area.y + area.height.saturating_sub(height) / 2, height: height.min(area.height), ..area };
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered().title(" Keys ").title_bottom(" ? or Esc to close ").border_style(Style::new().fg(AMBER)),
-        ),
-        area,
-    );
-}
+/// The help's pages: playing the pads first, then setting them up.
+pub const HELP: &[Page] = &[
+    Page::Keys(
+        "Basics",
+        &[
+            ("1 2 3 4 / Q W E R", "Pads 1–8 (press to play, also selects)"),
+            ("A S D F / Z X C V", "Pads 9–16"),
+            ("Shift+pad", "Stop that pad"),
+            ("Space", "Stop all pads"),
+            ("← → ↑ ↓", "Select a pad"),
+            ("Enter", "Assign a stored cue to the selected pad"),
+        ],
+    ),
+    Page::Keys(
+        "Pads",
+        &[
+            ("Enter", "Assign a stored cue to the selected pad"),
+            ("T", "Trim: open the selected pad in the sample editor"),
+            ("M", "Mode: one-shot · gate (plays while held) · toggle"),
+            ("L", "Loop on/off"),
+            ("G", "Retrigger: a one-shot press while playing restarts or is ignored"),
+            ("- / = / 0", "Gain down / up / 0 dB"),
+            ("Delete / Backspace", "Clear the selected pad"),
+        ],
+    ),
+    Page::Keys(
+        "Sample editor",
+        &[
+            ("Tab", "Switch between moving the start and the end"),
+            ("← / →", "Move it a beat along the grid (Shift: a bar); without a grid 0.1 s (Shift: 1 s)"),
+            (", / .", "Move it ±10 ms (Shift: ±1 ms)"),
+            ("[ / ]", "Halve / double the length"),
+            ("Space", "Preview (loops)"),
+            ("Enter / Esc", "Put it on the pad / cancel"),
+        ],
+    ),
+    Page::About(odj_core::about!()),
+];
 
 fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;

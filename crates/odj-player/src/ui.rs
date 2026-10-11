@@ -5,13 +5,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
 
-use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, centered};
+use odj_core::track::{Track, WAVE_RATE, WaveBin};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
 
 use crate::app::App;
-use crate::engine::{CD_FRAMES, Snapshot, SyncView};
+use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
 
 const CUE_COLOR: Color = Color::Rgb(255, 140, 0);
 const HOT_COLOR: Color = Color::Rgb(60, 220, 100);
@@ -27,6 +27,16 @@ const SLIP_COLOR: Color = Color::Rgb(200, 110, 255);
 pub const GHOST_BG: Color = Color::Rgb(95, 50, 125);
 const SYNC_COLOR: Color = Color::Rgb(255, 200, 40);
 const MASTER_COLOR: Color = Color::Rgb(255, 120, 40);
+/// Waveform background, and the colours of its bass, mids and highs.
+const WAVE_BG: Color = Color::Rgb(14, 14, 18);
+const LOW_WAVE: (u8, u8, u8) = (40, 110, 255);
+const MID_WAVE: (u8, u8, u8) = (255, 160, 40);
+const HIGH_WAVE: (u8, u8, u8) = (235, 240, 255);
+const CLIP_WAVE: (u8, u8, u8) = (255, 40, 40);
+const CENTRE_LINE: Color = Color::Rgb(55, 55, 68);
+const BEAT_TICK: Color = Color::Rgb(70, 110, 125);
+/// The wave keeps at least this many rows when the beat lanes take room.
+const MIN_WAVE_ROWS: usize = 4;
 /// Cells of the phase meter, across one beat.
 const PHASE_CELLS: usize = 17;
 /// Seconds of track shown in the zoomed waveform.
@@ -37,7 +47,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         Constraint::Length(1),
         Constraint::Length(4),
         Constraint::Min(4),
-        Constraint::Length(4),
+        // Two rows each side of the centre, and one on top for the markers.
+        Constraint::Length(7),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
@@ -55,11 +66,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     if let Some(track) = &s.track {
         let now = s.pos / track.sample_rate as f64;
         f.render_widget(
-            Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false, beats: s.show_grid },
+            Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false, beats: s.show_grid, lanes: true },
             zoom_inner,
         );
         f.render_widget(
-            Wave { track, s, start: 0.0, end: track.duration(), dim_played: true, beats: false },
+            Wave { track, s, start: 0.0, end: track.duration(), dim_played: true, beats: false, lanes: false },
             overview_inner,
         );
     } else {
@@ -75,8 +86,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 
     if app.browser.open {
         draw_browser(f, app);
-    } else if app.show_help {
-        draw_help(f);
+    } else if app.help.is_open() {
+        draw_help(f, &app.help, HELP);
     }
 }
 
@@ -344,22 +355,18 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
-        None => Line::from(Span::styled(
+        None => key_line(
             " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  F sync  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
-            Style::new().fg(DIM),
-        )),
+            area.width,
+        ),
     };
     f.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_browser(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 70, 70);
-    f.render_widget(Clear, area);
     let b = &app.browser;
-    let mut block = Block::bordered()
-        .title(format!(" {} ", b.dir.display()))
-        .title_bottom(" type to filter  ↑↓ select  Enter/→ open  ←/Backspace up  Esc clear/close ")
-        .border_style(Style::new().fg(AMBER));
+    let mut block = Block::bordered().title(format!(" {} ", b.dir.display())).border_style(Style::new().fg(AMBER));
     if !b.query.is_empty() {
         block = block.title(Line::from(format!(" filter: {}▏", b.query)).right_aligned().bold());
     }
@@ -386,68 +393,91 @@ fn draw_browser(f: &mut Frame, app: &App) {
             })
             .collect()
     };
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::new().fg(Color::Black).bg(AMBER))
-        .highlight_symbol("› ");
+    let hints = [
+        "type to filter",
+        "↑↓ PgUp PgDn Home End select",
+        "Enter/→ open",
+        "←/Backspace up",
+        "Esc clear/close",
+        "Tab close",
+    ];
+    let list_area = hinted_box(f, area, block, &hints);
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(b.selected));
-    f.render_stateful_widget(list, area, &mut state);
+    f.render_stateful_widget(list, list_area, &mut state);
 }
 
-fn draw_help(f: &mut Frame) {
-    let rows: &[(&str, &str)] = &[
-        ("Space", "Play / Pause"),
-        ("C", "Cue — playing: back to cue & pause · paused: set cue · hold on cue: preview"),
-        ("Space while holding C", "Keep playing after releasing Cue"),
-        ("1 2 3", "Hot cue A/B/C: jump & play (on the next beat when quantizing) · REC mode: store"),
-        ("E", "Hot cue REC / PLAY mode"),
-        ("Shift+1 2 3", "Clear hot cue (REC mode only)"),
-        ("I / O / P", "Loop in / Loop out / Reloop-Exit"),
-        ("O while looping", "Loop out adjust: , / . move the out point, O to finish"),
-        ("L", "Beat loop of the loop size / exit the loop"),
-        ("- / =", "Beatjump back / forward (moves the loop while looping)"),
-        ("Shift+- / =", "Beatjump size 1 … 64 beats"),
-        ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),
-        ("Z", "Slip: loops, reverse, held hot cues and pause carry on underneath"),
-        ("W / J / K / X", "Memory: store cue or loop / call previous / call next / delete"),
-        ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
-        ("↑ / ↓", "Tempo fader (Shift: ×10)"),
-        ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
-        ("M", "Master Tempo (key lock)"),
-        (", / .", "Jog: hold to slow/speed up · paused: 1 frame (Shift: strong / 1 beat)"),
-        ("Q", "Quantize this track: cues, loops and jumps go on the beat (always on while synced)"),
-        ("F / Shift+F", "Sync to the master deck's tempo and beats / make this deck the master"),
-        ("A / Shift+A", "Tap BPM (playing: the beats go on the taps) / back to the detected grid"),
-        ("D", "Make the playhead beat 1 of a bar"),
-        ("Y", "Grid adjust: , / . shift the beats 1 ms (Shift 10) · ↑/↓ BPM ±0.01 (Shift 0.1)"),
-        ("← / →", "Search (hold) · Shift: super fast search"),
-        ("B / N", "Previous / next track in folder"),
-        ("R", "Reverse"),
-        ("T / Shift+T", "Elapsed / remaining time · Auto Cue on/off"),
-        ("S / V", "Cycle start / brake time"),
-        ("Tab", "Browse files; type to filter the folder"),
-        ("Ctrl+C", "Quit (cue memory is saved)"),
-    ];
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(k, v)| {
-            Line::from(vec![
-                Span::styled(format!("{k:>22}  "), Style::new().fg(AMBER).bold()),
-                Span::raw(*v),
-            ])
-        })
-        .collect();
-    let height = lines.len() as u16 + 2;
-    let area = centered(f.area(), 90, 100);
-    let area = Rect { y: area.y + area.height.saturating_sub(height) / 2, height: height.min(area.height), ..area };
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered().title(" Keys ").title_bottom(" ? or Esc to close ").border_style(Style::new().fg(AMBER)),
-        ),
-        area,
-    );
-}
+/// The help's pages: the keys for playing first, the rest by topic.
+pub const HELP: &[Page] = &[
+    Page::Keys(
+        "Basics",
+        &[
+            ("Space", "Play / Pause"),
+            ("C", "Cue"),
+            ("1 2 3", "Hot cue A/B/C"),
+            ("L", "Beat loop / exit the loop"),
+            ("← / →", "Search (Shift: super fast)"),
+            ("↑ / ↓", "Tempo (Shift: ×10)"),
+            (", / .", "Jog: hold to slow down / speed up 3% (Shift: 12%)"),
+            ("R", "Reverse"),
+            ("F", "Sync to the master deck"),
+            ("B / N", "Previous / next track in folder"),
+            ("Tab", "File browser"),
+        ],
+    ),
+    Page::Keys(
+        "Cues",
+        &[
+            ("C", "Cue — playing: back to cue & pause · paused: set cue · hold on cue: preview"),
+            ("Space while holding C", "Keep playing after releasing Cue"),
+            ("1 2 3", "Hot cue A/B/C: jump & play (on the next beat when quantizing) · REC mode: store the cue, or the loop while looping"),
+            ("1 2 3 held in slip", "Play the hot cue while held, then back to where the track would be"),
+            ("E", "Hot cue REC / PLAY mode"),
+            ("Shift+1 2 3", "Clear hot cue (REC mode only)"),
+            ("W / J / K / X", "Memory: store cue or loop / call previous / call next / delete"),
+            ("Shift+J", "Back to the start of the memory region you're in"),
+            ("T", "Elapsed / remaining time"),
+            ("Shift+T", "Auto Cue on/off"),
+        ],
+    ),
+    Page::Keys(
+        "Loops",
+        &[
+            ("I / O / P", "Loop in / Loop out / Reloop-Exit"),
+            ("O while looping", "Loop out adjust: , / . move the out point (Shift: ×10), O to finish"),
+            ("R while looping", "Play the loop backwards, R again for forwards"),
+            ("L", "Beat loop of the loop size / exit the loop"),
+            ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
+            ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),
+            ("- / =", "Beatjump back / forward (moves the loop while looping)"),
+            ("Shift+- / =", "Beatjump size 1 … 64 beats"),
+            ("Z", "Slip: loops, reverse, held hot cues and pause carry on underneath"),
+        ],
+    ),
+    Page::Keys(
+        "Tempo",
+        &[
+            ("↑ / ↓", "Tempo fader (Shift: ×10)"),
+            ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
+            ("M", "Master Tempo (key lock)"),
+            ("F", "Sync to the master deck's tempo and beats"),
+            ("Shift+F", "Make this deck the master"),
+            (", / .", "Jog: hold to slow down / speed up 3% (Shift: 12%) · paused: 1 frame (Shift: 1 beat, 1 s without a BPM)"),
+            ("S / V", "Cycle start / brake time"),
+        ],
+    ),
+    Page::Keys(
+        "Beat grid",
+        &[
+            ("Q", "Quantize this track: cues, loops and jumps go on the beat (always on while synced)"),
+            ("A", "Tap BPM (playing: the beats go on the taps)"),
+            ("Shift+A", "Back to the detected grid"),
+            ("D", "Make the playhead beat 1 of a bar"),
+            ("Y", "Grid adjust: , / . shift the beats 1 ms (Shift: 10 ms) · ↑/↓ BPM ±0.01 (Shift: ±0.1) · Y or Esc to finish"),
+        ],
+    ),
+    Page::About(odj_core::about!()),
+];
 
 /// A waveform over a time window, with markers, loop region and playhead.
 struct Wave<'a> {
@@ -456,8 +486,11 @@ struct Wave<'a> {
     start: f64,
     end: f64,
     dim_played: bool,
-    /// Shade the columns where beats and bars start.
+    /// Show the beats and bars.
     beats: bool,
+    /// A row for the markers on top, and rows under the wave for this deck's
+    /// beats and the other decks'; clipping in red.
+    lanes: bool,
 }
 
 impl Widget for Wave<'_> {
@@ -480,12 +513,28 @@ impl Widget for Wave<'_> {
             _ => None,
         };
         let grid = self.s.grid.filter(|g| self.beats && g.period(sr) / sr > 2.0 * per_col);
-        // Whether a beat starts in [t0, t1), and if it is a downbeat.
-        let tick = |t0: f64, t1: f64| -> Option<bool> {
+        // The beat that starts in [t0, t1), if any.
+        let tick = |t0: f64, t1: f64| -> Option<f64> {
             let g = grid?;
             let n = g.beat_at(t0 * sr, sr).ceil();
-            (g.beat_pos(n, sr) < t1 * sr).then_some(n.rem_euclid(4.0) == 0.0)
+            (g.beat_pos(n, sr) < t1 * sr).then_some(n)
         };
+        let lanes = self.lanes && h >= 2 + MIN_WAVE_ROWS;
+        let shown = if lanes { shown_lanes(&self.s.sync.lanes, h - 2 - MIN_WAVE_ROWS) } else { Vec::new() };
+        // Without the beat ruler, beats are shaded through the wave; grid
+        // adjust shades them too, to line them up with the hits.
+        let shade = self.beats && (!lanes || self.s.grid_adjust);
+
+        // The wave is mirrored around a centre line, `half` rows each way; with
+        // an odd height the spare row goes on top, under the markers.
+        let (wave_top, wave_h) = if lanes { (1, h - 2 - shown.len()) } else { (0, h) };
+        let half = wave_h / 2;
+        let centre = wave_top + wave_h - half;
+        let depth = (half * 8) as f32;
+        let scale = self.track.wave_scale;
+        let eighths = |level: f32| ((level / scale).min(1.0) * depth).round() as usize;
+        let now_col = col_of(now);
+        let ghost_col = self.s.ghost.and_then(|g| col_of(g / sr));
 
         for x in 0..w {
             let t0 = self.start + x as f64 * per_col;
@@ -493,41 +542,80 @@ impl Widget for Wave<'_> {
             let in_loop = loop_range.is_some_and(|(a, b)| t1 > a && t0 < b);
             let b0 = (t0 * WAVE_RATE).max(0.0) as usize;
             let b1 = ((t1 * WAVE_RATE).ceil().max(0.0) as usize).min(bins.len()).max(b0 + 1);
-            let bin = if t1 <= 0.0 || b0 >= bins.len() {
-                None
+            let bin = (t1 > 0.0 && b0 < bins.len()).then(|| {
+                bins[b0..b1].iter().fold(WaveBin::default(), |a, b| WaveBin {
+                    peak: a.peak.max(b.peak),
+                    low: a.low.max(b.low),
+                    mid: a.mid.max(b.mid),
+                    high: a.high.max(b.high),
+                    clipped: a.clipped || b.clipped,
+                })
+            });
+            let playhead = now_col == Some(x as u16);
+            let bg = if playhead {
+                PLAYHEAD
+            } else if ghost_col == Some(x as u16) {
+                GHOST_BG
             } else {
-                Some(bins[b0..b1].iter().fold((0.0f32, 0.0f32), |(p, l), b| (p.max(b.peak), l.max(b.low))))
-            };
-            let (eighths, color) = match bin {
-                Some((peak, low)) => {
-                    let level = peak.min(1.0).powf(0.6);
-                    let bass = (low / peak.max(1e-6)).clamp(0.0, 1.0);
-                    let mut c = lerp((235, 240, 255), (30, 100, 255), bass);
-                    if self.dim_played && t1 <= now {
-                        c = lerp(c, (0, 0, 0), 0.6);
-                    }
-                    ((level * (h * 8) as f32).round() as usize, Color::Rgb(c.0, c.1, c.2))
+                match (in_loop, tick(t0, t1).filter(|_| shade).map(|n| n.rem_euclid(4.0) == 0.0)) {
+                    (true, Some(_)) if self.s.looping => Color::Rgb(70, 115, 45),
+                    (true, _) if self.s.looping => LOOP_BG,
+                    (true, _) => Color::Rgb(30, 40, 25),
+                    (false, Some(true)) => BAR_BG,
+                    (false, Some(false)) => BEAT_BG,
+                    (false, None) => WAVE_BG,
                 }
-                None => (0, DIM),
             };
+            // Bands from the centre out, each drawn over the next: bass, mids,
+            // then the whole signal, whose rim shows the highs; clipping turns
+            // the outer half row red.
+            let shade = |c: (u8, u8, u8)| {
+                let c = if playhead { lerp(c, (255, 90, 90), 0.4) } else { c };
+                let played = if self.dim_played { 0.6 } else { 0.35 };
+                let c = if t1 <= now { lerp(c, (0, 0, 0), played) } else { c };
+                Color::Rgb(c.0, c.1, c.2)
+            };
+            let layers = bin.map(|b| {
+                let full = eighths(b.peak);
+                let tip = if b.clipped && self.lanes { full.saturating_sub(4) } else { full };
+                [
+                    (eighths(b.low).min(tip), shade(LOW_WAVE)),
+                    (eighths(b.mid).min(tip), shade(MID_WAVE)),
+                    (tip, shade(HIGH_WAVE)),
+                    (full, shade(CLIP_WAVE)),
+                ]
+            });
+            // The colour at `d` eighths out from the centre, and where it ends.
+            let at = |d: usize| layers.and_then(|l| l.into_iter().find(|&(e, _)| e > d));
+
             for row in 0..h {
-                let from_bottom = h - 1 - row;
-                let fill = eighths.saturating_sub(from_bottom * 8).min(8);
-                if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + row as u16)) {
-                    cell.set_char(BARS[fill]).set_fg(color);
-                    let bg = match (in_loop, tick(t0, t1)) {
-                        (true, Some(_)) if self.s.looping => Some(Color::Rgb(70, 115, 45)),
-                        (true, _) if self.s.looping => Some(LOOP_BG),
-                        (true, _) => Some(Color::Rgb(30, 40, 25)),
-                        (false, Some(true)) => Some(BAR_BG),
-                        (false, Some(false)) => Some(BEAT_BG),
-                        (false, None) => None,
-                    };
-                    if let Some(bg) = bg {
-                        cell.set_bg(bg);
+                let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + row as u16)) else {
+                    continue;
+                };
+                cell.set_char(' ').set_bg(bg);
+                if row < centre - half || row >= centre + half {
+                    continue;
+                }
+                let k = if row < centre { centre - 1 - row } else { row - centre };
+                let Some((end, inner)) = at(k * 8) else {
+                    if row == centre - 1 && bin.is_some() {
+                        cell.set_char('▁').set_fg(CENTRE_LINE);
                     }
+                    continue;
+                };
+                let fill = (end - k * 8).min(8);
+                let outer = if fill == 8 { inner } else { at(end).map_or(bg, |(_, c)| c) };
+                if row < centre {
+                    cell.set_char(BARS[fill]).set_fg(inner).set_bg(outer);
+                } else {
+                    // Growing down: the background colour fills from the bottom.
+                    cell.set_char(BARS[8 - fill]).set_fg(outer).set_bg(inner);
                 }
             }
+        }
+
+        if lanes {
+            self.draw_beats(area, buf, per_col, &tick, &shown);
         }
 
         let mut marker = |sec: f64, ch: char, color: Color| {
@@ -550,22 +638,88 @@ impl Widget for Wave<'_> {
             marker(m.pos / sr, '▾', MEMORY_COLOR);
         }
         marker(self.s.cue / sr, '▼', CUE_COLOR);
+    }
+}
 
-        if let Some(x) = self.s.ghost.and_then(|g| col_of(g / sr)) {
-            for row in 0..area.height {
-                if let Some(cell) = buf.cell_mut((area.x + x, area.y + row)) {
-                    cell.set_bg(GHOST_BG);
+impl Wave<'_> {
+    /// The bottom rows: this deck's beats, with bar numbers, and right under
+    /// them a row for each other deck's, so beats in phase line up.
+    fn draw_beats(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        per_col: f64,
+        tick: &dyn Fn(f64, f64) -> Option<f64>,
+        lanes: &[Lane],
+    ) {
+        let ruler = area.y + area.height - 1 - lanes.len() as u16;
+        let mut put = |x: u16, y: u16, ch: char, style: Style| {
+            if x < area.width
+                && let Some(cell) = buf.cell_mut((area.x + x, y))
+            {
+                cell.set_char(ch).set_style(style);
+            }
+        };
+        for x in 0..area.width {
+            let t0 = self.start + x as f64 * per_col;
+            let t1 = t0 + per_col;
+            if let Some(n) = tick(t0, t1) {
+                if n.rem_euclid(4.0) == 0.0 {
+                    let bar = (n / 4.0) as i64 + 1;
+                    // Phrases start every 16 bars.
+                    let color = if (bar - 1).rem_euclid(16) == 0 { AMBER } else { GRID_COLOR };
+                    put(x, ruler, '┃', Style::new().fg(color).bold());
+                    // Bars before the grid's first downbeat go unnumbered.
+                    let number = if bar >= 1 { bar.to_string() } else { String::new() };
+                    for (i, ch) in number.chars().enumerate() {
+                        put(x + 1 + i as u16, ruler, ch, Style::new().fg(color));
+                    }
+                } else {
+                    put(x, ruler, '│', Style::new().fg(BEAT_TICK));
                 }
             }
         }
-        if let Some(x) = col_of(now) {
-            for row in 0..area.height {
-                if let Some(cell) = buf.cell_mut((area.x + x, area.y + row)) {
-                    cell.set_bg(PLAYHEAD);
+        for (i, lane) in lanes.iter().enumerate() {
+            let row = ruler + 1 + i as u16;
+            let color = lane_color(lane);
+            if let Some(b) = lane.beats.filter(|b| b.period > 2.0 * per_col) {
+                for x in 0..area.width {
+                    let t0 = self.start + x as f64 * per_col;
+                    let k = (b.beat + (t0 - b.at) / b.period).ceil();
+                    if b.at + (k - b.beat) * b.period < t0 + per_col {
+                        let ch = if k.rem_euclid(4.0) == 0.0 { '┃' } else { '│' };
+                        put(x, row, ch, Style::new().fg(color));
+                    }
                 }
+            }
+            let label = format!("D{}{}", lane.deck, if lane.playing { "" } else { " ‖" });
+            let style = if lane.beats.is_some() { Style::new().fg(color).bold() } else { Style::new().fg(DIM) };
+            for (x, ch) in label.chars().enumerate() {
+                put(x as u16, row, ch, style);
             }
         }
     }
+}
+
+/// The master in the sync colour, the other decks each in their own.
+fn lane_color(lane: &Lane) -> Color {
+    if lane.master {
+        return SYNC_COLOR;
+    }
+    match lane.deck {
+        1 => Color::Rgb(255, 120, 170),
+        2 => Color::Rgb(110, 220, 150),
+        3 => Color::Rgb(170, 150, 255),
+        _ => Color::Rgb(120, 200, 255),
+    }
+}
+
+/// The lanes that fit in `room` rows, by deck number; the master's stays.
+fn shown_lanes(lanes: &[Lane], room: usize) -> Vec<Lane> {
+    let (master, rest): (Vec<Lane>, Vec<Lane>) = lanes.iter().partition(|l| l.master);
+    let mut shown: Vec<Lane> = master.into_iter().chain(rest).take(room).collect();
+    shown.sort_by_key(|l| l.deck);
+    shown
 }
 
 fn lerp(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {

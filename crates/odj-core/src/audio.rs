@@ -4,10 +4,12 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::link;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::platform::PipeWireHost;
 use cpal::{
-    BufferSize, Device, DeviceDirection, ErrorKind, FromSample, HostId, SampleFormat, SizedSample, Stream,
+    BufferSize, OutputCallbackInfo, Device, DeviceDirection, ErrorKind, FromSample, HostId, SampleFormat, SizedSample, Stream,
     StreamConfig,
 };
 
@@ -15,8 +17,9 @@ pub use cpal::Host;
 
 /// Whatever produces the sound: the audio callback asks it for each block.
 pub trait Source: Send + 'static {
-    /// Fills `out` with interleaved stereo samples.
-    fn render(&mut self, out: &mut [f32]);
+    /// Fills `out` with interleaved stereo samples, the first of which comes
+    /// out of the speakers at `heard_at` on the [`link::now`] clock.
+    fn render(&mut self, out: &mut [f32], heard_at: f64);
 }
 
 /// Requested buffer size; small enough for cue/hot-cue response to feel immediate.
@@ -286,14 +289,16 @@ where
     let mut stereo = vec![0.0f32; 8192];
     let stream = device.build_output_stream(
         *config,
-        move |data: &mut [T], _| {
+        move |data: &mut [T], info: &OutputCallbackInfo| {
+            let ts = info.timestamp();
+            let heard_at = link::now() + ts.playback.duration_since(ts.callback).as_secs_f64();
             let frames = data.len() / channels;
             if stereo.len() < frames * 2 {
                 stereo.resize(frames * 2, 0.0);
             }
             source.lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .render(&mut stereo[..frames * 2]);
+                .render(&mut stereo[..frames * 2], heard_at);
             for (frame, lr) in data.chunks_exact_mut(channels).zip(stereo.chunks_exact(2)) {
                 route_frame(frame, lr, route);
             }

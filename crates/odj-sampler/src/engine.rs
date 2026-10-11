@@ -309,7 +309,7 @@ impl Sampler {
 }
 
 impl Source for Sampler {
-    fn render(&mut self, out: &mut [f32]) {
+    fn render(&mut self, out: &mut [f32], _heard_at: f64) {
         Sampler::render(self, out);
     }
 }

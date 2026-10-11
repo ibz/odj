@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod grid;
 pub mod library;
+pub mod link;
 pub mod memory;
 pub mod track;
 pub mod tui;

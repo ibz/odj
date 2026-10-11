@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use odj_core::audio::Source;
 use odj_core::grid::BeatGrid;
+use odj_core::link::{self, Packet};
 use odj_core::memory::{Cue, MAX_MEMORIES, TrackMemory};
 use odj_core::track::Track;
 
@@ -25,6 +26,16 @@ pub const JUMP_SIZES: [f64; 7] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0];
 /// Range of beatloop sizes, in beats.
 pub const MIN_LOOP_BEATS: f64 = 1.0 / 32.0;
 pub const MAX_LOOP_BEATS: f64 = 64.0;
+/// The phase lock changes a follower's speed by at most this much…
+const MAX_TRIM: f64 = 0.003;
+/// …aiming to correct an error within about this many seconds.
+const TRIM_TIME: f64 = 1.0;
+/// A follower further out of phase than this, in seconds, jumps back in…
+const JUMP_ERROR: f64 = 0.025;
+/// …once it has been out that far for this long.
+const JUMP_AFTER: f64 = 0.05;
+/// How much of each new phase measurement goes into the smoothed error.
+const SMOOTHING: f64 = 0.3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TempoRange {
@@ -101,6 +112,42 @@ struct Roll {
     saved: (Option<f64>, Option<f64>, bool),
 }
 
+/// Where the deck is heard: the block being rendered starts coming out of the
+/// speakers at `time`, with `pos` heard then, playing at `rate` times normal.
+#[derive(Clone, Copy)]
+struct Heard {
+    time: f64,
+    pos: f64,
+    rate: f64,
+}
+
+/// The other decks, as the sync thread last heard from them.
+#[derive(Clone, Default)]
+struct LinkState {
+    /// This deck's number; None while sync is unavailable.
+    deck: Option<u8>,
+    master: bool,
+    master_since: f64,
+    others: Vec<Packet>,
+}
+
+/// Sync as the UI shows it.
+#[derive(Clone, Default)]
+pub struct SyncView {
+    pub deck: Option<u8>,
+    pub synced: bool,
+    pub master: bool,
+    /// The master whose tempo this deck follows.
+    pub leader: Option<u8>,
+    /// Beats are locked too, not only the tempo.
+    pub phase_lock: bool,
+    /// Play was pressed: the deck starts on the master's beat.
+    pub waiting: bool,
+    /// The deck beatmatched against, and how far off this deck is, in beats.
+    pub phase: Option<(u8, f64)>,
+    pub others: Vec<Packet>,
+}
+
 /// What the UI needs to draw a frame, copied out so rendering never holds the lock.
 #[derive(Clone)]
 pub struct Snapshot {
@@ -142,6 +189,7 @@ pub struct Snapshot {
     pub roll: Option<f64>,
     pub jump_beats: f64,
     pub loop_size: f64,
+    pub sync: SyncView,
 }
 
 pub struct Deck {
@@ -186,6 +234,23 @@ pub struct Deck {
     pub jump_beats: f64,
     /// Size of the next beatloop, in beats.
     pub loop_size: f64,
+    synced: bool,
+    link: LinkState,
+    /// Following a master: the multiple of its tempo played, 1, 2 or ½.
+    sync_ratio: Option<f64>,
+    /// The phase lock's speed correction, a factor near 1.
+    trim: f64,
+    /// How far ahead of the master, in beats, smoothed.
+    phase_error: Option<f64>,
+    /// When the phase error went over `JUMP_ERROR`.
+    far_since: Option<f64>,
+    /// Play was pressed on a follower: it starts on the master's beat…
+    start_wait: bool,
+    /// …heard at this time.
+    start_at: Option<f64>,
+    heard: Option<Heard>,
+    /// Output frames fed to the time stretcher and not yet heard out of it.
+    mt_lag: usize,
     xfade: Option<(f64, usize)>,
     gain: f32,
     stretch: Option<Stretcher>,
@@ -231,6 +296,16 @@ impl Deck {
             roll: None,
             jump_beats: 4.0,
             loop_size: 4.0,
+            synced: false,
+            link: LinkState::default(),
+            sync_ratio: None,
+            trim: 1.0,
+            phase_error: None,
+            far_since: None,
+            start_wait: false,
+            start_at: None,
+            heard: None,
+            mt_lag: 0,
             xfade: None,
             gain: 0.0,
             stretch: Stretcher::new(out_rate, MAX_BLOCK),
@@ -282,6 +357,16 @@ impl Deck {
             jump_beats: self.jump_beats,
             loop_size: self.loop_size,
             loop_beats: self.loop_beats(),
+            sync: SyncView {
+                deck: self.link.deck,
+                synced: self.synced,
+                master: self.link.master,
+                leader: self.follows(),
+                phase_lock: self.lock_target().is_some(),
+                waiting: self.start_wait,
+                phase: self.phase(),
+                others: self.link.others.clone(),
+            },
         }
     }
 
@@ -305,9 +390,14 @@ impl Deck {
         self.speed = 0.0;
         self.reverse = false;
         self.cue_preview = false;
+        self.start_wait = false;
+        self.start_at = None;
+        self.unfollow();
         self.xfade = None;
         self.stretch_primed = false;
-        self.track.replace(track)
+        let old = self.track.replace(track);
+        self.match_leader();
+        old
     }
 
     pub fn memory(&self) -> TrackMemory {
@@ -350,6 +440,16 @@ impl Deck {
         1.0 + self.tempo / 100.0
     }
 
+    /// Playing speed relative to the track's own: tempo, jog and phase trim.
+    fn pitch(&self) -> f64 {
+        self.tempo_factor() * (1.0 + self.bend / 100.0) * self.trim
+    }
+
+    /// Source frames per output frame at normal speed.
+    fn sr_ratio(&self) -> f64 {
+        self.sample_rate() / self.out_rate as f64
+    }
+
     /// The beat grid: the user's, else the detected one.
     pub fn grid(&self) -> Option<BeatGrid> {
         self.grid_override.or(self.track.as_ref()?.grid)
@@ -387,11 +487,24 @@ impl Deck {
     fn start_now(&mut self) {
         self.playing = true;
         self.speed = self.direction();
+        self.start_wait = false;
+        self.start_at = None;
     }
 
     fn stop_now(&mut self) {
         self.playing = false;
         self.speed = 0.0;
+        self.start_wait = false;
+        self.start_at = None;
+    }
+
+    /// Starts at once, or a follower, on the master's next beat.
+    fn start_on_beat(&mut self) {
+        if self.lock_target().is_some() && !self.reverse {
+            self.start_wait = true;
+        } else {
+            self.start_now();
+        }
     }
 
     // --- Transport -------------------------------------------------------
@@ -405,12 +518,21 @@ impl Deck {
             self.cue_latched = true;
             return;
         }
-        self.playing = !self.playing;
-        if !self.playing {
+        if self.start_wait {
+            // Again before the beat: stays paused.
+            self.start_wait = false;
+            self.start_at = None;
+        } else if self.playing {
+            self.playing = false;
             self.pending = None;
             self.begin_slip(|s| s.paused = true);
         } else if self.slip.paused {
+            self.playing = true;
             self.end_slip(|s| s.paused = false, true);
+        } else if self.lock_target().is_some() && !self.reverse {
+            self.start_wait = true;
+        } else {
+            self.playing = true;
         }
     }
 
@@ -421,6 +543,8 @@ impl Deck {
             return;
         }
         self.pending = None;
+        self.start_wait = false;
+        self.start_at = None;
         self.cancel_slips();
         if self.playing {
             self.jump(self.cue);
@@ -508,7 +632,7 @@ impl Deck {
         } else {
             self.pending = None;
             self.enter(h.pos, h.loop_out, 0.0);
-            self.start_now();
+            self.start_on_beat();
         }
         true
     }
@@ -888,9 +1012,11 @@ impl Deck {
 
     // --- Beat grid and quantize ------------------------------------------------
 
+    /// Quantizing: as set for the track, and always while synced, so loops
+    /// and jumps keep the deck in phase.
     pub fn quantize(&self) -> bool {
         let steady = self.track.as_ref().is_some_and(|t| t.steady);
-        self.grid().is_some() && self.quantize_override.unwrap_or(steady)
+        self.grid().is_some() && (self.synced || self.quantize_override.unwrap_or(steady))
     }
 
     /// Turns quantize on or off for this track; None without a grid.
@@ -980,17 +1106,250 @@ impl Deck {
         }
     }
 
+    // --- Sync ------------------------------------------------------------------
+
+    pub fn is_synced(&self) -> bool {
+        self.synced
+    }
+
+    /// Turns sync on or off; None without a grid. Off, the tempo stays where
+    /// sync put it, on a range wide enough to hold it.
+    pub fn toggle_sync(&mut self) -> Option<bool> {
+        if self.synced {
+            self.synced = false;
+            self.unfollow();
+            if self.start_wait {
+                self.start_now();
+            }
+            while self.tempo.abs() > self.range.percent() {
+                self.range = self.range.next();
+            }
+            return Some(false);
+        }
+        self.grid()?;
+        self.synced = true;
+        self.match_leader();
+        Some(true)
+    }
+
+    /// Makes this deck the master; false without a grid.
+    pub fn claim_master(&mut self, now: f64) -> bool {
+        if self.grid().is_none() {
+            return false;
+        }
+        if !self.link.master {
+            self.link.master = true;
+            self.link.master_since = now;
+            self.unfollow();
+        }
+        true
+    }
+
+    /// The deck whose tempo this one follows.
+    pub fn follows(&self) -> Option<u8> {
+        self.sync_ratio.and(self.leader()).map(|p| p.deck)
+    }
+
+    /// The master, when synced and another deck is it.
+    fn leader(&self) -> Option<&Packet> {
+        if !self.synced || self.link.master {
+            return None;
+        }
+        link::leader(&self.link.others)
+    }
+
+    /// The master to lock beats to, and the multiple of its tempo played:
+    /// running, with steady grids on both decks.
+    fn lock_target(&self) -> Option<(Packet, f64)> {
+        let lead = *self.leader()?;
+        let ratio = self.sync_ratio?;
+        (lead.running && lead.steady && self.steady() && self.grid().is_some()).then_some((lead, ratio))
+    }
+
+    /// The beats follow the music closely enough to lock to: detected so, or
+    /// set by hand.
+    fn steady(&self) -> bool {
+        self.grid_override.is_some() || self.track.as_ref().is_some_and(|t| t.steady)
+    }
+
+    /// Playing forward at speed through whole beats: a beat clock to lock to.
+    fn running(&self) -> bool {
+        let whole = |b: f64| b > 0.999 && (b - b.round()).abs() < 1e-3;
+        self.playing
+            && !self.reverse
+            && self.speed == 1.0
+            && self.search == 0.0
+            && self.grid().is_some()
+            && (!self.looping || self.loop_beats().is_some_and(whole))
+    }
+
+    /// One round of sync, from the sync thread: takes in the other decks,
+    /// settles who is master, follows the master's tempo, and returns what to
+    /// tell the others.
+    pub fn update_link(&mut self, deck: u8, others: &[Packet], now: f64) -> Packet {
+        self.link.deck = Some(deck);
+        self.link.others = others.to_vec();
+        let master = link::elect(&self.packet(now), others);
+        if master != self.link.master {
+            self.link.master = master;
+            self.link.master_since = now;
+        }
+        self.match_leader();
+        self.packet(now)
+    }
+
+    /// Sets the tempo so this deck is heard at the master's, or half or
+    /// double that, whichever is nearer.
+    fn match_leader(&mut self) {
+        let (Some(target), Some(bpm)) = (self.leader().and_then(|p| p.bpm), self.bpm()) else {
+            return self.unfollow();
+        };
+        let (factor, ratio) = link::match_tempo(bpm, target);
+        self.tempo = (factor - 1.0) * 100.0;
+        self.sync_ratio = Some(ratio);
+    }
+
+    fn unfollow(&mut self) {
+        self.sync_ratio = None;
+        self.trim = 1.0;
+        self.phase_error = None;
+        self.far_since = None;
+    }
+
+    /// What this deck tells the others.
+    fn packet(&self, now: f64) -> Packet {
+        let h = self.heard.unwrap_or(Heard { time: now, pos: self.pos, rate: 0.0 });
+        let grid = self.grid();
+        Packet {
+            deck: self.link.deck.unwrap_or(0),
+            playing: self.playing,
+            synced: self.synced,
+            master: self.link.master,
+            steady: self.steady(),
+            running: self.running(),
+            master_since: self.link.master_since,
+            bpm: self.bpm().map(|b| b * self.tempo_factor()),
+            beat: grid.map_or(0.0, |g| g.beat_at(h.pos, self.sample_rate())),
+            rate: grid.map_or(0.0, |g| g.bpm / 60.0 * h.rate),
+            time: h.time,
+        }
+    }
+
+    /// How far this deck's beat is from the master's, or else another
+    /// playing deck's, in beats: the phase meter, also for beatmatching by ear.
+    fn phase(&self) -> Option<(u8, f64)> {
+        let (h, g) = (self.heard?, self.grid()?);
+        let others = &self.link.others;
+        let other = self
+            .leader()
+            .or_else(|| others.iter().find(|p| p.master && p.running))
+            .or_else(|| others.iter().find(|p| p.running))
+            .filter(|p| p.running && self.playing)?;
+        let ratio = match self.sync_ratio {
+            Some(ratio) => ratio,
+            None => link::match_tempo(g.bpm * self.tempo_factor(), other.bpm?).1,
+        };
+        let beat = g.beat_at(h.pos, self.sample_rate());
+        Some((other.deck, link::wrap(beat - ratio * other.beat_at(h.time))))
+    }
+
+    /// Where the deck is heard as the block starting at `t` is: behind the
+    /// playhead by what is still inside the time stretcher.
+    fn note_heard(&mut self, t: f64) {
+        let rate = self.speed * self.pitch() + self.search;
+        let lag = self.mt_lag as f64 * rate * self.sr_ratio();
+        self.heard = Some(Heard { time: t, pos: self.pos - lag, rate });
+    }
+
+    /// Keeps a follower in phase with the master, by trimming its speed or,
+    /// far out, by jumping; and times a start waiting for the beat.
+    fn follow(&mut self, t: f64) {
+        if self.start_wait {
+            // A frame generated now is heard after what is in the stretcher.
+            self.start_at = self.beat_start(t + self.mt_lag as f64 / self.out_rate as f64);
+            if self.start_at.is_none() {
+                self.start_now();
+            }
+        }
+        let locked = self.lock_target().filter(|_| self.running() && self.bend == 0.0 && !self.cue_preview);
+        let (Some((lead, ratio)), Some(h), Some(g)) = (locked, self.heard, self.grid()) else {
+            self.trim = 1.0;
+            self.phase_error = None;
+            self.far_since = None;
+            return;
+        };
+        let sr = self.sample_rate();
+        let measured = link::wrap(g.beat_at(h.pos, sr) - ratio * lead.beat_at(t));
+        let error = match self.phase_error {
+            Some(e) => link::wrap(e + link::wrap(measured - e) * SMOOTHING),
+            None => measured,
+        };
+        self.phase_error = Some(error);
+        let seconds = error * 60.0 / (g.bpm * self.tempo_factor());
+        if seconds.abs() <= JUMP_ERROR {
+            self.far_since = None;
+        } else if t - *self.far_since.get_or_insert(t) >= JUMP_AFTER {
+            self.shift_by(-measured * g.period(sr));
+            self.trim = 1.0;
+            self.phase_error = None;
+            self.far_since = None;
+            return;
+        }
+        self.trim = 1.0 - (seconds / TRIM_TIME).clamp(-MAX_TRIM, MAX_TRIM);
+    }
+
+    /// When a follower waiting at its playhead should be heard starting so
+    /// its beat meets the master's, at the earliest at `t`; a beat just gone
+    /// still counts, so a start due at the end of a block isn't put off.
+    fn beat_start(&self, t: f64) -> Option<f64> {
+        let (lead, ratio) = self.lock_target().filter(|(l, _)| l.rate > 0.0)?;
+        let b = self.grid()?.beat_at(self.pos, self.sample_rate());
+        let n = (ratio * lead.beat_at(t - 0.001) - b).ceil();
+        Some(lead.time + ((b + n) / ratio - lead.beat) / lead.rate)
+    }
+
+    /// Moves the playhead by `d` frames to get back in phase, staying in the
+    /// loop, the slip ghosts moving along.
+    fn shift_by(&mut self, d: f64) {
+        let mut to = self.pos + d;
+        if self.looping
+            && let (Some(a), Some(b)) = (self.loop_in, self.loop_out)
+        {
+            if to >= b {
+                to -= b - a;
+            } else if to < a {
+                to += b - a;
+            }
+        }
+        self.jump(to);
+        if let Some(g) = self.slip.ghost.as_mut() {
+            *g += d;
+        }
+        if let Some(r) = self.roll.as_mut() {
+            r.ghost += d;
+        }
+    }
+
     // --- Tempo ---------------------------------------------------------------
 
-    pub fn move_tempo(&mut self, steps: f64) {
+    /// Moves the tempo fader; false while following a master's tempo.
+    pub fn move_tempo(&mut self, steps: f64) -> bool {
+        if self.follows().is_some() {
+            return false;
+        }
         let step = self.range.step();
         let max = self.range.percent();
         self.tempo = ((self.tempo + steps * step) / step).round() * step;
         self.tempo = self.tempo.clamp(-max, max);
+        true
     }
 
-    pub fn reset_tempo(&mut self) {
+    pub fn reset_tempo(&mut self) -> bool {
+        if self.follows().is_some() {
+            return false;
+        }
         self.tempo = 0.0;
+        true
     }
 
     pub fn cycle_range(&mut self) {
@@ -1009,7 +1368,25 @@ impl Deck {
     // --- Audio -----------------------------------------------------------------
 
     /// Fills `out` (interleaved stereo) with the next block of audio.
+    #[cfg(test)]
     pub fn render(&mut self, out: &mut [f32]) {
+        self.render_at(out, None);
+    }
+
+    /// Like `render`, knowing when the block will be heard, which sync needs.
+    pub fn render_at(&mut self, out: &mut [f32], heard_at: Option<f64>) {
+        let stretched = self.master_tempo && self.stretch.is_some();
+        if !stretched {
+            self.mt_lag = 0;
+        }
+        match heard_at {
+            Some(t) => {
+                self.note_heard(t);
+                self.follow(t);
+            }
+            None if self.start_wait => self.start_now(),
+            None => {}
+        }
         let n = out.len() / 2;
         if self.out_l.len() < n {
             self.out_l.resize(n, 0.0);
@@ -1017,11 +1394,11 @@ impl Deck {
         }
         let mut l = std::mem::take(&mut self.out_l);
         let mut r = std::mem::take(&mut self.out_r);
-        if self.master_tempo && self.stretch.is_some() {
-            self.render_stretched(&mut l[..n], &mut r[..n]);
+        if stretched {
+            self.render_stretched(&mut l[..n], &mut r[..n], heard_at);
         } else {
             self.stretch_primed = false;
-            self.generate(&mut l[..n], &mut r[..n]);
+            self.generate(&mut l[..n], &mut r[..n], heard_at);
         }
         for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             frame[0] = l[i];
@@ -1032,7 +1409,7 @@ impl Deck {
     }
 
     /// Varispeed playback, then Rubber Band shifts the key back to the original.
-    fn render_stretched(&mut self, l: &mut [f32], r: &mut [f32]) {
+    fn render_stretched(&mut self, l: &mut [f32], r: &mut [f32], heard_at: Option<f64>) {
         let Some(mut st) = self.stretch.take() else { return };
         let mut gl = std::mem::take(&mut self.gen_l);
         let mut gr = std::mem::take(&mut self.gen_r);
@@ -1048,6 +1425,7 @@ impl Deck {
                 pad -= k;
             }
             self.discard = st.start_delay();
+            self.mt_lag = 0;
             self.stretch_primed = true;
         }
         st.set_pitch_scale(1.0 / self.tempo_factor());
@@ -1058,8 +1436,10 @@ impl Deck {
             let available = st.available();
             if available == 0 {
                 let k = st.samples_required().clamp(64, MAX_BLOCK);
-                self.generate(&mut gl[..k], &mut gr[..k]);
+                let heard = heard_at.map(|t| t + (done + self.mt_lag) as f64 / self.out_rate as f64);
+                self.generate(&mut gl[..k], &mut gr[..k], heard);
                 st.process(&gl[..k], &gr[..k]);
+                self.mt_lag += k;
             } else if self.discard > 0 {
                 let k = available.min(self.discard).min(MAX_BLOCK);
                 let got = st.retrieve(&mut gl[..k], &mut gr[..k]);
@@ -1071,6 +1451,7 @@ impl Deck {
                     break;
                 }
                 done += got;
+                self.mt_lag = self.mt_lag.saturating_sub(got);
             }
         }
         l[done..].fill(0.0);
@@ -1082,8 +1463,9 @@ impl Deck {
     }
 
     /// Reads the track at the current speed with cubic interpolation, running
-    /// the motor ramp, loops and end-of-track handling frame by frame.
-    fn generate(&mut self, l: &mut [f32], r: &mut [f32]) {
+    /// the motor ramp, loops and end-of-track handling frame by frame. The
+    /// first frame is heard at `heard`, if known.
+    fn generate(&mut self, l: &mut [f32], r: &mut [f32], heard: Option<f64>) {
         let Some(track) = self.track.clone() else {
             l.fill(0.0);
             r.fill(0.0);
@@ -1093,8 +1475,9 @@ impl Deck {
         let frames = track.frames();
         let last = self.last_frame();
         let sr_ratio = track.sample_rate as f64 / self.out_rate as f64;
-        let pitch = self.tempo_factor() * (1.0 + self.bend / 100.0);
-        let target = if self.playing { self.direction() } else { 0.0 };
+        let pitch = self.pitch();
+        let mut target = if self.playing { self.direction() } else { 0.0 };
+        let out_rate = self.out_rate as f64;
         let ramp = |seconds: f64| {
             if seconds <= 0.0 { f64::INFINITY } else { 1.0 / (seconds * self.out_rate as f64) }
         };
@@ -1108,6 +1491,12 @@ impl Deck {
         let slip_dir = if self.slip.reverse { 1.0 } else { dir };
 
         for i in 0..l.len() {
+            if let (Some(at), Some(t)) = (self.start_at, heard)
+                && t + i as f64 / out_rate >= at
+            {
+                self.start_now();
+                target = self.direction();
+            }
             if (self.playing || self.slip.paused)
                 && let Some(g) = self.slip.ghost.as_mut()
             {
@@ -1209,8 +1598,8 @@ fn sample(s: &[f32], frames: usize, pos: f64) -> (f32, f32) {
 }
 
 impl Source for Deck {
-    fn render(&mut self, out: &mut [f32]) {
-        Deck::render(self, out);
+    fn render(&mut self, out: &mut [f32], heard_at: f64) {
+        self.render_at(out, Some(heard_at));
     }
 }
 
@@ -1586,6 +1975,267 @@ mod tests {
         let g = d.grid().unwrap();
         assert_eq!((g.bpm, g.anchor), (121.0, track.grid.unwrap().anchor));
         assert_eq!((d.memory().grid, d.memory().bpm), (Some(g), None));
+    }
+
+    // --- Sync ---
+
+    /// 10 ms blocks.
+    const BLOCK: usize = 480;
+
+    /// A master heard at `bpm`, its beat `beat0` heard at time 0.
+    fn master(bpm: f64, beat0: f64) -> impl Fn(f64) -> Packet {
+        move |t| Packet {
+            deck: 1,
+            playing: true,
+            synced: true,
+            master: true,
+            steady: true,
+            running: true,
+            master_since: 0.0,
+            bpm: Some(bpm),
+            beat: beat0 + t * bpm / 60.0,
+            rate: bpm / 60.0,
+            time: t,
+        }
+    }
+
+    /// Runs `d` against the master from time `*t` for `seconds`, the way the
+    /// audio and sync threads would; returns the output.
+    fn follow(d: &mut Deck, t: &mut f64, seconds: f64, lead: &impl Fn(f64) -> Packet) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut buf = [0.0; BLOCK * 2];
+        for _ in 0..(seconds * SR as f64 / BLOCK as f64).round() as usize {
+            d.update_link(2, &[lead(*t)], *t);
+            d.render_at(&mut buf, Some(*t));
+            out.extend_from_slice(&buf);
+            *t += BLOCK as f64 / SR as f64;
+        }
+        out
+    }
+
+    /// The follower's phase against the master, in ms.
+    fn phase_ms(d: &Deck) -> f64 {
+        let (_, beats) = d.phase().expect("a phase");
+        beats * 60_000.0 / (d.bpm().unwrap() * d.tempo_factor())
+    }
+
+    /// A synced deck that started in phase with `lead` and played a second.
+    fn following(lead: &impl Fn(f64) -> Packet, t: &mut f64) -> Deck {
+        following_on(deck(), lead, t)
+    }
+
+    fn following_on(mut d: Deck, lead: &impl Fn(f64) -> Packet, t: &mut f64) -> Deck {
+        d.pos = beat(2.0);
+        assert_eq!(d.toggle_sync(), Some(true));
+        follow(&mut d, t, 0.02, lead);
+        d.play_pause();
+        follow(&mut d, t, 1.0, lead);
+        assert!(d.playing);
+        d
+    }
+
+    #[test]
+    fn followers_take_the_masters_tempo() {
+        let mut d = deck();
+        let mut t = 100.0;
+        d.toggle_sync();
+        follow(&mut d, &mut t, 0.02, &master(135.0, 0.0));
+        assert_eq!(d.follows(), Some(1));
+        assert!((d.tempo - 12.5).abs() < 1e-9);
+        assert!(!d.move_tempo(1.0) && !d.reset_tempo(), "the tempo keys are locked");
+        assert!(d.quantize(), "quantize is on while synced");
+        // Half or double, whichever is nearer.
+        follow(&mut d, &mut t, 0.02, &master(250.0, 0.0));
+        assert_eq!(d.sync_ratio, Some(0.5));
+        assert!((d.tempo - 125.0 / 1.2 + 100.0).abs() < 1e-9);
+        follow(&mut d, &mut t, 0.02, &master(67.5, 0.0));
+        assert_eq!(d.sync_ratio, Some(2.0));
+        assert!((d.tempo - 12.5).abs() < 1e-9);
+        // Unsynced, the tempo stays, on a range that holds it.
+        assert_eq!(d.toggle_sync(), Some(false));
+        assert!((d.tempo - 12.5).abs() < 1e-9);
+        assert_eq!(d.range, TempoRange::R16);
+        assert!(!d.quantize());
+        assert!(d.move_tempo(1.0));
+    }
+
+    #[test]
+    fn a_synced_deck_playing_alone_becomes_master() {
+        let mut d = deck();
+        d.toggle_sync();
+        d.play_pause();
+        let me = d.update_link(2, &[], 5.0);
+        assert!(me.master && d.snapshot().sync.master);
+        assert!(d.playing, "nothing to wait for");
+        // A newer claim takes over, and this deck follows it.
+        let lead = Packet { master_since: 6.0, ..master(128.0, 0.0)(7.0) };
+        d.update_link(2, &[lead], 7.0);
+        assert!(!d.snapshot().sync.master);
+        assert_eq!(d.follows(), Some(1));
+        // Claiming it back.
+        assert!(d.claim_master(8.0));
+        assert_eq!(d.follows(), None);
+        assert!(d.update_link(2, &[lead], 8.0).master);
+    }
+
+    #[test]
+    fn play_waits_for_the_masters_beat() {
+        let lead = master(120.0, 0.3);
+        let mut t = 100.0;
+        let mut d = deck();
+        d.pos = beat(2.0);
+        d.toggle_sync();
+        follow(&mut d, &mut t, 0.02, &lead);
+        d.play_pause();
+        assert!(!d.playing && d.snapshot().sync.waiting);
+        let pressed = t;
+        while !d.playing {
+            follow(&mut d, &mut t, 0.01, &lead);
+            assert!(t - pressed < 0.52, "at most a beat");
+        }
+        assert!(t - pressed > 0.3, "the master's beat was 0.35 s off");
+        follow(&mut d, &mut t, 0.02, &lead);
+        assert!(phase_ms(&d).abs() < 0.1, "in phase from the start: {} ms", phase_ms(&d));
+        assert!((d.trim - 1.0).abs() < 1e-6);
+
+        // Play again before the beat: still paused.
+        d.play_pause();
+        d.play_pause();
+        assert!(d.snapshot().sync.waiting);
+        d.play_pause();
+        follow(&mut d, &mut t, 1.0, &lead);
+        assert!(!d.playing && !d.snapshot().sync.waiting);
+    }
+
+    #[test]
+    fn small_phase_errors_are_trimmed_out_without_a_jump() {
+        let mut t = 100.0;
+        let mut d = following(&master(120.0, 0.3), &mut t);
+        // The master moves 10 ms.
+        let lead = master(120.0, 0.32);
+        let mut buf = [0.0; BLOCK * 2];
+        for _ in 0..800 {
+            let before = d.pos;
+            d.update_link(2, &[lead(t)], t);
+            d.render_at(&mut buf, Some(t));
+            t += BLOCK as f64 / SR as f64;
+            let moved = d.pos - before;
+            assert!((moved / BLOCK as f64 - 1.0).abs() <= MAX_TRIM + 1e-9, "no jump: {moved}");
+        }
+        assert!(phase_ms(&d).abs() < 0.5, "{} ms", phase_ms(&d));
+    }
+
+    #[test]
+    fn big_phase_errors_jump_back_in() {
+        let mut t = 100.0;
+        let mut d = following(&master(120.0, 0.3), &mut t);
+        let lead = master(120.0, 0.5);
+        follow(&mut d, &mut t, 0.1, &lead);
+        assert!(phase_ms(&d).abs() < 0.5, "{} ms", phase_ms(&d));
+    }
+
+    #[test]
+    fn followers_keep_up_with_the_master() {
+        let mut t = 100.0;
+        let track = Track::from_samples("t".into(), "t".into(), None, SR, click_track(120.0, 150.0, SR));
+        let mut d = Deck::new(SR);
+        d.load(Arc::new(track), &TrackMemory::default(), false);
+        let mut d = following_on(d, &master(120.0, 0.3), &mut t);
+        // A tempo change, live.
+        let lead = |t: f64| Packet { beat: 0.3 + 101.0 * 2.0 + (t - 101.0) * 2.1, ..master(126.0, 0.0)(t) };
+        follow(&mut d, &mut t, 4.0, &lead);
+        assert!((d.tempo - 5.0).abs() < 1e-9);
+        assert!(phase_ms(&d).abs() < 0.5, "{} ms", phase_ms(&d));
+        // The master's sound card runs 100 ppm fast, for minutes.
+        let at = t;
+        let drifting = |t: f64| Packet { beat: lead(at).beat + (t - at) * 2.1 * 1.0001, ..lead(t) };
+        let mut buf = [0.0; BLOCK * 2];
+        while t < at + 120.0 {
+            let before = d.pos;
+            d.update_link(2, &[drifting(t)], t);
+            d.render_at(&mut buf, Some(t));
+            t += BLOCK as f64 / SR as f64;
+            assert!(((d.pos - before) / (BLOCK as f64 * 1.05) - 1.0).abs() <= MAX_TRIM + 1e-9, "no jump");
+        }
+        assert!(phase_ms(&d).abs() < 0.5, "{} ms", phase_ms(&d));
+    }
+
+    #[test]
+    fn unsteady_grids_sync_the_tempo_only() {
+        let mut track = Track::from_samples("t".into(), "t".into(), None, SR, click_track(120.0, 20.0, SR));
+        track.steady = false;
+        let mut d = Deck::new(SR);
+        d.load(Arc::new(track), &TrackMemory::default(), false);
+        let lead = master(126.0, 0.3);
+        let mut t = 100.0;
+        d.toggle_sync();
+        follow(&mut d, &mut t, 0.02, &lead);
+        let sync = d.snapshot().sync;
+        assert_eq!((sync.leader, sync.phase_lock), (Some(1), false));
+        assert!((d.tempo - 5.0).abs() < 1e-9);
+        d.play_pause();
+        assert!(d.playing, "no waiting for a beat");
+        follow(&mut d, &mut t, 1.0, &lead);
+        assert_eq!(d.trim, 1.0);
+        // A grid set by hand is trusted.
+        d.set_downbeat();
+        assert!(d.snapshot().sync.phase_lock);
+    }
+
+    /// Finds where the clicks start in `out` (stereo), in frames.
+    fn onsets(out: &[f32]) -> Vec<usize> {
+        let mut quiet = 0;
+        let mut found = Vec::new();
+        for (i, f) in out.chunks(2).enumerate() {
+            if f[0].abs() < 0.01 {
+                quiet += 1;
+                continue;
+            }
+            if quiet > SR as usize / 50 {
+                found.push(i);
+            }
+            quiet = 0;
+        }
+        found
+    }
+
+    /// The deck says what it plays is heard when it actually comes out, with
+    /// Master Tempo's latency too.
+    fn check_heard_positions(master_tempo: bool) {
+        let mut d = deck();
+        if master_tempo && !d.toggle_master_tempo() {
+            return;
+        }
+        d.play_pause();
+        let mut buf = [0.0; BLOCK * 2];
+        let mut out = Vec::new();
+        let mut said = Vec::new();
+        let mut t = 50.0;
+        for _ in 0..300 {
+            d.render_at(&mut buf, Some(t));
+            said.push(d.heard.unwrap());
+            out.extend_from_slice(&buf);
+            t += BLOCK as f64 / SR as f64;
+        }
+        let found = onsets(&out);
+        assert!(found.len() > 8, "{found:?}");
+        for i in found {
+            let h = said[i / BLOCK];
+            let pos = h.pos + (i % BLOCK) as f64 * h.rate;
+            // Kicks on the beats, hats halfway.
+            let off = ((pos - beat(0.0)) / 12_000.0 - ((pos - beat(0.0)) / 12_000.0).round()) * 12_000.0;
+            assert!(off.abs() < 0.002 * SR as f64, "heard {} ms off at frame {i}", off / 48.0);
+        }
+    }
+
+    #[test]
+    fn heard_positions_match_the_output() {
+        check_heard_positions(false);
+    }
+
+    #[test]
+    fn heard_positions_match_the_output_with_master_tempo() {
+        check_heard_positions(true);
     }
 
     fn run(d: &mut Deck, frames: usize) -> Vec<f32> {

@@ -1256,6 +1256,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "cpal",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

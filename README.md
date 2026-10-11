@@ -49,6 +49,24 @@ on from where it would have been had you never rolled. Slip mode (`Z`) does the 
 for loops, reverse, held hot cues and pause: the track keeps going
 underneath, shown as a purple line on the waveform, and comes back in time.
 
+### Sync
+
+Run one odj-player per deck and they find each other: each takes a deck
+number (DECK 1 to 4, in the header) and shows the others' tempo. `F` syncs a
+deck to the master: it takes the master's tempo, or half or double it,
+whichever is nearer, and keeps its beats on the master's, correcting drift by
+up to 0.3% of speed and jumping back in if it's far out. Play on a synced deck
+waits for the master's next beat, and quantize stays on while synced. Decks
+whose beats don't keep to the grid sync their tempo only (`SYNC BPM`).
+
+The first synced deck to play becomes the master; when it stops, a synced deck
+that's playing takes over, so loading your next track never moves the tempo
+of what's playing. `Shift+F` makes a deck the master. The phase meter shows
+how far a deck's beats are from the master's, or another playing deck's,
+in ms, so it helps when beatmatching by ear too. Sync allows for each sound
+card's latency and Master Tempo's, so decks on different cards meet at the
+mixer.
+
 Press `?` in the app for all keys. Memory points, hot cues, loops, beat grid
 corrections and quantize are remembered per track, one JSON file each under
 `~/.local/share/odj/tracks/`. Files are named by a fingerprint of the audio, so
@@ -74,7 +92,8 @@ next start. A pad whose file has moved or changed shows so.
 ## Layout
 
 A Cargo workspace: `crates/odj-core` holds what both apps share (decoding and
-fingerprinting, the cue library, audio output, the file browser);
+fingerprinting, the cue library, audio output, the file browser, the link
+between decks);
 `crates/odj-player` and `crates/odj-sampler` are the two binaries.
 
 ## Install on Omarchy / Arch

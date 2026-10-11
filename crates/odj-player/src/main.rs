@@ -1,6 +1,7 @@
 mod app;
 mod engine;
 mod stretch;
+mod sync;
 mod ui;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use odj_core::{audio, tui};
 
 use app::App;
 use engine::Deck;
+use sync::SyncLink;
 
 fn main() -> Result<()> {
     let arg = std::env::args_os().nth(1).map(PathBuf::from);
@@ -54,7 +56,11 @@ fn start(terminal: &mut DefaultTerminal, browser: Browser, file: Option<PathBuf>
     let _stream = output.start(deck.clone())?;
 
     let name = format!("{} · {} Hz", output.name, output.sample_rate());
+    let link = SyncLink::start(deck.clone());
     let mut app = App::new(deck, browser, key_release, name);
+    if let Err(e) = &link {
+        app.set_status(format!("Sync unavailable: {e}"));
+    }
     match file {
         Some(f) if is_audio(&f) => {
             app.load(f);

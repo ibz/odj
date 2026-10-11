@@ -11,7 +11,7 @@ use odj_core::track::{Track, WAVE_RATE};
 use odj_core::tui::{AMBER, DIM, centered};
 
 use crate::app::App;
-use crate::engine::{CD_FRAMES, Snapshot};
+use crate::engine::{CD_FRAMES, Snapshot, SyncView};
 
 const CUE_COLOR: Color = Color::Rgb(255, 140, 0);
 const HOT_COLOR: Color = Color::Rgb(60, 220, 100);
@@ -25,13 +25,17 @@ pub const BAR_BG: Color = Color::Rgb(75, 75, 88);
 const SLIP_COLOR: Color = Color::Rgb(200, 110, 255);
 /// The column of the slip ghost, where the track would be.
 pub const GHOST_BG: Color = Color::Rgb(95, 50, 125);
+const SYNC_COLOR: Color = Color::Rgb(255, 200, 40);
+const MASTER_COLOR: Color = Color::Rgb(255, 120, 40);
+/// Cells of the phase meter, across one beat.
+const PHASE_CELLS: usize = 17;
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     let [header, status, zoom, overview, info, footer] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(4),
         Constraint::Length(4),
         Constraint::Length(3),
@@ -78,6 +82,9 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     let mut left = vec![Span::styled(" ODJ ", Style::new().fg(Color::Black).bg(AMBER).bold()), Span::raw(" ")];
+    if let Some(n) = s.sync.deck {
+        left.push(Span::styled(format!("DECK {n}  "), Style::new().fg(AMBER).bold()));
+    }
     if let Some((n, total)) = app.track_number {
         left.push(Span::styled("TRACK ", Style::new().fg(DIM)));
         left.push(Span::styled(format!("{n:02}"), Style::new().bold()));
@@ -110,6 +117,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
 
     let (state, color) = if s.cue_preview {
         ("● CUE  ", CUE_COLOR)
+    } else if s.sync.waiting {
+        ("◆ WAIT ", SYNC_COLOR)
     } else if s.playing && s.reverse {
         ("◀ REV  ", Color::Cyan)
     } else if s.playing {
@@ -195,7 +204,71 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     let slip_style = if s.slip { Style::new().fg(Color::Black).bg(SLIP_COLOR).bold() } else { Style::new().fg(DIM) };
     spans.push(Span::styled(" SLIP ", slip_style));
 
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    let [first, second] = Layout::vertical([Constraint::Length(1); 2]).areas(inner);
+    f.render_widget(Paragraph::new(Line::from(spans)), first);
+    f.render_widget(Paragraph::new(sync_line(&s.sync, s.bpm.map(|b| b * (1.0 + s.tempo / 100.0)))), second);
+}
+
+/// SYNC and MASTER, the phase meter, and the other decks.
+fn sync_line(sync: &SyncView, heard_bpm: Option<f64>) -> Line<'static> {
+    let badge = |on: bool, color: Color| {
+        if on { Style::new().fg(Color::Black).bg(color).bold() } else { Style::new().fg(DIM) }
+    };
+    let mut spans = Vec::new();
+    if sync.deck.is_none() {
+        spans.push(Span::styled(" SYNC ", Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)));
+        return Line::from(spans);
+    }
+    let label = if sync.synced && sync.leader.is_some() && !sync.phase_lock { " SYNC BPM " } else { " SYNC " };
+    spans.push(Span::styled(label, badge(sync.synced, SYNC_COLOR)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(" MASTER ", badge(sync.master, MASTER_COLOR)));
+    match sync.leader {
+        Some(n) => spans.push(Span::styled(format!(" → D{n}"), Style::new().fg(SYNC_COLOR).bold())),
+        None if sync.synced && !sync.master => spans.push(Span::styled(" no master yet", Style::new().fg(DIM))),
+        None => {}
+    }
+
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled("PHASE ", Style::new().fg(DIM)));
+    match sync.phase {
+        Some((deck, beats)) => {
+            let ms = heard_bpm.map_or(0.0, |bpm| beats * 60_000.0 / bpm);
+            let color = match ms.abs() {
+                m if m < 5.0 => Color::Green,
+                m if m < 20.0 => Color::Yellow,
+                _ => Color::Red,
+            };
+            let at = (((beats + 0.5) * PHASE_CELLS as f64) as usize).min(PHASE_CELLS - 1);
+            let meter: String = (0..PHASE_CELLS)
+                .map(|i| match i {
+                    _ if i == at => '●',
+                    _ if i == PHASE_CELLS / 2 => '┃',
+                    _ => '·',
+                })
+                .collect();
+            spans.push(Span::styled(format!("▕{meter}▏"), Style::new().fg(color)));
+            spans.push(Span::styled(format!(" {ms:+4.0} ms"), Style::new().fg(color).bold()));
+            spans.push(Span::styled(format!(" vs D{deck}"), Style::new().fg(DIM)));
+        }
+        None => spans.push(Span::styled(format!("▕{}▏", "·".repeat(PHASE_CELLS)), Style::new().fg(DIM))),
+    }
+
+    for p in &sync.others {
+        spans.push(Span::raw("    "));
+        let style = if p.master { Style::new().fg(MASTER_COLOR).bold() } else { Style::new().fg(Color::Gray) };
+        spans.push(Span::styled(format!("D{} ", p.deck), style));
+        spans.push(Span::styled(if p.playing { "▶ " } else { "‖ " }, Style::new().fg(DIM)));
+        let bpm = p.bpm.map_or("---.--".to_string(), |b| format!("{b:.2}"));
+        spans.push(Span::styled(bpm, style));
+        if p.master {
+            spans.push(Span::styled(" M", style));
+        }
+        if p.synced && !p.master {
+            spans.push(Span::styled(" S", Style::new().fg(SYNC_COLOR)));
+        }
+    }
+    Line::from(spans)
 }
 
 fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
@@ -272,7 +345,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
         None => Line::from(Span::styled(
-            " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
+            " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  F sync  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
             Style::new().fg(DIM),
         )),
     };
@@ -342,7 +415,8 @@ fn draw_help(f: &mut Frame) {
         ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
         ("M", "Master Tempo (key lock)"),
         (", / .", "Jog: hold to slow/speed up · paused: 1 frame (Shift: strong / 1 beat)"),
-        ("Q", "Quantize this track: cues, loops and jumps go on the beat"),
+        ("Q", "Quantize this track: cues, loops and jumps go on the beat (always on while synced)"),
+        ("F / Shift+F", "Sync to the master deck's tempo and beats / make this deck the master"),
         ("A / Shift+A", "Tap BPM (playing: the beats go on the taps) / back to the detected grid"),
         ("D", "Make the playhead beat 1 of a bar"),
         ("Y", "Grid adjust: , / . shift the beats 1 ms (Shift 10) · ↑/↓ BPM ±0.01 (Shift 0.1)"),

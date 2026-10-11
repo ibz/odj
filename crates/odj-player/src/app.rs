@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use odj_core::library::{Browser, siblings};
+use odj_core::link;
 use odj_core::memory::Memory;
 use odj_core::track::Track;
 
@@ -96,7 +97,7 @@ impl App {
         self.deck.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
+    pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
     }
 
@@ -475,9 +476,35 @@ impl App {
                 let sign = if code == KeyCode::Up { 1.0 } else { -1.0 };
                 self.deck().nudge_grid_bpm(sign * if shift { 0.1 } else { 0.01 });
             }
-            KeyCode::Up => self.deck().move_tempo(if shift { 10.0 } else { 1.0 }),
-            KeyCode::Down => self.deck().move_tempo(if shift { -10.0 } else { -1.0 }),
-            KeyCode::Char('0') if once => self.deck().reset_tempo(),
+            KeyCode::Up | KeyCode::Down => {
+                let sign = if code == KeyCode::Up { 1.0 } else { -1.0 };
+                let moved = self.deck().move_tempo(sign * if shift { 10.0 } else { 1.0 });
+                if !moved {
+                    self.synced_tempo();
+                }
+            }
+            KeyCode::Char('0') if once => {
+                let reset = self.deck().reset_tempo();
+                if !reset {
+                    self.synced_tempo();
+                }
+            }
+            KeyCode::Char('f') if once && shift => {
+                let claimed = self.deck().claim_master(link::now());
+                if claimed {
+                    self.set_status("Master: synced decks follow this one");
+                } else {
+                    self.set_status("The master needs a beat grid (tap the BPM with A)");
+                }
+            }
+            KeyCode::Char('f') if once => {
+                let on = self.deck().toggle_sync();
+                match on {
+                    Some(true) => self.set_status("Sync on"),
+                    Some(false) => self.set_status("Sync off, the tempo stays"),
+                    None => self.set_status("Sync needs a beat grid (tap the BPM with A)"),
+                }
+            }
             KeyCode::Char('g') if once => self.deck().cycle_range(),
             KeyCode::Char('m') if once => {
                 let (on, latency) = {
@@ -537,6 +564,9 @@ impl App {
                 self.set_status("Beat grid reset to detected");
             }
             KeyCode::Char('a') if once => self.tap(),
+            KeyCode::Char('q') if once && self.deck().is_synced() => {
+                self.set_status("Quantize stays on while synced, so the deck stays in phase");
+            }
             KeyCode::Char('q') if once => {
                 let on = self.deck().toggle_quantize();
                 match on {
@@ -572,6 +602,15 @@ impl App {
                 deck.start_time = next_preset(START_TIMES, deck.start_time);
             }
             _ => {}
+        }
+    }
+}
+
+impl App {
+    fn synced_tempo(&mut self) {
+        let leader = self.deck().follows();
+        if let Some(n) = leader {
+            self.set_status(format!("Synced to DECK {n}, F to unsync"));
         }
     }
 }

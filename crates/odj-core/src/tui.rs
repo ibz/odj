@@ -51,8 +51,10 @@ pub fn restore(key_release: bool) {
     ratatui::restore();
 }
 
-/// Plays on the only stereo output there is; with more to choose from, or when a card
-/// is unavailable, asks. `None` means the user quit the picker.
+/// Always asks which output and route to play on, even with only one card: a card with
+/// just two channels still offers left-only/right-only mono alongside stereo, and those
+/// would otherwise be unreachable. Only the system default is used without asking, and
+/// only when no outputs were found at all. `None` means the user quit the picker.
 pub fn pick_output(terminal: &mut DefaultTerminal, host: &audio::Host) -> Result<Option<audio::Output>> {
     let cards = audio::cards(host)?;
     let choices = audio::choices(&cards);
@@ -60,11 +62,6 @@ pub fn pick_output(terminal: &mut DefaultTerminal, host: &audio::Host) -> Result
         return audio::Output::open_default(host)
             .context("no audio outputs found (does your user have access to /dev/snd, e.g. via the `audio` group?)")
             .map(Some);
-    }
-    let all_available = choices.iter().all(|c| c.available(&cards));
-    let mut stereo = choices.iter().filter(|c| matches!(c.route, audio::Route::Stereo(..)));
-    if let (true, Some(only), None) = (all_available, stereo.next(), stereo.next()) {
-        return audio::Output::open(host, &cards, only).map(Some);
     }
     let items: Vec<(String, bool)> = choices.iter().map(|c| (c.label(&cards), c.available(&cards))).collect();
     let mut selected = items.iter().position(|(_, ok)| *ok).unwrap_or(0);

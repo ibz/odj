@@ -92,7 +92,8 @@ pub fn host() -> Host {
     cpal::default_host()
 }
 
-/// Playback devices to choose from, without HDMI/DisplayPort.
+/// Playback devices to choose from, including HDMI/DisplayPort — the picker is always
+/// shown, so there's no need to hide outputs nobody would want; the user just skips them.
 ///
 /// Fails when PipeWire runs but offers nothing: going around it to the hardware would
 /// lock cards away from PipeWire and other odj instances, and hide the real problem.
@@ -104,18 +105,13 @@ pub fn cards(host: &Host) -> Result<Vec<Card>> {
     };
     if pipewire && (host.id() != HostId::PipeWire || cards.is_empty()) {
         bail!(
-            "PipeWire is running but has no usable audio outputs (HDMI is not used).\n\
+            "PipeWire is running but has no usable audio outputs.\n\
              Check `wpctl status`. If it lists no devices, PipeWire probably can't open the \
              sound cards: make sure your user may use /dev/snd (e.g. is in the `audio` group), \
              then log in again or reboot so PipeWire restarts with that access."
         );
     }
     Ok(cards)
-}
-
-fn is_hdmi(name: &str) -> bool {
-    let name = name.to_lowercase();
-    name.contains("hdmi") || name.contains("displayport")
 }
 
 /// PipeWire sinks. Other programs' playback streams (including other odj instances)
@@ -137,9 +133,6 @@ fn pipewire_cards(host: &Host) -> Vec<Card> {
             continue;
         }
         let name = desc.name().to_string();
-        if is_hdmi(&node) || is_hdmi(&name) {
-            continue;
-        }
         let Ok(config) = device.default_output_config() else { continue };
         cards.push(Card {
             device,
@@ -172,9 +165,6 @@ fn alsa_cards(host: &Host) -> Vec<Card> {
         }
         let Ok(desc) = hw.description() else { continue };
         let name = desc.name().to_string();
-        if is_hdmi(&name) {
-            continue;
-        }
         let Some(plug) = devices.iter().find(|d| pcm_id(d) == format!("plug{id}")) else { continue };
         // The raw hw device tells the real channel count and native rate.
         let configs = match hw.supported_output_configs() {

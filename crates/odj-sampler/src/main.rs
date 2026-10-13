@@ -40,15 +40,22 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         return Ok(());
     };
     let sampler = Arc::new(Mutex::new(Sampler::new()));
-    let _stream = output.start(sampler.clone())?;
+    let stream = output.start(sampler.clone())?;
+    if let Err(e) = audio::verify_route(&host, &output) {
+        drop(stream); // tear down rather than play on from the wrong device
+        return Err(e);
+    }
 
     let name = format!("{} · {} Hz", output.name, output.sample_rate());
     let mut app = App::new(sampler, output.sample_rate(), Kit::file(), key_release, name);
-    run(terminal, &mut app)
+    run(terminal, &mut app, &output.errors)
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) -> Result<()> {
     while !app.quit {
+        if let Some(e) = errors.take() {
+            app.set_status(e);
+        }
         app.tick();
         let snapshot = app.sampler.lock().unwrap_or_else(|e| e.into_inner()).snapshot();
         terminal.draw(|f| ui::draw(f, app, &snapshot))?;

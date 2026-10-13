@@ -53,7 +53,11 @@ fn start(terminal: &mut DefaultTerminal, browser: Browser, file: Option<PathBuf>
         return Ok(());
     };
     let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
-    let _stream = output.start(deck.clone())?;
+    let stream = output.start(deck.clone())?;
+    if let Err(e) = audio::verify_route(&host, &output) {
+        drop(stream); // tear down rather than play on from the wrong device
+        return Err(e);
+    }
 
     let name = format!("{} · {} Hz", output.name, output.sample_rate());
     let link = SyncLink::start(deck.clone());
@@ -67,13 +71,16 @@ fn start(terminal: &mut DefaultTerminal, browser: Browser, file: Option<PathBuf>
         }
         _ => app.browser.open = true,
     }
-    let result = run(terminal, &mut app);
+    let result = run(terminal, &mut app, &output.errors);
     app.remember();
     result
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) -> Result<()> {
     while !app.quit {
+        if let Some(e) = errors.take() {
+            app.set_status(e);
+        }
         app.tick();
         let snapshot = app.deck.lock().unwrap_or_else(|e| e.into_inner()).snapshot();
         terminal.draw(|f| ui::draw(f, app, &snapshot))?;

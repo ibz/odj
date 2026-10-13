@@ -254,7 +254,7 @@ impl App {
         self.sampler.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn set_status(&mut self, msg: impl Into<String>) {
+    pub(crate) fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
     }
 

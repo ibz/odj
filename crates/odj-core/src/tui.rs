@@ -64,7 +64,7 @@ pub fn pick_output(terminal: &mut DefaultTerminal, host: &audio::Host) -> Result
     let all_available = choices.iter().all(|c| c.available(&cards));
     let mut stereo = choices.iter().filter(|c| matches!(c.route, audio::Route::Stereo(..)));
     if let (true, Some(only), None) = (all_available, stereo.next(), stereo.next()) {
-        return audio::Output::open(&cards, only).map(Some);
+        return audio::Output::open(host, &cards, only).map(Some);
     }
     let items: Vec<(String, bool)> = choices.iter().map(|c| (c.label(&cards), c.available(&cards))).collect();
     let mut selected = items.iter().position(|(_, ok)| *ok).unwrap_or(0);
@@ -80,7 +80,7 @@ pub fn pick_output(terminal: &mut DefaultTerminal, host: &audio::Host) -> Result
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = items.len() - 1,
             KeyCode::Enter if items[selected].1 => {
-                return audio::Output::open(&cards, &choices[selected]).map(Some);
+                return audio::Output::open(host, &cards, &choices[selected]).map(Some);
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
             KeyCode::Esc | KeyCode::Char('q' | 'Q') => return Ok(None),

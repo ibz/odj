@@ -1,9 +1,9 @@
 # Maintainer: ibz <github@ibz.me>
 pkgname=odj-git
 _pkgname=odj
-pkgver=r1.a9b6d61
+pkgver=r17.0915687
 pkgrel=1
-pkgdesc="Keyboard-driven DJ player and sampler for the terminal, inspired by Pioneer CDJ decks"
+pkgdesc="Keyboard-driven DJ player for the terminal, inspired by Pioneer CDJ decks"
 arch=('x86_64' 'aarch64')
 url="https://github.com/ibz/odj"
 license=('MIT')
@@ -11,6 +11,7 @@ depends=('rubberband' 'alsa-lib' 'libpipewire' 'gcc-libs' 'glibc')
 makedepends=('cargo' 'clang' 'git')
 provides=("$_pkgname")
 conflicts=("$_pkgname")
+options=('!lto')
 source=("$_pkgname::git+$url.git")
 sha256sums=('SKIP')
 
@@ -39,7 +40,7 @@ build() {
 package() {
   cd "$_pkgname"
   install -Dm755 target/release/odj-player "$pkgdir/usr/bin/odj-player"
-  install -Dm755 target/release/odj-sampler "$pkgdir/usr/bin/odj-sampler"
+  ln -s odj-player "$pkgdir/usr/bin/odj"
   install -Dm644 packaging/odj-player.desktop "$pkgdir/usr/share/applications/odj-player.desktop"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

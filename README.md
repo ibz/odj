@@ -229,8 +229,8 @@ git clone https://github.com/ibz/odj && cd odj/packaging/arch
 makepkg -si
 ```
 
-This builds the latest `master`, pulls in `rubberband` and `alsa-lib`, and
-installs `odj-player` and `odj-sampler` plus a launcher entry (Super+Space →
+This builds the latest `master`, pulls in `rubberband`, `alsa-lib` and `libpipewire`, and
+installs `odj-player`, an `odj` alias and a launcher entry (Super+Space →
 "odj player"), which opens in your default terminal. Run `makepkg -si` again
 to update; `sudo pacman -R odj-git` removes it. Once it's on the AUR: `yay -S odj-git`.
 

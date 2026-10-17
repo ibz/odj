@@ -234,6 +234,19 @@ installs `odj-player`, an `odj` alias and a launcher entry (Super+Space →
 "odj player"), which opens in your default terminal. Run `makepkg -si` again
 to update; `sudo pacman -R odj-git` removes it. Once it's on the AUR: `yay -S odj-git`.
 
+## Install on Debian / Ubuntu
+
+```
+git clone https://github.com/ibz/odj && cd odj
+packaging/debian/build.sh              # or: packaging/debian/build.sh ubuntu:24.04
+sudo apt install ./packaging/debian/dist/debian-trixie/odj_*.deb
+```
+
+This builds the package in a Docker container of the release you name (Debian
+trixie by default), so it matches that release's libraries. It installs
+`odj-player`, an `odj` alias and the launcher entry, and pulls in rubberband,
+ALSA and PipeWire. `sudo apt remove odj` removes it.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

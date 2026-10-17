@@ -16,3 +16,18 @@ ratatui.workspace = true
 
 [dev-dependencies]
 odj-core = { workspace = true, features = ["test-util"] }
+
+[package.metadata.deb]
+name = "odj"
+maintainer = "Ioan Bizău <odj@ibz.me>"
+copyright = "Ioan Bizău <odj@ibz.me>"
+license-file = ["../../LICENSE", "0"]
+section = "sound"
+priority = "optional"
+extended-description = "Keyboard-driven DJ player for the terminal, inspired by Pioneer CDJ decks."
+assets = [
+    ["target/release/odj-player", "usr/bin/", "755"],
+    { dest = "usr/bin/odj", link_name = "odj-player" },
+    ["../../packaging/odj-player.desktop", "usr/share/applications/", "644"],
+    ["../../README.md", "usr/share/doc/odj/", "644"],
+]

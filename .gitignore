@@ -1,3 +1,4 @@
 /target
 /packaging/arch/*/
 /packaging/arch/*.pkg.tar.*
+/packaging/debian/dist/

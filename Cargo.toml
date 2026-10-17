@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+default-members = ["crates/odj-player"]
 resolver = "3"
 
 [workspace.package]

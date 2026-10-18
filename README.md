@@ -25,6 +25,10 @@ Use a terminal with the kitty keyboard protocol (Ghostty, kitty, foot,
 Alacritty, WezTerm) and run it outside tmux. Hold-to-preview cue, jog nudges
 and search need key-release events; elsewhere those holds fall back to timers.
 
+![Playing a track, with a loop and a hot cue set](https://raw.githubusercontent.com/ibz/odj/screenshots/performing.png)
+
+![Browsing a folder of tracks](https://raw.githubusercontent.com/ibz/odj/screenshots/browser.png)
+
 ### Beat grid and quantize
 
 odj-player finds where each track's beats and bars fall, not just its tempo,

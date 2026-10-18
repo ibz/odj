@@ -21,6 +21,8 @@ jobs:
             slug: debian-trixie
           - image: ubuntu:24.04
             slug: ubuntu-24.04
+          - image: ubuntu:26.04
+            slug: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
         with:

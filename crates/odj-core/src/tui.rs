@@ -524,6 +524,71 @@ pub fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     center
 }
 
+/// Renders a `TestBackend` buffer back to the ANSI text it would have put on a
+/// real terminal, for tools (e.g. `freeze`) that turn a terminal capture into
+/// an image. Not meant for a real backend: it reopens one SGR escape per cell
+/// whose style changed, which only a snapshot buffer needs.
+#[cfg(any(test, feature = "test-util"))]
+pub fn to_ansi(buf: &ratatui::buffer::Buffer) -> String {
+    use ratatui::style::Modifier;
+    use std::fmt::Write;
+
+    fn sgr(color: Color, bg: bool) -> Option<String> {
+        let base = if bg { 48 } else { 38 };
+        let n = match color {
+            Color::Reset => return None,
+            Color::Black => 0,
+            Color::Red => 1,
+            Color::Green => 2,
+            Color::Yellow => 3,
+            Color::Blue => 4,
+            Color::Magenta => 5,
+            Color::Cyan => 6,
+            Color::Gray => 7,
+            Color::DarkGray => 8,
+            Color::LightRed => 9,
+            Color::LightGreen => 10,
+            Color::LightYellow => 11,
+            Color::LightBlue => 12,
+            Color::LightMagenta => 13,
+            Color::LightCyan => 14,
+            Color::White => 15,
+            Color::Indexed(i) => i,
+            Color::Rgb(r, g, b) => return Some(format!("{base};2;{r};{g};{b}")),
+        };
+        Some(format!("{base};5;{n}"))
+    }
+
+    let area = buf.area;
+    let mut out = String::new();
+    for y in area.y..area.y + area.height {
+        let mut style = None;
+        for x in area.x..area.x + area.width {
+            let cell = &buf[(x, y)];
+            let this = (cell.fg, cell.bg, cell.modifier);
+            if style != Some(this) {
+                let mut codes = vec!["0".to_string()];
+                codes.extend(sgr(cell.fg, false));
+                codes.extend(sgr(cell.bg, true));
+                if cell.modifier.contains(Modifier::BOLD) {
+                    codes.push("1".into());
+                }
+                if cell.modifier.contains(Modifier::UNDERLINED) {
+                    codes.push("4".into());
+                }
+                if cell.modifier.contains(Modifier::CROSSED_OUT) {
+                    codes.push("9".into());
+                }
+                write!(out, "\x1b[{}m", codes.join(";")).unwrap();
+                style = Some(this);
+            }
+            out.push_str(cell.symbol());
+        }
+        out.push_str("\x1b[0m\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;

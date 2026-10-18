@@ -918,4 +918,83 @@ mod tests {
         app.tick();
         assert_eq!(app.deck().snapshot().roll, None);
     }
+
+    /// Writes ANSI dumps of a few screens under `target/screenshots/`, for a
+    /// CI step to rasterize into the README/website images. Entirely
+    /// synthetic: no audio file or device involved, so it needs neither a
+    /// sample track nor CI audio hardware. Ignored by default since the
+    /// output is meant to be generated on demand, not on every test run.
+    ///
+    /// `ODJ_SCREENSHOT_DIR` overrides the default location, so the CI step
+    /// that rasterizes these doesn't have to guess it from a relative path.
+    fn screenshot_dir() -> PathBuf {
+        let dir = std::env::var_os("ODJ_SCREENSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/screenshots")));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dump_screenshot(name: &str, app: &App, cols: u16, rows: u16) {
+        use odj_core::tui::to_ansi;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let snapshot = app.deck().snapshot();
+        let mut t = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+        std::fs::write(screenshot_dir().join(format!("{name}.ans")), to_ansi(t.backend().buffer())).unwrap();
+    }
+
+    fn fictional_track(artist: &str, title: &str, bpm: f64, seconds: f64) -> Track {
+        let path = PathBuf::from(format!("{artist} - {title}.mp3"));
+        Track::from_samples(path, title.into(), Some(artist.into()), 48_000, click_track(bpm, seconds, 48_000))
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_performing() {
+        let dir = std::env::temp_dir().join(format!("odj-shot-performing-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mem = TrackMemory { quantize: Some(true), ..TrackMemory::default() };
+        let track = fictional_track("Nova Satellite", "Night Drive", 128.0, 60.0);
+        deck.lock().unwrap().load(Arc::new(track), &mem, false);
+        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into());
+        press(&mut app, KeyCode::Char(' '), false); // play
+        app.deck().render(&mut vec![0.0; 2 * 48_000 * 20]); // 20s in, so the waveform isn't at the very start
+        press(&mut app, KeyCode::Char('e'), false); // hot cue REC mode
+        press(&mut app, KeyCode::Char('1'), false); // store hot cue A here
+        press(&mut app, KeyCode::Char('e'), false); // back to PLAY mode
+        press(&mut app, KeyCode::Char('l'), false); // 4-beat loop
+        dump_screenshot("performing", &app, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_browser() {
+        let dir = std::env::temp_dir().join(format!("odj-shot-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        for name in [
+            "Nova Satellite - Night Drive.mp3",
+            "Glass Horizon - Afterglow.flac",
+            "Echo Static - Low Light.wav",
+            "Paper Tiger - Red Room.mp3",
+            "Kilo Hearts - Sundown.mp3",
+        ] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut browser = Browser::new(dir);
+        browser.open = true;
+        let app = App::new(deck, browser, true, "Built-in Audio · 48000 Hz".into());
+        dump_screenshot("browser", &app, 120, 40);
+    }
 }

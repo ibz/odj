@@ -1,0 +1,86 @@
+name: Screenshots
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FREEZE_VERSION: 0.2.2
+  # Explicit and shared between steps, so the test step (which writes here)
+  # and the rasterize step (which reads here) can't disagree on where this is.
+  ODJ_SCREENSHOT_DIR: ${{ github.workspace }}/target/screenshots
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            pkg-config libclang-dev librubberband-dev libasound2-dev libpipewire-0.3-dev
+
+      - name: Render screens to ANSI
+        run: cargo test -p odj-player --bin odj-player -- --ignored screenshot
+
+      - name: Install freeze
+        run: |
+          curl -sL "https://github.com/charmbracelet/freeze/releases/download/v${FREEZE_VERSION}/freeze_${FREEZE_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C /usr/local/bin --strip-components=1 "freeze_${FREEZE_VERSION}_Linux_x86_64/freeze"
+
+      - name: Rasterize to PNG
+        run: |
+          echo "ODJ_SCREENSHOT_DIR=$ODJ_SCREENSHOT_DIR"
+          ls -la "$ODJ_SCREENSHOT_DIR"
+          mkdir -p target/screenshots-png
+          for f in "$ODJ_SCREENSHOT_DIR"/*.ans; do
+            # -l txt: freeze has no lexer for .ans, and its content-sniffing
+            # fallback is unreliable, so pick the language explicitly.
+            # </dev/null: Actions runs steps with stdin connected to a pipe,
+            # and freeze prefers (empty) stdin over the file argument
+            # whenever stdin looks like a pipe, which empties the output.
+            freeze "$f" -l txt -o "target/screenshots-png/$(basename "${f%.ans}").png" --window=false -p 0 -m 0 < /dev/null
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: target/screenshots-png/*.png
+
+      - name: Publish screenshots that actually changed
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin screenshots:refs/remotes/origin/screenshots || true
+          wt=$(mktemp -d)
+          git worktree add --detach "$wt"
+          cd "$wt"
+          if git show-ref --verify --quiet refs/remotes/origin/screenshots; then
+            git checkout -B screenshots origin/screenshots
+            git rm -rq .
+          else
+            git checkout --orphan screenshots
+            git rm -rqf . 2>/dev/null || true
+          fi
+
+          cp "$GITHUB_WORKSPACE"/target/screenshots-png/*.png .
+          git add -A
+          # Git diffs by blob hash, so this is a no-op (and no commit/push) unless
+          # a PNG's content actually changed.
+          if git diff --cached --quiet; then
+            echo "No screenshot changes, nothing to push."
+          else
+            git commit -m "Update screenshots from ${GITHUB_SHA}"
+            git push origin HEAD:screenshots
+          fi

@@ -832,6 +832,20 @@ impl Deck {
             (true, Some(pos), Some(out)) => Cue { pos, loop_out: Some(out) },
             _ => Cue { pos: self.cue, loop_out: None },
         };
+        self.push_memory(entry)
+    }
+
+    /// Promotes the last loop set (by `I`/`O`/`L`), in or out of it, to a
+    /// memory point — unlike `store_memory`, this works even once you've
+    /// left it, since `loop_in`/`loop_out` (what Reloop-Exit reuses) hold
+    /// only the one most recent loop.
+    pub fn store_last_loop(&mut self) -> Option<usize> {
+        self.track.as_ref()?;
+        let (pos, out) = (self.loop_in?, self.loop_out?);
+        self.push_memory(Cue { pos, loop_out: Some(out) })
+    }
+
+    fn push_memory(&mut self, entry: Cue) -> Option<usize> {
         if self.memories.len() >= MAX_MEMORIES
             || self.memories.iter().any(|m| (m.pos - entry.pos).abs() < 1.0)
         {
@@ -2503,6 +2517,33 @@ mod tests {
         assert!(d.delete_memory());
         assert_eq!(d.memories.len(), 2);
         assert!(!d.delete_memory());
+    }
+
+    #[test]
+    fn store_last_loop_promotes_a_dormant_loop() {
+        let mut d = deck();
+        assert_eq!(d.store_memory(), Some(1)); // cue at 0
+        d.play_pause();
+        run(&mut d, SR as usize);
+        d.loop_in(); // 1 s — also moves the cue here, unlike store_last_loop
+        run(&mut d, 24_000);
+        d.loop_out(); // 1.5 s
+        d.reloop_exit(); // leave the loop — loop_in/out stay as "the last loop"
+        assert!(!d.looping);
+
+        // store_last_loop grabs the dormant loop even though we're not in it.
+        assert_eq!(d.store_last_loop(), Some(2));
+        assert_eq!(d.memories[1].pos, SR as f64);
+        assert_eq!(d.memories[1].loop_out, Some(1.5 * SR as f64));
+
+        // Promoting the same loop again is a duplicate.
+        assert!(d.store_last_loop().is_none());
+    }
+
+    #[test]
+    fn store_last_loop_is_none_without_a_loop() {
+        let mut d = deck();
+        assert!(d.store_last_loop().is_none());
     }
 
     #[test]

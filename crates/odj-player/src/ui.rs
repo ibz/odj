@@ -678,6 +678,7 @@ pub const HELP: &[Page] = &[
             ("O while looping", "Loop out adjust: , / . move the out point (Shift: ×10), O to finish"),
             ("R while looping", "Play the loop backwards, R again for forwards"),
             ("L", "Beat loop of the loop size / exit the loop"),
+            ("Shift+L", "Promote the last loop (set by I/O/L, in or out of it) to a memory"),
             ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
             ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),
             ("- / =", "Beatjump back / forward (moves the loop while looping)"),

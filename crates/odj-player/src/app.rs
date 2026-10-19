@@ -750,6 +750,18 @@ impl App {
                 }
             }
             KeyCode::Char('p') if once => self.deck().reloop_exit(),
+            KeyCode::Char('l') if once && shift => {
+                let (stored, had_loop) = {
+                    let mut deck = self.deck();
+                    let had_loop = deck.snapshot().loop_in.is_some();
+                    (deck.store_last_loop(), had_loop)
+                };
+                match stored {
+                    Some(n) => self.set_status(format!("Memory {n} stored")),
+                    None if had_loop => self.set_status("Already in memory"),
+                    None => self.set_status("No loop to store"),
+                }
+            }
             KeyCode::Char('l') if once => {
                 if !self.deck().beat_loop() {
                     self.set_status("Beat loops need a beat grid (tap the BPM with A)");
@@ -1010,6 +1022,31 @@ mod tests {
         press(&mut app, KeyCode::Char(' '), false);
         app.load(PathBuf::from("other.mp3"));
         assert!(app.loading.is_some());
+    }
+
+    #[test]
+    fn shift_l_promotes_the_last_loop_even_after_leaving_it() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'), false);
+        app.deck().step_paused(75.0); // 1 s
+        press(&mut app, KeyCode::Char('o'), false);
+        press(&mut app, KeyCode::Char('p'), false); // reloop_exit: leave it
+        assert!(!app.deck().snapshot().looping);
+
+        press(&mut app, KeyCode::Char('l'), true);
+        let memories = app.deck().snapshot().memories;
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].loop_out.is_some());
+
+        press(&mut app, KeyCode::Char('l'), true); // same loop again: duplicate
+        assert_eq!(app.deck().snapshot().memories.len(), 1);
+    }
+
+    #[test]
+    fn shift_l_without_a_loop_does_nothing() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('l'), true);
+        assert!(app.deck().snapshot().memories.is_empty());
     }
 
     #[test]

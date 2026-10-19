@@ -17,9 +17,11 @@ use crate::engine::{Deck, JUMP_SIZES, MAX_LOOP_BEATS, MIN_LOOP_BEATS, MemoryCall
 use crate::video;
 
 /// How far the playhead must move since the last request before asking for
-/// another video frame — one `ffmpeg` grab is much slower than a UI tick,
-/// so there's no point asking on every one of them.
-const VIDEO_POS_EPSILON: f64 = 0.1;
+/// another video frame. Matches the batch's own frame spacing: asking for
+/// less than that wouldn't show a different frame anyway, and the worker
+/// usually serves it from the already-decoded batch, not a fresh `ffmpeg`
+/// spawn — see `video::FRAME_INTERVAL`.
+const VIDEO_POS_EPSILON: f64 = video::FRAME_INTERVAL;
 
 /// A loaded track's video preview, if it has a video track and `ffmpeg`
 /// stays available for it.

@@ -44,8 +44,10 @@ const MIN_WAVE_ROWS: usize = 4;
 const PHASE_CELLS: usize = 17;
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
-/// Screen columns reserved for the video preview, inside the zoom box.
-const VIDEO_PANE_COLS: u16 = 44;
+/// Bounds on the video pane's width, inside the zoom box: never so narrow
+/// it's pointless, and the waveform always keeps at least this much room.
+const MIN_VIDEO_COLS: u16 = 24;
+const MIN_WAVE_COLS: u16 = 30;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     // The status rows wrap inside their box, which grows to fit them.
@@ -75,8 +77,15 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         let now = s.pos / track.sample_rate as f64;
         let wave_inner = match app.video.as_ref().and_then(|v| v.frame.as_ref()) {
             Some(frame) => {
+                // Sized from the available height, not a fixed width: the
+                // video's own aspect ratio (`video::ASPECT`) then fills it
+                // top-to-bottom instead of being letterboxed down to fit a
+                // mismatched box.
+                let ideal = (zoom_inner.height as f64 * video::ASPECT).round() as u16;
+                let max_video_cols = zoom_inner.width.saturating_sub(MIN_WAVE_COLS).max(MIN_VIDEO_COLS);
+                let video_cols = ideal.clamp(MIN_VIDEO_COLS, max_video_cols);
                 let [video_area, wave_area] =
-                    Layout::horizontal([Constraint::Length(VIDEO_PANE_COLS), Constraint::Fill(1)]).areas(zoom_inner);
+                    Layout::horizontal([Constraint::Length(video_cols), Constraint::Fill(1)]).areas(zoom_inner);
                 draw_video(f, video_area, frame);
                 wave_area
             }
@@ -140,21 +149,42 @@ fn draw_no_track(f: &mut Frame, area: Rect) {
     f.render_widget(big, Rect { y, height, ..area });
 }
 
-/// Paints a decoded video frame as colored blocks, nearest-neighbor mapped
-/// onto whatever screen area is actually available — the frame's own
-/// resolution is fixed regardless of terminal size, see `crate::video`.
+/// Paints a decoded video frame as colored half-blocks, nearest-neighbor
+/// mapped onto whatever screen area is actually available — the frame's
+/// own resolution is fixed regardless of terminal size, see `crate::video`.
+/// Each cell shows two source pixel rows (▀'s foreground is its visible
+/// upper half, background its lower half) rather than one, doubling the
+/// effective vertical resolution for the same cell budget — a cell can
+/// already carry two colors, so this is free detail, not a new dependency.
 fn draw_video(f: &mut Frame, area: Rect, frame: &video::Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // `frame.width`/`frame.height` are in source-pixel proportion, not
+    // corrected for cells being taller than they are wide — that
+    // correction happens here, widening the box a decoded pixel column is
+    // worth, so the fitted (largest that stays within `area`, centered)
+    // box shows it undistorted instead of either stretched to fill
+    // whatever's available or squashed by being mapped cell-for-pixel.
+    // `half_rows` is halved for the same reason: two pixel rows become one
+    // cell row, so a cell row is only worth half a pixel row's height.
+    let cell_width = frame.width as f64 * video::CELL_ASPECT;
+    let half_rows = frame.height as f64 / 2.0;
+    let scale = (area.width as f64 / cell_width).min(area.height as f64 / half_rows);
+    let w = ((cell_width * scale) as u16).clamp(1, area.width);
+    let h = ((half_rows * scale) as u16).clamp(1, area.height);
+    let (x0, y0) = (area.x + (area.width - w) / 2, area.y + (area.height - h) / 2);
+
     let buf = f.buffer_mut();
-    for y in 0..area.height {
-        let fy = (y as u32 * frame.height as u32 / area.height as u32) as usize;
-        for x in 0..area.width {
-            let fx = (x as u32 * frame.width as u32 / area.width as u32) as usize;
-            let Some(&(r, g, b)) = frame.pixels.get(fy * frame.width as usize + fx) else { continue };
-            let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) else { continue };
-            cell.set_char('█').set_style(Style::new().fg(Color::Rgb(r, g, b)));
+    for y in 0..h {
+        let fy_top = (y as u32 * frame.height as u32 / h as u32) as usize;
+        let fy_bottom = (fy_top + 1).min(frame.height as usize - 1);
+        for x in 0..w {
+            let fx = (x as u32 * frame.width as u32 / w as u32) as usize;
+            let Some(&top) = frame.pixels.get(fy_top * frame.width as usize + fx) else { continue };
+            let bottom = frame.pixels.get(fy_bottom * frame.width as usize + fx).copied().unwrap_or(top);
+            let Some(cell) = buf.cell_mut((x0 + x, y0 + y)) else { continue };
+            cell.set_char('▀').set_style(Style::new().fg(Color::Rgb(top.0, top.1, top.2)).bg(Color::Rgb(bottom.0, bottom.1, bottom.2)));
         }
     }
 }
@@ -1022,5 +1052,32 @@ mod tests {
         assert_eq!(text(flow(groups(), 80)), ["PLAY  TIME 1:00    BPM 128.0"]);
         assert_eq!(text(flow(groups(), 15)), ["PLAY  TIME 1:00", "BPM 128.0"]);
         assert_eq!(text(flow(groups(), 5)), ["PLAY", "TIME 1:00", "BPM 128.0"]);
+    }
+
+    #[test]
+    fn draw_video_fits_the_frame_instead_of_stretching_it() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A 1:1 pixel frame — cell-equivalent width 4 * 2 = 8, pixel rows
+        // pack 2-per-cell so its cell-equivalent height is 4 / 2 = 2, a
+        // 4:1 box overall — into an area that's much taller than it's
+        // wide: width is the constraining dimension (20/8 = 2.5 < 10/2 = 5.0).
+        let frame = video::Frame { width: 4, height: 4, pixels: vec![(200, 10, 10); 16] };
+        let area = Rect { x: 0, y: 0, width: 20, height: 10 };
+        let mut t = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        t.draw(|f| draw_video(f, area, &frame)).unwrap();
+        let buf = t.backend().buffer();
+
+        let painted: Vec<(u16, u16)> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "▀")
+            .collect();
+        assert!(!painted.is_empty());
+        let (min_x, max_x) = (painted.iter().map(|&(x, _)| x).min().unwrap(), painted.iter().map(|&(x, _)| x).max().unwrap());
+        let (min_y, max_y) = (painted.iter().map(|&(_, y)| y).min().unwrap(), painted.iter().map(|&(_, y)| y).max().unwrap());
+        assert_eq!((min_x, max_x), (0, 19), "width is the constraining dimension: fills it");
+        assert_eq!(max_y - min_y + 1, 5, "height scales down with it (2 * 2.5), not stretched to fill 10");
+        assert_eq!(min_y, 2, "and is centered: (10 - 5) / 2 blank rows above");
     }
 }

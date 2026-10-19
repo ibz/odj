@@ -14,6 +14,26 @@ use odj_core::track::Track;
 use odj_core::tui::Help;
 
 use crate::engine::{Deck, JUMP_SIZES, MAX_LOOP_BEATS, MIN_LOOP_BEATS, MemoryCall};
+use crate::video;
+
+/// How far the playhead must move since the last request before asking for
+/// another video frame — one `ffmpeg` grab is much slower than a UI tick,
+/// so there's no point asking on every one of them.
+const VIDEO_POS_EPSILON: f64 = 0.1;
+
+/// A loaded track's video preview, if it has a video track and `ffmpeg`
+/// stays available for it.
+pub struct VideoView {
+    worker: video::VideoWorker,
+    pub frame: Option<video::Frame>,
+    last_requested: f64,
+}
+
+impl VideoView {
+    fn new(source: Arc<dyn video::VideoSource>) -> Self {
+        Self { worker: video::VideoWorker::start(source), frame: None, last_requested: f64::NEG_INFINITY }
+    }
+}
 
 /// Without key-release events a hold lasts this long after the last key event.
 const HOLD_FALLBACK: Duration = Duration::from_millis(500);
@@ -137,6 +157,7 @@ pub struct App {
     /// Recent taps, with the playhead at each while playing forward.
     taps: Vec<(Instant, Option<f64>)>,
     pub quit: bool,
+    pub video: Option<VideoView>,
 }
 
 impl App {
@@ -175,6 +196,7 @@ impl App {
             roll: None,
             taps: Vec::new(),
             quit: false,
+            video: None,
         }
     }
 
@@ -410,6 +432,9 @@ impl App {
                     .position(|p| *p == track.path)
                     .map(|i| (i + 1, folder.len()));
                 let auto_cue = self.memory.settings.auto_cue;
+                self.video = track
+                    .has_video
+                    .then(|| VideoView::new(Arc::new(video::FfmpegSource::new(track.path.clone()))));
                 let old = self.deck().load(Arc::new(track), &mem, auto_cue);
                 // Free the previous track's samples outside the audio lock.
                 drop(old);
@@ -482,6 +507,46 @@ impl App {
     pub fn tick(&mut self) {
         self.finish_loading();
         self.apply_holds();
+        self.update_video();
+    }
+
+    /// Drains any frame the video worker decoded, and requests one at the
+    /// current playhead if it's moved enough since the last request.
+    fn update_video(&mut self) {
+        let Some(video) = &mut self.video else { return };
+        let mut unavailable = false;
+        while let Ok(event) = video.worker.events.try_recv() {
+            match event {
+                video::Event::Frame(frame) => video.frame = Some(frame),
+                video::Event::Unavailable => {
+                    unavailable = true;
+                    break;
+                }
+            }
+        }
+        if unavailable {
+            self.video = None;
+            return;
+        }
+
+        let Some(pos_secs) = ({
+            let deck = self.deck();
+            deck.track.as_ref().map(|t| deck.position() / t.sample_rate as f64)
+        }) else {
+            return;
+        };
+        let video = self.video.as_mut().expect("checked Some above");
+        // Once a frame has arrived, throttle by how far the playhead has
+        // moved. Until then, keep asking every tick — e.g. right after
+        // load, or while every grab is failing — so repeated failures
+        // actually reach the worker's give-up threshold instead of
+        // waiting forever on a position that may never move again (a
+        // paused track whose first grab failed would otherwise keep
+        // `self.video` around showing nothing, forever).
+        if video.frame.is_none() || (pos_secs - video.last_requested).abs() > VIDEO_POS_EPSILON {
+            video.worker.request(pos_secs);
+            video.last_requested = pos_secs;
+        }
     }
 
     /// Taps the tempo. While playing, the taps also place the beats, the last
@@ -1764,5 +1829,55 @@ mod tests {
         press(&mut app, KeyCode::Enter, false); // drill in
         press(&mut app, KeyCode::Down, false); // select the second folder
         dump_screenshot("settings", &app, 120, 40);
+    }
+
+    /// Runs `tick()` until `done` is true or `timeout` elapses, so tests
+    /// don't race the background video-grab thread.
+    fn wait_for(app: &mut App, timeout: Duration, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !done(app) {
+            assert!(Instant::now() < deadline, "condition never became true");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn video_shows_a_frame_then_throttles_by_playhead_movement() {
+        use std::sync::atomic::Ordering;
+        let mut app = app();
+        let fake = Arc::new(video::test_util::FakeSource::working());
+        app.video = Some(VideoView::new(fake.clone()));
+
+        wait_for(&mut app, Duration::from_secs(2), |a| a.video.as_ref().is_some_and(|v| v.frame.is_some()));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+        // Position hasn't moved: ticking more shouldn't ask again.
+        for _ in 0..5 {
+            app.tick();
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+        // ~0.2s at 48kHz — past the throttle threshold.
+        app.deck().step_paused(15.0);
+        wait_for(&mut app, Duration::from_secs(2), |_| fake.calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn video_gives_up_after_repeated_failures() {
+        let mut app = app();
+        app.video = Some(VideoView::new(Arc::new(video::test_util::FakeSource::failing())));
+        wait_for(&mut app, Duration::from_secs(2), |a| a.video.is_none());
+    }
+
+    #[test]
+    fn audio_only_track_never_starts_a_video_worker() {
+        // `app()` loads a track built with `Track::from_samples`, which
+        // always has `has_video: false` — `finish_loading` is the only
+        // place that starts one, and it's not exercised by the test
+        // helper's direct `deck.load(...)`, so this just confirms the
+        // default stays `None` rather than something accidentally set.
+        let app = app();
+        assert!(app.video.is_none());
     }
 }

@@ -59,6 +59,9 @@ pub struct Track {
     pub key: Option<Key>,
     /// First audible frame, used as the default cue point.
     pub first_sound: f64,
+    /// The file's container also has a video track (symphonia only decodes
+    /// the audio one; this is a plain demux-metadata check, not decoding).
+    pub has_video: bool,
 }
 
 /// A file's audio and tags, without any analysis.
@@ -70,6 +73,7 @@ pub struct Decoded {
     pub sample_rate: u32,
     /// Interleaved stereo.
     pub samples: Vec<f32>,
+    pub has_video: bool,
 }
 
 impl Track {
@@ -89,6 +93,7 @@ impl Track {
         let d = decode(path)?;
         let mut track = Track::from_samples(path.to_path_buf(), d.title, d.artist, d.sample_rate, d.samples);
         track.id = d.id;
+        track.has_video = d.has_video;
         Ok(track)
     }
 
@@ -112,8 +117,9 @@ impl Track {
             (key.join().expect("key detection panicked"), grid, wave)
         });
         Track {
-            // Set by `load`; tracks built from bare samples have no file to fingerprint.
+            // Set by `load`; tracks built from bare samples have no file to fingerprint or probe.
             id: String::new(),
+            has_video: false,
             wave_scale: wave_scale(&wave),
             wave,
             grid,
@@ -156,6 +162,11 @@ pub fn decode(path: &Path) -> Result<Decoded> {
             }
         }
     }
+
+    // Demux-metadata check only — symphonia has no video decoder, so a
+    // video track (e.g. a yt-dlp download kept for later video playback)
+    // is never read beyond this, just noted as present.
+    let has_video = format.tracks().iter().any(|t| t.track_type() == Some(TrackType::Video));
 
     let track = format
         .default_track(TrackType::Audio)
@@ -211,7 +222,7 @@ pub fn decode(path: &Path) -> Result<Decoded> {
     let title = title.unwrap_or_else(|| {
         path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
     });
-    Ok(Decoded { id: fingerprint(hasher), title, artist, sample_rate, samples })
+    Ok(Decoded { id: fingerprint(hasher), title, artist, sample_rate, samples, has_video })
 }
 
 /// 128 bits of the hash as hex: plenty to tell tracks apart, short as a file name.
@@ -758,6 +769,9 @@ mod file_test {
     fn load_real_file() {
         let p = std::env::var("ODJ_TEST_FILE").unwrap();
         let t = super::Track::load(std::path::Path::new(&p)).unwrap();
-        eprintln!("title={} artist={:?} sr={} dur={:.2} bpm={:?} first={}", t.title, t.artist, t.sample_rate, t.duration(), t.grid, t.first_sound);
+        eprintln!(
+            "title={} artist={:?} sr={} dur={:.2} bpm={:?} first={} has_video={}",
+            t.title, t.artist, t.sample_rate, t.duration(), t.grid, t.first_sound, t.has_video
+        );
     }
 }

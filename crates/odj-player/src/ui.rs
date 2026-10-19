@@ -14,6 +14,7 @@ use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint}
 
 use crate::app::App;
 use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
+use crate::video;
 
 const CUE_COLOR: Color = Color::Rgb(255, 140, 0);
 const HOT_COLOR: Color = Color::Rgb(60, 220, 100);
@@ -43,6 +44,8 @@ const MIN_WAVE_ROWS: usize = 4;
 const PHASE_CELLS: usize = 17;
 /// Seconds of track shown in the zoomed waveform.
 const ZOOM_SPAN: f64 = 8.0;
+/// Screen columns reserved for the video preview, inside the zoom box.
+const VIDEO_PANE_COLS: u16 = 44;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     // The status rows wrap inside their box, which grows to fit them.
@@ -70,9 +73,18 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     f.render_widget(overview_block, overview);
     if let Some(track) = &s.track {
         let now = s.pos / track.sample_rate as f64;
+        let wave_inner = match app.video.as_ref().and_then(|v| v.frame.as_ref()) {
+            Some(frame) => {
+                let [video_area, wave_area] =
+                    Layout::horizontal([Constraint::Length(VIDEO_PANE_COLS), Constraint::Fill(1)]).areas(zoom_inner);
+                draw_video(f, video_area, frame);
+                wave_area
+            }
+            None => zoom_inner,
+        };
         f.render_widget(
             Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false, beats: s.show_grid, lanes: true },
-            zoom_inner,
+            wave_inner,
         );
         f.render_widget(
             Wave { track, s, start: 0.0, end: track.duration(), dim_played: true, beats: false, lanes: false },
@@ -126,6 +138,25 @@ fn draw_no_track(f: &mut Frame, area: Rect) {
     let height = (rows * rows_per_line).min(area.height);
     let y = area.y + (area.height - height) / 2;
     f.render_widget(big, Rect { y, height, ..area });
+}
+
+/// Paints a decoded video frame as colored blocks, nearest-neighbor mapped
+/// onto whatever screen area is actually available — the frame's own
+/// resolution is fixed regardless of terminal size, see `crate::video`.
+fn draw_video(f: &mut Frame, area: Rect, frame: &video::Frame) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buf = f.buffer_mut();
+    for y in 0..area.height {
+        let fy = (y as u32 * frame.height as u32 / area.height as u32) as usize;
+        for x in 0..area.width {
+            let fx = (x as u32 * frame.width as u32 / area.width as u32) as usize;
+            let Some(&(r, g, b)) = frame.pixels.get(fy * frame.width as usize + fx) else { continue };
+            let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) else { continue };
+            cell.set_char('█').set_style(Style::new().fg(Color::Rgb(r, g, b)));
+        }
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {

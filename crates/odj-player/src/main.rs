@@ -3,6 +3,7 @@ mod engine;
 mod stretch;
 mod sync;
 mod ui;
+mod video;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

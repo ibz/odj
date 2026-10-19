@@ -1347,6 +1347,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "odj-downloader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ratatui",
+ "youtube_dl",
+]
+
+[[package]]
 name = "odj-player"
 version = "0.1.0"
 dependencies = [
@@ -2584,6 +2593,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2899,6 +2917,18 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "youtube_dl"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9689a10ae6a391064930de26cf8a11cf8e844bbfccf2d1f39cd02b10679c14ad"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "wait-timeout",
+]
 
 [[package]]
 name = "zmij"

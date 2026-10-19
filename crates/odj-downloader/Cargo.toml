@@ -1,0 +1,14 @@
+[package]
+name = "odj-downloader"
+description = "Downloads tracks via yt-dlp for later use in odj-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+ratatui.workspace = true
+youtube_dl = "0.10"

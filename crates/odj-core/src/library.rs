@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "wav", "ogg", "oga", "m4a", "mp4", "aac", "aif", "aiff", "caf", "mka", "webm",
+    "mp3", "flac", "wav", "ogg", "oga", "m4a", "mp4", "aac", "aif", "aiff", "caf", "mka", "mkv", "webm",
 ];
 
 pub fn is_audio(path: &Path) -> bool {

@@ -498,7 +498,7 @@ pub fn hinted_box(f: &mut Frame, area: Rect, block: Block, hints: &[&'static str
 }
 
 /// A key on a badge, then what it does, both in `color`.
-fn key_hint(key: &str, action: &str, color: Color) -> Line<'static> {
+pub fn key_hint(key: &str, action: &str, color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {key} "), Style::new().fg(Color::Black).bg(color).bold()),
         Span::styled(format!(" {action} "), Style::new().fg(color).bold()),

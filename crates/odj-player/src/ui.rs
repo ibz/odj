@@ -2,14 +2,15 @@
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
+use tui_big_text::{BigText, PixelSize};
 
 use odj_core::key::Key;
 use odj_core::track::{Track, WAVE_RATE, WaveBin};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint};
 
 use crate::app::App;
 use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
@@ -77,22 +78,54 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
             Wave { track, s, start: 0.0, end: track.duration(), dim_played: true, beats: false, lanes: false },
             overview_inner,
         );
-    } else {
-        let msg = match app.loading() {
-            Some(name) => format!("Loading {name}…"),
-            None => "No track — press Tab to browse".to_string(),
-        };
+    } else if let Some(name) = app.loading() {
+        let msg = format!("Loading {name}…");
         f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).fg(DIM), zoom_inner);
+    } else {
+        draw_no_track(f, zoom_inner);
     }
 
     draw_info(f, info, app, s);
-    draw_footer(f, footer, app);
+    draw_footer(f, footer, app, s);
 
     if app.browser.open {
         draw_browser(f, app);
+    } else if app.settings_screen.is_open() {
+        draw_settings(f, app);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
+}
+
+/// Nothing loaded: "press Tab to browse" as big as the waveform area allows,
+/// since it's the only thing worth noticing on an otherwise empty screen.
+fn draw_no_track(f: &mut Frame, area: Rect) {
+    let lines = ["No track", "press Tab to browse"];
+    let longest = lines.iter().map(|l| l.chars().count()).max().unwrap_or(1) as u16;
+    let rows = lines.len() as u16;
+
+    // Glyphs are 8x8; (cols, rows) is how many cells one glyph takes at each
+    // size. Pick the biggest that still fits, falling back to the smallest.
+    let sizes = [
+        (PixelSize::Full, 8, 8),
+        (PixelSize::HalfWidth, 4, 8),
+        (PixelSize::Quadrant, 4, 4),
+        (PixelSize::Octant, 4, 2),
+    ];
+    let (size, _cols, rows_per_line) = sizes
+        .into_iter()
+        .find(|&(_, cols, rows_per_line)| longest * cols <= area.width && rows * rows_per_line <= area.height)
+        .unwrap_or((PixelSize::Octant, 4, 2));
+
+    let big = BigText::builder()
+        .pixel_size(size)
+        .style(Style::new().fg(DIM))
+        .centered()
+        .lines(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .build();
+    let height = (rows * rows_per_line).min(area.height);
+    let y = area.y + (area.height - height) / 2;
+    f.render_widget(big, Rect { y, height, ..area });
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
@@ -399,21 +432,65 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let line = match app.status() {
-        Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
-        None => key_line(
-            " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  F sync  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse  ? help  Ctrl+C quit",
-            area.width,
-        ),
-    };
-    f.render_widget(Paragraph::new(line), area);
+fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
+    if let Some(msg) = app.status() {
+        let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if s.track.is_none() {
+        // No track: the deck keys are all moot, so highlight the one that
+        // isn't — Tab — pinned left, with the keys that still work regardless
+        // pinned right instead of trailing right after it.
+        let mut left_spans = vec![Span::raw(" ")];
+        left_spans.extend(key_hint("Tab", "browse", AMBER).spans);
+        let left = Line::from(left_spans);
+        let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+        let (lw, rw) = (left.width() as u16, right.width() as u16);
+        let [left_area, _, right_area] =
+            Layout::horizontal([Constraint::Length(lw), Constraint::Fill(1), Constraint::Length(rw)]).areas(area);
+        f.render_widget(Paragraph::new(left), left_area);
+        f.render_widget(Paragraph::new(right), right_area);
+        return;
+    }
+    // Same split as the no-track case: the deck keys (which can run long,
+    // and simply clip on a narrow terminal rather than push the rest off)
+    // on the left, globals always fully visible, pinned right.
+    let left = Line::styled(
+        " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  F sync  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse",
+        Style::new().fg(DIM),
+    );
+    let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+    let rw = right.width() as u16;
+    // A fixed gap, so clipped-on-narrow left text never runs straight into
+    // the right group instead of just being cut off.
+    let [left_area, _, right_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
 }
 
 fn draw_browser(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 70, 70);
     let b = &app.browser;
-    let mut block = Block::bordered().title(format!(" {} ", b.dir.display())).border_style(Style::new().fg(AMBER));
+    // No music folder yet: a one-time "pick one and go" framing instead of
+    // the ongoing "manage several" one, regardless of how you got here.
+    let first_run = app.music_dirs().is_empty();
+    // Already inside one of them: Ctrl+U here would have nothing to do.
+    let already_covered = app.music_dirs().iter().any(|d| b.dir.starts_with(d));
+    let title = if first_run {
+        " Pick your music folder ".to_string()
+    } else {
+        format!(" {} ", b.dir.display())
+    };
+    let mut block = Block::bordered().title(title).border_style(Style::new().fg(AMBER));
+    if !already_covered {
+        let badge = if first_run { "Use current folder" } else { "Add to music folders" };
+        block = block.title_bottom(key_hint("Ctrl+U", badge, AMBER).left_aligned());
+    }
+    if first_run && b.query.is_empty() {
+        block = block.title(Line::from(format!(" {} ", b.dir.display())).right_aligned());
+    }
     if !b.query.is_empty() {
         block = block.title(Line::from(format!(" filter: {}▏", b.query)).right_aligned().bold());
     }
@@ -440,17 +517,91 @@ fn draw_browser(f: &mut Frame, app: &App) {
             })
             .collect()
     };
-    let hints = [
-        "type to filter",
-        "↑↓ PgUp PgDn Home End select",
-        "Enter/→ open",
-        "←/Backspace up",
-        "Esc clear/close",
-        "Tab close",
-    ];
-    let list_area = hinted_box(f, area, block, &hints);
+    // Three groups on one row: the primary action highlighted on the left,
+    // how to search in the middle, plain navigation on the right. Tab
+    // (close) isn't worth a mention — Esc already does that.
+    let inner = block.inner(area);
+    let [list_area, hints_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    // Onboarding: Ctrl+U (on the border) is the one highlighted action, so
+    // Enter/open isn't a second one — it's folded into plain navigation,
+    // leaving only Esc on the left.
+    let left = if first_run {
+        Line::styled("Esc", Style::new().fg(DIM))
+    } else {
+        let mut spans = key_hint("Enter/→", "open", AMBER).spans;
+        spans.push(Span::styled("  Esc", Style::new().fg(DIM)));
+        Line::from(spans)
+    };
+    let center = Line::styled("type to filter", Style::new().fg(DIM));
+    let right = if first_run {
+        Line::styled("↑↓ PgUp PgDn Home End ← → navigate", Style::new().fg(DIM))
+    } else {
+        Line::styled("↑↓ PgUp PgDn Home End ← navigate", Style::new().fg(DIM))
+    };
+    let (lw, cw, rw) = (left.width() as u16, center.width() as u16, right.width() as u16);
+    let [left_a, _, center_a, _, right_a] = Layout::horizontal([
+        Constraint::Length(lw),
+        Constraint::Fill(1),
+        Constraint::Length(cw),
+        Constraint::Fill(1),
+        Constraint::Length(rw),
+    ])
+    .areas(hints_row.inner(Margin::new(1, 0)));
+    f.render_widget(Paragraph::new(left), left_a);
+    f.render_widget(Paragraph::new(center), center_a);
+    f.render_widget(Paragraph::new(right), right_a);
+
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(b.selected));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The settings screen: a top-level list of global settings, one of which
+/// (music folders) drills into its own list.
+fn draw_settings(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 60, 50);
+    let screen = &app.settings_screen;
+    let title = match (screen.folder().is_some(), screen.editable()) {
+        (true, true) => " My music folders ",
+        (true, false) => " Music folders ",
+        (false, _) => " Settings ",
+    };
+    let block = Block::bordered().title(title).border_style(Style::new().fg(AMBER));
+
+    let (items, hints, selected): (Vec<ListItem>, &[&str], usize) = if let Some(i) = screen.folder() {
+        let dirs = app.music_dirs();
+        let items = if dirs.is_empty() {
+            vec![ListItem::new("(none yet — Enter to browse)").fg(DIM)]
+        } else {
+            dirs.iter().map(|d| ListItem::new(d.display().to_string())).collect()
+        };
+        let hints: &[&str] = if !screen.editable() {
+            &["↑↓ select", "Enter/→ browse here", "Esc cancel"]
+        } else if dirs.is_empty() && screen.onboarding() {
+            // Forced first-run setup: nothing to select or remove yet, and
+            // no backing out either — a folder is needed before anything else.
+            &["Enter/→ browse"]
+        } else if dirs.is_empty() {
+            &["Enter/→ browse", "Esc back"]
+        } else {
+            &["↑↓ select", "X/Delete remove", "Enter/→ add (browse, then Ctrl+U)", "Esc back"]
+        };
+        (items, hints, i)
+    } else {
+        // The row menu is never gated — only the music-folders list itself
+        // can be, and only during forced first-run setup.
+        let items = vec![
+            ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" })),
+            ListItem::new(format!("Music folders ({})", app.music_dirs().len())),
+        ];
+        (items, &["↑↓ select", "Enter toggle/open", "Esc close"], screen.row())
+    };
+    let list_area = hinted_box(f, area, block, hints);
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
@@ -470,6 +621,8 @@ pub const HELP: &[Page] = &[
             ("F", "Sync to the master deck"),
             ("B / N", "Previous / next track in folder"),
             ("Tab", "File browser"),
+            ("Ctrl+U in the browser", "Add this folder to your music folders"),
+            ("`", "Settings: auto-cue, music folders"),
         ],
     ),
     Page::Keys(

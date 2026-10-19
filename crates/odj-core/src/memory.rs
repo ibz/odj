@@ -85,11 +85,14 @@ pub struct Settings {
     pub jump_beats: f64,
     /// Size of the next beatloop, in beats.
     pub loop_beats: f64,
+    /// Folders the browser can jump into; the first that still exists is
+    /// where it opens when no folder is given on the command line.
+    pub music_dirs: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_cue: true, jump_beats: 4.0, loop_beats: 4.0 }
+        Self { auto_cue: true, jump_beats: 4.0, loop_beats: 4.0, music_dirs: Vec::new() }
     }
 }
 

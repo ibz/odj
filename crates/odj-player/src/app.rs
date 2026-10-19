@@ -31,6 +31,83 @@ struct Hold {
     until: Option<Instant>,
 }
 
+/// How many rows the settings screen has (auto-cue, music folders).
+const SETTINGS_ROWS: usize = 2;
+
+/// The settings screen: a list of global settings, one of which (music
+/// folders) drills into its own list.
+#[derive(Default)]
+pub struct SettingsScreen {
+    open: bool,
+    row: usize,
+    /// Set while drilled into the music-folders row, with the selected index.
+    folder: Option<usize>,
+    /// False when this is the quick switcher opened by going "up" from a
+    /// music folder while browsing: picking is still allowed, but adding
+    /// and removing folders is something only the real settings screen does.
+    editable: bool,
+    /// True only for the forced first-run flow (`open_to_music_dirs`): no
+    /// folder configured yet anywhere, so there's nothing else to do. Not
+    /// re-triggered by later emptying an already-set-up list by hand — that
+    /// Esc should still work, since you're not stuck, you just chose to.
+    onboarding: bool,
+}
+
+impl SettingsScreen {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    pub fn folder(&self) -> Option<usize> {
+        self.folder
+    }
+
+    pub fn editable(&self) -> bool {
+        self.editable
+    }
+
+    pub fn onboarding(&self) -> bool {
+        self.onboarding
+    }
+
+    fn toggle(&mut self) {
+        self.open = !self.open;
+        self.row = 0;
+        self.folder = None;
+        self.editable = true;
+        self.onboarding = false;
+    }
+
+    /// Opens straight into the (editable) music folders list, for first-run
+    /// setup when nothing's configured yet, skipping the row menu.
+    pub fn open_to_music_dirs(&mut self) {
+        self.open = true;
+        self.row = 1;
+        self.folder = Some(0);
+        self.editable = true;
+        self.onboarding = true;
+    }
+
+    /// Esc: out of the folder list first, else closes. The quick switcher
+    /// has no row list to step back to, so it always closes outright.
+    fn back(&mut self) {
+        if !self.editable || self.folder.take().is_none() {
+            self.open = false;
+            self.folder = None;
+        }
+    }
+
+    /// Jumping to a folder leaves the screen entirely, not just its list.
+    fn close(&mut self) {
+        self.open = false;
+        self.folder = None;
+    }
+}
+
 pub struct App {
     pub deck: Arc<Mutex<Deck>>,
     pub browser: Browser,
@@ -38,6 +115,11 @@ pub struct App {
     loading: Option<(PathBuf, mpsc::Receiver<anyhow::Result<Track>>)>,
     status: Option<(String, Instant)>,
     pub help: Help,
+    pub settings_screen: SettingsScreen,
+    /// Browsing to pick a new music folder (from Settings' Tab): a plain
+    /// file browser, so going up stays a filesystem "up" even at an
+    /// existing music folder, rather than jumping to the quick switcher.
+    picking_music_dir: bool,
     pub show_remaining: bool,
     /// Hot cue REC mode: the hot cue keys store instead of trigger.
     pub hot_rec: bool,
@@ -63,8 +145,8 @@ impl App {
         browser: Browser,
         key_release: bool,
         output_name: String,
+        memory: Memory,
     ) -> Self {
-        let memory = Memory::load();
         {
             let mut d = deck.lock().unwrap_or_else(|e| e.into_inner());
             if JUMP_SIZES.contains(&memory.settings.jump_beats) {
@@ -79,6 +161,8 @@ impl App {
             loading: None,
             status: None,
             help: Help::default(),
+            settings_screen: SettingsScreen::default(),
+            picking_music_dir: false,
             show_remaining: false,
             hot_rec: false,
             track_number: None,
@@ -127,6 +211,147 @@ impl App {
 
     pub fn auto_cue(&self) -> bool {
         self.memory.settings.auto_cue
+    }
+
+    pub fn music_dirs(&self) -> &[PathBuf] {
+        &self.memory.settings.music_dirs
+    }
+
+    fn toggle_auto_cue(&mut self) {
+        self.memory.settings.auto_cue = !self.memory.settings.auto_cue;
+        let on = self.memory.settings.auto_cue;
+        self.set_status(format!("Auto Cue {} (applies from the next load)", if on { "on" } else { "off" }));
+        if let Err(e) = self.memory.save_settings() {
+            self.set_status(format!("Could not save settings: {e}"));
+        }
+    }
+
+    /// Adds the browser's current folder to the music folders list, so it's
+    /// one of the places the browser can open or jump to. A no-op if it's
+    /// already there or inside one already there — its subfolders are
+    /// already browseable through that one. Adding a folder that's an
+    /// ancestor of existing ones replaces them, for the same reason.
+    fn add_music_dir(&mut self) {
+        let dir = self.browser.dir.clone();
+        if let Some(existing) = self.memory.settings.music_dirs.iter().find(|d| dir.starts_with(d)).cloned() {
+            self.set_status(format!("{} is already inside {}", dir.display(), existing.display()));
+            return;
+        }
+        let dirs = &mut self.memory.settings.music_dirs;
+        let before = dirs.len();
+        dirs.retain(|d| !d.starts_with(&dir));
+        let replaced = before - dirs.len();
+        dirs.push(dir.clone());
+        match self.memory.save_settings() {
+            Ok(()) => {
+                let msg = if before == 0 {
+                    format!("Using {} as your music folder", dir.display())
+                } else if replaced == 0 {
+                    format!("Added {} to music folders", dir.display())
+                } else {
+                    let s = if replaced == 1 { "" } else { "s" };
+                    format!("Added {} to music folders, replacing {replaced} subfolder{s}", dir.display())
+                };
+                self.set_status(msg);
+                // Picked a folder to add, rather than adding one in passing
+                // while just browsing: that's done now, so leave both screens.
+                if self.picking_music_dir {
+                    self.browser.close();
+                    self.settings_screen.close();
+                    self.picking_music_dir = false;
+                }
+            }
+            Err(e) => self.set_status(format!("Could not save settings: {e}")),
+        }
+    }
+
+    /// Removes the music folder at `i`, keeping the selection in range.
+    fn remove_music_dir(&mut self, i: usize) {
+        if i >= self.memory.settings.music_dirs.len() {
+            return;
+        }
+        let removed = self.memory.settings.music_dirs.remove(i);
+        match self.memory.save_settings() {
+            Ok(()) => self.set_status(format!("Removed {}", removed.display())),
+            Err(e) => self.set_status(format!("Could not save settings: {e}")),
+        }
+        let last = self.memory.settings.music_dirs.len().saturating_sub(1);
+        self.settings_screen.folder = Some(i.min(last));
+    }
+
+    /// Opens the browser at the music folder at `i`, leaving settings.
+    fn jump_to_music_dir(&mut self, i: usize) {
+        let Some(dir) = self.memory.settings.music_dirs.get(i).cloned() else { return };
+        self.browser.enter(dir, None);
+        self.browser.open = true;
+        self.picking_music_dir = false;
+        self.settings_screen.close();
+    }
+
+    /// Going up from one of the music folders goes to the folder list
+    /// instead of its filesystem parent; elsewhere, and while picking a new
+    /// music folder to add, it's a normal "up" even at an existing one —
+    /// you're looking for a different folder, not browsing to play.
+    fn up_or_to_music_dirs(&mut self) {
+        if self.picking_music_dir {
+            self.browser.parent();
+            return;
+        }
+        let at = self.memory.settings.music_dirs.iter().position(|d| *d == self.browser.dir);
+        match at {
+            Some(i) => {
+                self.browser.close();
+                self.settings_screen.open = true;
+                self.settings_screen.row = 1;
+                self.settings_screen.folder = Some(i);
+                self.settings_screen.editable = false;
+            }
+            None => self.browser.parent(),
+        }
+    }
+
+    /// While the settings screen is open it's modal: ↑↓ to move or drill,
+    /// Enter/X to act, Esc falls through to close it, anything else is
+    /// swallowed rather than reaching the deck underneath.
+    fn settings_key(&mut self, code: KeyCode) -> bool {
+        if !self.settings_screen.open {
+            return false;
+        }
+        match (self.settings_screen.folder, code) {
+            // Forced first-run setup, nothing picked yet: there's nothing
+            // else to do, so no backing out (Ctrl+C still quits the app).
+            // Not triggered by later emptying an already-set-up list by
+            // hand — that's a deliberate choice, not being stuck.
+            (Some(_), KeyCode::Esc) if self.settings_screen.onboarding => {}
+            (_, KeyCode::Esc) => return false,
+            (Some(i), KeyCode::Up) => self.settings_screen.folder = Some(i.saturating_sub(1)),
+            (Some(i), KeyCode::Down) => {
+                let last = self.memory.settings.music_dirs.len().saturating_sub(1);
+                self.settings_screen.folder = Some((i + 1).min(last));
+            }
+            (Some(i), KeyCode::Char('x') | KeyCode::Delete) if self.settings_screen.editable => {
+                self.remove_music_dir(i);
+            }
+            // The quick switcher (not editable) is for picking a folder to
+            // browse; the real settings screen is for managing the list, so
+            // it doesn't also double as a way to jump into one.
+            (Some(i), KeyCode::Enter | KeyCode::Right) if !self.settings_screen.editable => {
+                self.jump_to_music_dir(i);
+            }
+            // Settings stays open underneath; a successful Ctrl+U while
+            // picking closes both and returns to normal use (add_music_dir).
+            // Picking, so going up doesn't bounce off an existing folder.
+            (Some(_), KeyCode::Enter | KeyCode::Right) if self.settings_screen.editable => {
+                self.browser.open = true;
+                self.picking_music_dir = true;
+            }
+            (None, KeyCode::Up) => self.settings_screen.row = self.settings_screen.row.saturating_sub(1),
+            (None, KeyCode::Down) => self.settings_screen.row = (self.settings_screen.row + 1).min(SETTINGS_ROWS - 1),
+            (None, KeyCode::Enter) if self.settings_screen.row == 0 => self.toggle_auto_cue(),
+            (None, KeyCode::Enter) => self.settings_screen.folder = Some(0),
+            _ => {}
+        }
+        true
     }
 
     pub fn loading(&self) -> Option<String> {
@@ -202,6 +427,7 @@ impl App {
         };
         let Some(current) = current else {
             self.browser.open = true;
+            self.picking_music_dir = false;
             return;
         };
         let list = siblings(&current);
@@ -334,6 +560,11 @@ impl App {
     fn browser_key(&mut self, key: &KeyEvent) {
         let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
+            // Not Ctrl+H: on terminals without the kitty protocol that's
+            // indistinguishable from plain Backspace, which is also bound
+            // here (delete filter char / go up), so it would silently do
+            // the wrong thing instead of adding the folder.
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => self.add_music_dir(),
             KeyCode::Char(c) if typing => self.browser.type_char(c),
             KeyCode::Up => self.browser.move_by(-1),
             KeyCode::Down => self.browser.move_by(1),
@@ -343,10 +574,10 @@ impl App {
             KeyCode::End => self.browser.move_by(isize::MAX / 2),
             KeyCode::Backspace => {
                 if !self.browser.backspace() {
-                    self.browser.parent();
+                    self.up_or_to_music_dirs();
                 }
             }
-            KeyCode::Left => self.browser.parent(),
+            KeyCode::Left => self.up_or_to_music_dirs(),
             KeyCode::Enter | KeyCode::Right => {
                 if let Some(path) = self.browser.activate() {
                     self.load(path);
@@ -370,15 +601,26 @@ impl App {
         if self.help.is_open() && self.help.key(code, shift, crate::ui::HELP.len()) {
             return;
         }
+        if self.settings_key(code) {
+            return;
+        }
         match code {
             KeyCode::Esc => {
                 self.help.close();
+                self.settings_screen.back();
                 if self.deck().is_adjusting_grid() {
                     self.deck().toggle_grid_adjust();
                 }
             }
             KeyCode::Char('/') if once => self.help.toggle(),
-            KeyCode::Tab if once => self.browser.open = true,
+            KeyCode::Char('`') if once => {
+                self.help.close();
+                self.settings_screen.toggle();
+            }
+            KeyCode::Tab if once => {
+                self.browser.open = true;
+                self.picking_music_dir = false;
+            }
 
             KeyCode::Char(' ') if once => self.deck().play_pause(),
             KeyCode::Char('c') if once => {
@@ -557,17 +799,7 @@ impl App {
             KeyCode::Char('n') if once => self.skip_track(1),
 
             KeyCode::Char('r') if once => self.deck().toggle_reverse(),
-            KeyCode::Char('t') if once && shift => {
-                self.memory.settings.auto_cue = !self.memory.settings.auto_cue;
-                let on = self.memory.settings.auto_cue;
-                self.set_status(format!(
-                    "Auto Cue {} (applies from the next load)",
-                    if on { "on" } else { "off" }
-                ));
-                if let Err(e) = self.memory.save_settings() {
-                    self.set_status(format!("Could not save settings: {e}"));
-                }
-            }
+            KeyCode::Char('t') if once && shift => self.toggle_auto_cue(),
             KeyCode::Char('t') if once => self.show_remaining = !self.show_remaining,
             KeyCode::Char('a') if once && shift => {
                 self.deck().reset_grid();
@@ -679,7 +911,7 @@ mod tests {
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
         deck.lock().unwrap().load(Arc::new(track), &mem, false);
-        App::new(deck, Browser::new(dir), true, String::new())
+        App::new(deck, Browser::new(dir), true, String::new(), Memory::load())
     }
 
     fn key(app: &mut App, code: KeyCode, shift: bool, kind: KeyEventKind) {
@@ -804,7 +1036,7 @@ mod tests {
     #[test]
     fn the_readme_has_every_help_key() {
         use odj_core::tui::Page;
-        let readme = include_str!("../../../README.md").replace('`', "");
+        let readme = include_str!("../../../README.md");
         let start = readme.find("### odj-player\n").expect("a section for odj-player");
         let section = &readme[start..];
         let section = &section[..section[4..].find("\n### ").map_or(section.len(), |i| i + 4)];
@@ -812,7 +1044,10 @@ mod tests {
             let Page::Keys(title, keys) = page else { continue };
             let page = section.split("#### ").find(|p| p.starts_with(&format!("{title}\n"))).expect(title);
             for (k, v) in *keys {
-                assert!(page.contains(&format!("| {k} | {v} |")), "{title}: {k}");
+                // A key that's itself a backtick needs the longer-delimiter
+                // markdown escape (`` ` ``), not a plain `k` code span.
+                let md_key = if k.contains('`') { format!("`` {k} ``") } else { format!("`{k}`") };
+                assert!(page.contains(&format!("| {md_key} | {v} |")), "{title}: {k}");
             }
         }
     }
@@ -919,6 +1154,513 @@ mod tests {
         assert_eq!(app.deck().snapshot().roll, None);
     }
 
+    fn press_ctrl(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent { code, modifiers: KeyModifiers::CONTROL, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+    }
+
+    #[test]
+    fn h_opens_settings_and_esc_closes_it() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('`'), false);
+        assert!(app.settings_screen.is_open());
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.settings_screen.is_open());
+    }
+
+    #[test]
+    fn open_to_music_dirs_skips_straight_to_the_list() {
+        let mut app = app();
+        app.settings_screen.open_to_music_dirs();
+        assert!(app.settings_screen.is_open());
+        assert!(app.settings_screen.editable());
+        assert_eq!(app.settings_screen.folder(), Some(0));
+
+        // Enter, X and Ctrl+U all behave exactly as in the normal editable list.
+        app.memory.settings.music_dirs.clear();
+        let dir = app.browser.dir.clone();
+        press(&mut app, KeyCode::Enter, false);
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.music_dirs(), [dir]);
+        assert!(!app.settings_screen.is_open(), "picking a folder concludes setup");
+    }
+
+    #[test]
+    fn opening_settings_closes_help() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'), false);
+        assert!(app.help.is_open());
+        press(&mut app, KeyCode::Char('`'), false);
+        assert!(app.settings_screen.is_open());
+        assert!(!app.help.is_open());
+    }
+
+    #[test]
+    fn settings_is_modal_and_toggles_auto_cue() {
+        let mut app = app();
+        let was_playing = app.deck().snapshot().playing;
+        press(&mut app, KeyCode::Char('`'), false);
+        // Space is swallowed while settings is open, not sent to the deck.
+        press(&mut app, KeyCode::Char(' '), false);
+        assert_eq!(app.deck().snapshot().playing, was_playing);
+
+        let auto_cue = app.auto_cue();
+        press(&mut app, KeyCode::Enter, false); // row 0: auto-cue
+        assert_eq!(app.auto_cue(), !auto_cue);
+    }
+
+    #[test]
+    fn browser_hints_are_in_three_groups() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        // The tests share a settings file; this is the normal (not
+        // onboarding) layout, so it needs a music folder already configured
+        // — just not this one, or the Ctrl+U badge this test locates the
+        // hints row by would be hidden as "already added".
+        app.memory.settings.music_dirs = vec![app.browser.dir.join("elsewhere")];
+        press(&mut app, KeyCode::Tab, false); // open the browser
+
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let buf = t.backend().buffer();
+
+        // The hints row is the one just above the box's bottom border, which
+        // carries the Ctrl+U badge.
+        let hints_y = (0..buf.area.height).find(|&y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            row.contains("Ctrl+U")
+        });
+        let hints_y = hints_y.expect("the hints row is on screen") - 1;
+        let row: String = (0..buf.area.width).map(|x| buf[(x, hints_y)].symbol()).collect();
+
+        // The box is narrower than the terminal, so the row also carries
+        // whatever's behind it on either side — check group order, not
+        // exact position.
+        let enter_at = row.find("Enter/").expect("Enter/\u{2192} open is shown");
+        let esc_at = row.find("Esc").expect("Esc is shown");
+        let filter_at = row.find("type to filter").expect("the filter hint is shown");
+        let nav_at = row.find("navigate").expect("the navigate hint is shown");
+        assert!(enter_at < esc_at, "Enter is left of Esc: {row:?}");
+        assert!(esc_at < filter_at, "Esc is left of the filter hint: {row:?}");
+        assert!(filter_at < nav_at, "the filter hint is left of navigate: {row:?}");
+        assert!(!row.contains("Tab"), "Tab isn't worth a mention: {row:?}");
+    }
+
+    #[test]
+    fn onboarding_browser_hints_drop_enter_and_fold_into_navigate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        // The tests share a settings file; onboarding is specifically the
+        // no-music-folders-at-all case.
+        app.memory.settings.music_dirs.clear();
+        press(&mut app, KeyCode::Tab, false); // open the browser
+
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let buf = t.backend().buffer();
+
+        // Locate the hints row the same way: just above the Ctrl+U badge.
+        let hints_y = (0..buf.area.height)
+            .find(|&y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>().contains("Ctrl+U"))
+            .expect("the hints row is on screen")
+            - 1;
+        let row: String = (0..buf.area.width).map(|x| buf[(x, hints_y)].symbol()).collect();
+
+        assert!(!row.contains("Enter"), "Enter/open isn't shown during onboarding: {row:?}");
+        assert!(row.contains('→'), "the right arrow moved into navigate: {row:?}");
+        let esc_at = row.find("Esc").expect("Esc is shown");
+        let filter_at = row.find("type to filter").expect("the filter hint is shown");
+        let nav_at = row.find("navigate").expect("the navigate hint is shown");
+        assert!(esc_at < filter_at, "Esc is left of the filter hint: {row:?}");
+        assert!(filter_at < nav_at, "the filter hint is left of navigate: {row:?}");
+    }
+
+    #[test]
+    fn ctrl_h_adds_to_music_folders_and_settings_lists_them() {
+        let mut app = app();
+        // The tests share a settings file; start from empty.
+        app.memory.settings.music_dirs.clear();
+        let dir = app.browser.dir.clone();
+        press(&mut app, KeyCode::Tab, false); // open the browser
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.music_dirs(), [dir.clone()]);
+        assert!(app.status().is_some_and(|s| s.contains("Using")), "the first folder gets its own message");
+
+        // Adding the same folder again is a no-op.
+        press_ctrl(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.music_dirs().len(), 1);
+
+        press(&mut app, KeyCode::Tab, false); // close the browser
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in
+        assert_eq!(app.settings_screen.folder(), Some(0));
+
+        press(&mut app, KeyCode::Char('x'), false); // remove it
+        assert!(app.music_dirs().is_empty());
+        // Emptied by hand in a normal session (not the forced first-run
+        // flow), so Esc still works — same two-level back-then-close as ever.
+        press(&mut app, KeyCode::Esc, false);
+        assert!(app.settings_screen.is_open());
+        assert_eq!(app.settings_screen.folder(), None);
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.settings_screen.is_open());
+    }
+
+    #[test]
+    fn footer_highlights_tab_when_theres_no_track() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("odj-test-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+
+        // Wide enough that the full key list isn't clipped before "Space play".
+        let render = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+        let text = render(&empty);
+        assert!(text.contains("Tab") && text.contains("browse"), "Tab is explained");
+        assert!(!text.contains("Space play"), "deck keys are hidden: there's nothing to play");
+
+        let loaded = app();
+        let text = render(&loaded);
+        assert!(text.contains("Space play"), "deck keys are back once a track is loaded");
+    }
+
+    #[test]
+    fn footer_globals_stay_visible_and_pinned_right_even_when_narrow() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let app = app(); // a track is loaded
+        // Narrow enough that the old single-string fallback would have
+        // dropped `` entirely, keeping only "? help  Ctrl+C quit".
+        let mut t = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let buf = t.backend().buffer();
+        let footer_row: String = (0..buf.area.width).map(|x| buf[(x, buf.area.height - 1)].symbol()).collect();
+
+        assert!(footer_row.contains('`'), "settings is shown even when narrow: {footer_row:?}");
+        assert!(footer_row.trim_end().ends_with("Ctrl+C quit"), "globals are pinned right: {footer_row:?}");
+    }
+
+    #[test]
+    fn footer_pins_tab_left_and_globals_right_when_no_track() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("odj-test-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+
+        let mut t = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let snapshot = empty.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &empty, &snapshot)).unwrap();
+        let buf = t.backend().buffer();
+        let footer_row: String = (0..buf.area.width).map(|x| buf[(x, buf.area.height - 1)].symbol()).collect();
+
+        assert!(footer_row.trim_start().starts_with("Tab"), "Tab is pinned to the left: {footer_row:?}");
+        assert!(footer_row.trim_end().ends_with("Ctrl+C quit"), "globals are pinned to the right: {footer_row:?}");
+    }
+
+    #[test]
+    fn no_track_message_renders_as_big_pixel_text() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir().join(format!("odj-test-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+
+        let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let snapshot = empty.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &empty, &snapshot)).unwrap();
+        let cells = &t.backend().buffer().content;
+
+        // Rendered as block glyphs, not the old one-line plain-text message.
+        assert!(cells.iter().any(|c| c.symbol() == "█"), "the big-text glyphs are drawn");
+    }
+
+    #[test]
+    fn add_badge_hidden_when_current_folder_already_added() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        app.browser.open = true;
+        let dir = app.browser.dir.clone();
+        let other = dir.join("elsewhere");
+
+        let render = |app: &App| {
+            let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        app.memory.settings.music_dirs = vec![other];
+        assert!(render(&app).contains("Add to music folders"), "a different folder is configured: badge shown");
+
+        app.memory.settings.music_dirs = vec![dir];
+        assert!(!render(&app).contains("Add to music folders"), "this folder is already configured: badge hidden");
+    }
+
+    #[test]
+    fn empty_music_dirs_only_hints_what_actually_works() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        app.memory.settings.music_dirs.clear();
+        app.settings_screen.open_to_music_dirs();
+
+        let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let text: String = t.backend().buffer().content.iter().map(|c| c.symbol()).collect();
+
+        assert!(text.contains("Enter to browse"), "the one real action is explained");
+        assert!(!text.contains("Ctrl+U"), "nothing to add yet, so don't mention it here");
+        assert!(!text.contains("select"), "nothing to select with an empty list");
+        assert!(!text.contains("remove"), "nothing to remove with an empty list");
+        assert!(!text.contains("Esc"), "no backing out of setup with no folder yet either");
+    }
+
+    #[test]
+    fn cant_escape_the_music_folders_list_with_none_configured() {
+        let mut app = app();
+        app.memory.settings.music_dirs.clear();
+        app.settings_screen.open_to_music_dirs();
+
+        press(&mut app, KeyCode::Esc, false);
+        assert!(app.settings_screen.is_open(), "Esc does nothing: still empty, still gated");
+        assert_eq!(app.settings_screen.folder(), Some(0));
+    }
+
+    #[test]
+    fn the_row_menu_above_it_is_not_gated() {
+        let mut app = app();
+        app.memory.settings.music_dirs.clear();
+        press(&mut app, KeyCode::Char('`'), false); // the row menu, not drilled in
+        assert_eq!(app.settings_screen.folder(), None);
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.settings_screen.is_open(), "no folders yet isn't a reason to trap you here too");
+    }
+
+    #[test]
+    fn deleting_your_way_to_empty_mid_session_is_not_a_trap() {
+        let mut app = app();
+        let dir = app.browser.dir.clone();
+        // The tests share a settings file; start with one already configured,
+        // as if from a previous session — this is not first-run.
+        app.memory.settings.music_dirs = vec![dir];
+
+        press(&mut app, KeyCode::Char('`'), false); // open settings normally
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in
+        assert!(!app.settings_screen.onboarding());
+        press(&mut app, KeyCode::Char('x'), false); // delete the only folder
+        assert!(app.music_dirs().is_empty());
+
+        press(&mut app, KeyCode::Esc, false);
+        assert!(app.settings_screen.is_open(), "steps back to the row menu first");
+        assert_eq!(app.settings_screen.folder(), None);
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.settings_screen.is_open(), "and a second Esc actually leaves");
+    }
+
+    #[test]
+    fn adding_a_subfolder_of_an_added_folder_is_rejected() {
+        let mut app = app();
+        let parent = app.browser.dir.clone();
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        // The tests share a settings file; start from just the parent.
+        app.memory.settings.music_dirs = vec![parent.clone()];
+
+        app.browser.open = true;
+        app.browser.enter(child, None);
+        press_ctrl(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(app.music_dirs(), [parent], "the subfolder wasn't added");
+        assert!(app.status().is_some_and(|s| s.contains("already inside")));
+    }
+
+    #[test]
+    fn adding_a_folder_replaces_its_now_redundant_subfolders() {
+        let mut app = app();
+        let parent = app.browser.dir.clone();
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        // The tests share a settings file; start from just the child.
+        app.memory.settings.music_dirs = vec![child];
+
+        app.browser.open = true;
+        app.browser.enter(parent.clone(), None);
+        press_ctrl(&mut app, KeyCode::Char('u'));
+
+        assert_eq!(app.music_dirs(), [parent], "the child was replaced, not duplicated");
+        assert!(app.status().is_some_and(|s| s.contains("replacing 1 subfolder")));
+    }
+
+    #[test]
+    fn adding_a_folder_from_inside_settings_concludes_setup() {
+        let mut app = app();
+        // The tests share a settings file; start from empty.
+        app.memory.settings.music_dirs.clear();
+        let dir = app.browser.dir.clone();
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in, empty so far
+        assert!(app.music_dirs().is_empty());
+
+        press(&mut app, KeyCode::Enter, false); // Enter, from inside settings, opens the browser
+        assert!(app.browser.open);
+        assert!(app.settings_screen.is_open(), "settings stays open underneath");
+        press_ctrl(&mut app, KeyCode::Char('u')); // pick the folder we're browsing
+
+        assert!(!app.browser.open, "picking it closes the browser...");
+        assert!(!app.settings_screen.is_open(), "...and settings too: setup is done");
+        assert_eq!(app.music_dirs(), [dir]);
+    }
+
+    #[test]
+    fn backing_out_without_picking_resumes_settings() {
+        let mut app = app();
+        app.memory.settings.music_dirs.clear();
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in, empty so far
+        press(&mut app, KeyCode::Enter, false); // opens the browser
+        assert!(app.browser.open);
+
+        press(&mut app, KeyCode::Esc, false); // changed my mind, no Ctrl+U
+
+        assert!(!app.browser.open);
+        assert!(app.settings_screen.is_open(), "back in settings automatically");
+        assert_eq!(app.settings_screen.folder(), Some(0));
+        assert!(app.music_dirs().is_empty(), "nothing was added");
+    }
+
+    #[test]
+    fn enter_in_real_settings_opens_browser_to_add_another() {
+        let mut app = app();
+        let other = app.browser.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        // The tests share a settings file; start from just this one folder.
+        app.memory.settings.music_dirs = vec![other.clone()];
+
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in
+        press(&mut app, KeyCode::Enter, false); // Enter always offers to add another
+
+        assert!(app.browser.open, "existing entries or not, Enter is how you add one");
+        assert_eq!(app.music_dirs(), [other], "nothing changed yet, just browsing");
+    }
+
+    #[test]
+    fn picking_a_new_folder_goes_up_normally_past_an_existing_one() {
+        let mut app = app();
+        let dir = app.browser.dir.clone();
+        let parent = dir.parent().unwrap().to_path_buf();
+        // The tests share a settings file; the browser's own folder is "already added".
+        app.memory.settings.music_dirs = vec![dir.clone()];
+
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in
+        press(&mut app, KeyCode::Enter, false); // Enter: browse to pick a new folder
+        assert_eq!(app.browser.dir, dir, "opens where the browser already was");
+
+        press(&mut app, KeyCode::Left, false); // going up while picking...
+        assert!(app.browser.open, "...stays a plain browser...");
+        assert_eq!(app.browser.dir, parent, "...even past an already-added folder");
+    }
+
+    #[test]
+    fn backspace_at_a_music_dir_goes_to_the_folder_list() {
+        let mut app = app();
+        let other = app.browser.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        // The tests share a settings file; start from just this one folder.
+        app.memory.settings.music_dirs = vec![other.clone()];
+
+        app.browser.open = true;
+        app.browser.enter(other, None);
+        press(&mut app, KeyCode::Left, false);
+
+        assert!(!app.browser.open);
+        assert!(app.settings_screen.is_open());
+        assert_eq!(app.settings_screen.folder(), Some(0));
+        assert!(!app.settings_screen.editable(), "a quick switcher, not settings management");
+    }
+
+    #[test]
+    fn the_quick_switcher_cant_add_or_remove_folders() {
+        let mut app = app();
+        let other = app.browser.dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        // The tests share a settings file; start from just this one folder.
+        app.memory.settings.music_dirs = vec![other.clone()];
+
+        app.browser.open = true;
+        app.browser.enter(other, None);
+        press(&mut app, KeyCode::Left, false); // up into the (non-editable) quick switcher
+
+        press(&mut app, KeyCode::Char('x'), false);
+        assert_eq!(app.music_dirs().len(), 1, "x doesn't remove it");
+        press(&mut app, KeyCode::Tab, false);
+        assert!(!app.browser.open, "Tab doesn't open the browser to add another");
+
+        // The real settings screen, opened deliberately, still can.
+        press(&mut app, KeyCode::Esc, false);
+        press(&mut app, KeyCode::Char('`'), false);
+        press(&mut app, KeyCode::Down, false);
+        press(&mut app, KeyCode::Enter, false);
+        assert!(app.settings_screen.editable());
+        press(&mut app, KeyCode::Char('x'), false);
+        assert!(app.music_dirs().is_empty());
+    }
+
+    #[test]
+    fn backspace_elsewhere_still_goes_to_the_filesystem_parent() {
+        let mut app = app();
+        // The tests share a settings file; make sure this folder isn't one.
+        app.memory.settings.music_dirs.clear();
+        let parent = app.browser.dir.clone();
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        app.browser.open = true;
+        app.browser.enter(child, None);
+        press(&mut app, KeyCode::Left, false);
+
+        assert!(app.browser.open, "a plain parent, not the folder list");
+        assert_eq!(app.browser.dir, parent);
+    }
+
     /// Writes ANSI dumps of a few screens under `target/screenshots/`, for a
     /// CI step to rasterize into the README/website images. Entirely
     /// synthetic: no audio file or device involved, so it needs neither a
@@ -963,7 +1705,7 @@ mod tests {
         let mem = TrackMemory { quantize: Some(true), ..TrackMemory::default() };
         let track = fictional_track("Nova Satellite", "Night Drive", 128.0, 60.0);
         deck.lock().unwrap().load(Arc::new(track), &mem, false);
-        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into());
+        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into(), Memory::load());
         press(&mut app, KeyCode::Char(' '), false); // play
         app.deck().render(&mut vec![0.0; 2 * 48_000 * 20]); // 20s in, so the waveform isn't at the very start
         press(&mut app, KeyCode::Char('e'), false); // hot cue REC mode
@@ -994,7 +1736,33 @@ mod tests {
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut browser = Browser::new(dir);
         browser.open = true;
-        let app = App::new(deck, browser, true, "Built-in Audio · 48000 Hz".into());
+        let app = App::new(deck, browser, true, "Built-in Audio · 48000 Hz".into(), Memory::load());
         dump_screenshot("browser", &app, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_settings() {
+        use odj_core::memory::{Settings, write_json};
+
+        let dir = std::env::temp_dir().join(format!("odj-shot-settings-{}", std::process::id()));
+        let config = dir.join("config");
+        std::fs::create_dir_all(config.join("odj")).unwrap();
+        let settings = Settings {
+            music_dirs: vec!["/home/dj/Music".into(), "/mnt/usb/Tracks".into(), "/home/dj/Downloads/sets".into()],
+            ..Settings::default()
+        };
+        write_json(&config.join("odj/settings.json"), &settings).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &config);
+            std::env::set_var("XDG_CONFIG_HOME", &config);
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into(), Memory::load());
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in
+        press(&mut app, KeyCode::Down, false); // select the second folder
+        dump_screenshot("settings", &app, 120, 40);
     }
 }

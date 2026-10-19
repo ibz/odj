@@ -6,10 +6,16 @@ Keyboard-driven DJ tools for the Linux terminal:
 - **odj-sampler**, which plays the cues stored by odj-player from 16 pads.
 
 ```
-cargo run --release -p odj-player -- ~/Music      # browse a folder
+cargo run --release -p odj-player                 # first run: pick & remember a music folder
+cargo run --release -p odj-player -- ~/Music      # or browse this folder just this once
 cargo run --release -p odj-player -- track.mp3    # load a track straight away
 cargo run --release -p odj-sampler                # 16 pads of stored cues
 ```
+
+The first run (or whenever no music folder is set yet) asks you to pick one
+and remembers it; passing a folder on the command line just browses there
+for that session, without changing what's remembered. Manage saved folders
+any time from Settings (`` ` ``).
 
 Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
 needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF.
@@ -131,6 +137,8 @@ along their bottom edge, as does the output picker at start.
 | `F` | Sync to the master deck |
 | `B / N` | Previous / next track in folder |
 | `Tab` | File browser |
+| `Ctrl+U in the browser` | Add this folder to your music folders |
+| `` ` `` | Settings: auto-cue, music folders |
 
 #### Cues
 

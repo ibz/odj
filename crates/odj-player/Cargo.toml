@@ -13,6 +13,7 @@ publish = false
 odj-core.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
+tui-big-text = "0.8.10"
 
 [dev-dependencies]
 odj-core = { workspace = true, features = ["test-util"] }

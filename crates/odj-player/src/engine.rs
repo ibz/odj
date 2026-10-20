@@ -216,14 +216,25 @@ pub struct Snapshot {
     pub sync: SyncView,
 }
 
-/// Which memory point to call, from the region the deck is in.
+/// Which memory point to call: always the nearest one in that direction,
+/// including one the deck is already sitting exactly on — so landing on a
+/// memory and immediately calling the same direction again doesn't re-find
+/// it, but instead steps on to the next one that way.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MemoryCall {
-    /// The start of the region before this one.
-    Previous,
-    /// The start of this region.
-    Current,
-    Next,
+    Left,
+    Right,
+}
+
+/// Whether `pos` counts as "at" this memory point: for a loop, anywhere
+/// inside it, not just exactly at its start — the playhead wanders the
+/// whole loop while it plays, so a tight distance check would only ever
+/// match for an instant right as it wraps.
+fn memory_covers(m: &Cue, pos: f64) -> bool {
+    match m.loop_out {
+        Some(out) => pos >= m.pos - 1.0 && pos < out + 1.0,
+        None => (m.pos - pos).abs() < 1.0,
+    }
 }
 
 pub struct Deck {
@@ -862,12 +873,12 @@ impl Deck {
     pub fn call_memory(&mut self, which: MemoryCall) -> Option<usize> {
         // From a jump still waiting for its beat, so presses add up.
         let from = self.pending.map_or(self.pos, |p| p.to);
-        // The point starting the region the deck is in.
-        let current = self.memories.iter().rposition(|m| m.pos <= from + 1.0);
         let i = match which {
-            MemoryCall::Previous => current?.checked_sub(1)?,
-            MemoryCall::Current => current?,
-            MemoryCall::Next => self.memories.iter().position(|m| m.pos > from + 1.0)?,
+            // Strictly before: excludes one already sat on (within a
+            // frame), so a repeat press steps to the next one back
+            // instead of re-finding the same one.
+            MemoryCall::Left => self.memories.iter().rposition(|m| m.pos < from - 1.0)?,
+            MemoryCall::Right => self.memories.iter().position(|m| m.pos > from + 1.0)?,
         };
         let m = self.memories[i];
         self.loop_adjust = false;
@@ -890,11 +901,21 @@ impl Deck {
         Some(i + 1)
     }
 
-    /// Deletes the memory point at the current cue point.
+    /// The memory point at the current position, if any — what
+    /// `delete_memory` would remove, without removing it. Keyed off `pos`,
+    /// not `cue`: calling a memory while playing jumps `pos` there without
+    /// moving `cue` (see `call_memory`), so using `cue` here would make
+    /// deleting a loop you just jumped to silently fail while playing.
+    pub fn memory_at_pos(&self) -> Option<Cue> {
+        let pos = self.pos;
+        self.memories.iter().copied().find(|m| memory_covers(m, pos))
+    }
+
+    /// Deletes the memory point at the current position.
     pub fn delete_memory(&mut self) -> bool {
         let before = self.memories.len();
-        let cue = self.cue;
-        self.memories.retain(|m| (m.pos - cue).abs() >= 1.0);
+        let pos = self.pos;
+        self.memories.retain(|m| !memory_covers(m, pos));
         self.memories.len() != before
     }
 
@@ -2026,10 +2047,10 @@ mod tests {
         d.cue_down(true); // snaps to the beat at 0.25 s
         d.play_pause();
         run(&mut d, 18_000); // 0.625 s: past beat 0.25 s, before 0.75 s
-        assert_eq!(d.call_memory(MemoryCall::Next), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Right), Some(1));
         assert!(d.pos < beat(1.0), "nothing happens before the beat");
-        assert_eq!(d.call_memory(MemoryCall::Next), Some(2), "a second press goes on from the first");
-        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Right), Some(2), "a second press goes on from the first");
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(1));
         run(&mut d, 12_000); // 0.875 s: the beat at 0.75 s went by
         let expected = at + (0.875 - 0.75) * SR as f64;
         assert!(d.playing);
@@ -2517,24 +2538,41 @@ mod tests {
     }
 
     #[test]
-    fn previous_skips_the_region_the_deck_is_in() {
+    fn j_and_k_jump_straight_to_the_nearest_memory() {
         let mut d = deck();
         for _ in 0..3 {
             d.store_memory();
             d.step_paused(75.0);
             d.cue_down(true);
-        } // points at 0, 1 and 2 s; the deck at 3 s
-        d.play_pause();
-        run(&mut d, SR as usize / 2); // 3.5 s, in the region from 2 s
-        assert_eq!(d.call_memory(MemoryCall::Previous), Some(2));
+        } // memories at 0, 1 and 2 s; the deck ends up at 3 s, paused
+
+        // Lands exactly on the nearest one each press, so — unlike a tight
+        // "which region am I in" lookup — it never has to skip past a
+        // memory that's clearly the nearest one just to reach it.
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(3));
+        assert_eq!(d.pos, 2.0 * SR as f64);
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(2), "pressing again steps further back");
         assert_eq!(d.pos, SR as f64);
-        run(&mut d, 1_000);
-        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1), "pressing again goes on back");
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(1));
         assert_eq!(d.pos, 0.0);
-        run(&mut d, SR as usize / 2);
-        assert_eq!(d.call_memory(MemoryCall::Current), Some(1), "restarts the region");
-        assert!(d.playing && d.pos == 0.0);
-        assert_eq!(d.call_memory(MemoryCall::Previous), None, "nothing before the first");
+        assert_eq!(d.call_memory(MemoryCall::Left), None, "nothing before the first");
+
+        assert_eq!(d.call_memory(MemoryCall::Right), Some(2), "and K steps forward the same way");
+        assert_eq!(d.pos, SR as f64);
+    }
+
+    #[test]
+    fn j_finds_a_memory_further_left_after_the_nearer_one_is_deleted() {
+        let mut d = deck();
+        d.store_memory(); // A at 0 s
+        d.step_paused(150.0); // 2 s
+        d.cue_down(true);
+        d.store_memory(); // B at 2 s, nearer the playhead
+        assert!(d.delete_memory(), "delete B");
+        assert_eq!(d.memories.len(), 1);
+
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(1), "finds A directly, doesn't skip past it");
+        assert_eq!(d.pos, 0.0);
     }
 
     #[test]
@@ -2557,27 +2595,64 @@ mod tests {
         d.reloop_exit();
         run(&mut d, 200_000);
         let cue = d.cue;
-        assert_eq!(d.call_memory(MemoryCall::Current), Some(3));
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(3));
         assert!(d.playing && d.looping);
         assert_eq!(d.pos, 2.0 * SR as f64);
         assert_eq!(d.cue, cue, "the cue point stays");
-        assert_eq!(d.call_memory(MemoryCall::Previous), Some(2));
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(2));
         assert!(d.playing && !d.looping);
         assert_eq!(d.pos, SR as f64);
 
         // Paused, it becomes the cue point and the deck waits there.
         d.play_pause();
-        assert_eq!(d.call_memory(MemoryCall::Previous), Some(1));
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(1));
         assert!(!d.playing);
         assert_eq!((d.pos, d.cue), (0.0, 0.0));
-        assert_eq!(d.call_memory(MemoryCall::Previous), None);
-        assert_eq!(d.call_memory(MemoryCall::Current), Some(1), "paused on a point, it stays");
-        assert_eq!(d.call_memory(MemoryCall::Next), Some(2));
+        assert_eq!(d.call_memory(MemoryCall::Left), None, "nothing before the first");
+        assert_eq!(d.call_memory(MemoryCall::Right), Some(2));
         assert_eq!(d.cue, SR as f64);
 
         assert!(d.delete_memory());
         assert_eq!(d.memories.len(), 2);
         assert!(!d.delete_memory());
+    }
+
+    #[test]
+    fn delete_memory_works_after_calling_one_while_playing() {
+        let mut d = deck();
+        d.store_memory(); // a memory at pos 0
+        d.step_paused(150.0); // 2 s, still paused
+        d.cue_down(true); // sets a new cue here, at 2 s — away from the memory
+        d.play_pause();
+        run(&mut d, SR as usize); // +1 s, still playing; cue stays at 2 s
+
+        // Jumps back to the memory, but — the actual bug report — stays
+        // playing, so `cue` doesn't follow (only a paused call moves it).
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(1));
+        assert!((d.pos - 0.0).abs() < 1.0, "pos is back at the memory");
+        assert!((d.cue - 2.0 * SR as f64).abs() < 1.0, "cue is still where it was, unmoved");
+        assert!(d.delete_memory(), "delete still finds it via pos, not the stale cue");
+        assert!(d.memories.is_empty());
+    }
+
+    #[test]
+    fn delete_memory_works_anywhere_inside_a_playing_loop() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, SR as usize); // 1 s
+        d.loop_in(); // loop_in = 1 s
+        run(&mut d, 24_000); // +0.5 s
+        d.loop_out(); // loop_out = 1.5 s, now looping
+        assert!(d.store_memory().is_some(), "promotes the active loop");
+
+        // Deep into the loop body, not sitting at its start point — the
+        // actual bug report: a tight distance check to the start only
+        // ever matched for an instant right as the loop wrapped.
+        run(&mut d, 10_000);
+        assert!((d.pos - SR as f64).abs() > 1.0, "well past the loop's start point");
+        assert!(d.memory_at_pos().is_some(), "still finds it — pos is inside the loop");
+        assert!(d.delete_memory());
+        assert!(d.memories.is_empty());
     }
 
     #[test]

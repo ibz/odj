@@ -150,8 +150,8 @@ along their bottom edge, as does the output picker at start.
 | `1 2 3 held in slip` | Play the hot cue while held, then back to where the track would be |
 | `E` | Hot cue REC / PLAY mode |
 | `Shift+1 2 3` | Clear hot cue (REC mode only) |
-| `W / J / K / X` | Memory: store cue or loop / call previous / call next / delete |
-| `Shift+J` | Back to the start of the memory region you're in |
+| `W / J / K / X` | Memory: store cue or loop / jump to the nearest one left / right / delete |
+| `X X on a loop memory` | A loop needs a second X within 2s to confirm the delete |
 | `T` | Elapsed / remaining time |
 | `Shift+T` | Auto Cue on/off |
 

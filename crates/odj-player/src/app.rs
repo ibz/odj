@@ -9,7 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use odj_core::library::{Browser, siblings};
 use odj_core::link;
-use odj_core::memory::Memory;
+use odj_core::memory::{Memory, TrackMemory};
 use odj_core::track::Track;
 use odj_core::tui::Help;
 
@@ -40,6 +40,9 @@ impl VideoView {
 /// Without key-release events a hold lasts this long after the last key event.
 const HOLD_FALLBACK: Duration = Duration::from_millis(500);
 const STATUS_TIME: Duration = Duration::from_secs(4);
+/// How long a first `X` on a loop memory stays armed, waiting for a second
+/// one to confirm the delete.
+const MEMORY_DELETE_CONFIRM: Duration = Duration::from_secs(2);
 const BEND: f64 = 3.0;
 const BEND_STRONG: f64 = 12.0;
 const SEARCH: f64 = 4.0;
@@ -134,6 +137,9 @@ pub struct App {
     pub deck: Arc<Mutex<Deck>>,
     pub browser: Browser,
     memory: Memory,
+    /// The loaded track's cue memory as it was on disk when loaded — see
+    /// `remember`.
+    memory_baseline: TrackMemory,
     loading: Option<(PathBuf, mpsc::Receiver<anyhow::Result<Track>>)>,
     status: Option<(String, Instant)>,
     pub help: Help,
@@ -158,6 +164,10 @@ pub struct App {
     roll: Option<Hold>,
     /// Recent taps, with the playhead at each while playing forward.
     taps: Vec<(Instant, Option<f64>)>,
+    /// Set by a first `X` on a loop memory; a second one within
+    /// `MEMORY_DELETE_CONFIRM` deletes it, so one stray press can't lose a
+    /// promoted loop the way it can a plain cue.
+    pending_memory_delete: Option<Instant>,
     pub quit: bool,
     pub video: Option<VideoView>,
 }
@@ -181,6 +191,7 @@ impl App {
             deck,
             browser,
             memory,
+            memory_baseline: TrackMemory::default(),
             loading: None,
             status: None,
             help: Help::default(),
@@ -197,6 +208,7 @@ impl App {
             search_fwd: None,
             roll: None,
             taps: Vec::new(),
+            pending_memory_delete: None,
             quit: false,
             video: None,
         }
@@ -399,14 +411,17 @@ impl App {
         self.loading = Some((path, rx));
     }
 
-    /// Stores the loaded track's cues so they come back next time.
+    /// Stores the loaded track's cues so they come back next time. Merges
+    /// with whatever's on disk rather than overwriting it outright, so
+    /// another odj instance with the same track open doesn't have its own
+    /// saved changes silently discarded — see `Memory::save_track_merged`.
     pub fn remember(&mut self) {
         let (track, mem) = {
             let deck = self.deck();
             let Some(track) = deck.track.as_ref() else { return };
             (track.clone(), deck.memory())
         };
-        if let Err(e) = self.memory.save_track(&track, &mem) {
+        if let Err(e) = self.memory.save_track_merged(&track, &self.memory_baseline, &mem) {
             self.set_status(format!("Could not save cue memory: {e}"));
         }
     }
@@ -424,6 +439,10 @@ impl App {
             Ok(track) => {
                 self.remember();
                 let mem = self.memory.get(&track);
+                // This track's on-disk state at the moment of loading —
+                // `remember()` diffs against it to merge rather than
+                // overwrite; see `Memory::save_track_merged`.
+                self.memory_baseline = mem.clone();
                 let msg = match track.bpm() {
                     Some(bpm) => format!("Loaded {} ({bpm:.1} BPM)", track.title),
                     None => format!("Loaded {} (no BPM found)", track.title),
@@ -661,9 +680,48 @@ impl App {
         }
     }
 
+    /// `X`: deletes the memory at the current position — works whether you
+    /// got there by playing, scrubbing, or calling the memory itself
+    /// (which only moves `cue` while paused; `pos` always moves). A plain
+    /// cue goes immediately, as before; a loop needs a second `X` within
+    /// `MEMORY_DELETE_CONFIRM` to confirm, since losing a promoted loop is
+    /// pricier than losing a bare cue point.
+    fn delete_memory_key(&mut self) {
+        let candidate = self.deck().memory_at_pos();
+        match candidate {
+            None => {
+                self.pending_memory_delete = None;
+                self.set_status("No memory here");
+            }
+            Some(cue) if cue.loop_out.is_none() => {
+                self.pending_memory_delete = None;
+                self.deck().delete_memory();
+                self.remember();
+                self.set_status("Memory deleted");
+            }
+            Some(_) => {
+                let armed = self.pending_memory_delete.is_some_and(|at| at.elapsed() < MEMORY_DELETE_CONFIRM);
+                if armed {
+                    self.pending_memory_delete = None;
+                    self.deck().delete_memory();
+                    self.remember();
+                    self.set_status("Loop memory deleted");
+                } else {
+                    self.pending_memory_delete = Some(Instant::now());
+                    self.set_status("Press X again to delete this loop memory");
+                }
+            }
+        }
+    }
+
     fn deck_key(&mut self, code: KeyCode, shift: bool, repeat: bool) {
         // Keys that toggle or trigger ignore auto-repeat; steppers accept it.
         let once = !repeat;
+        // Anything other than a confirming second `X` drops the arm, so it
+        // can't go off later from an unrelated press.
+        if code != KeyCode::Char('x') {
+            self.pending_memory_delete = None;
+        }
         // Over the deck, the help takes the keys that turn and scroll it.
         if self.help.is_open() && self.help.key(code, shift, crate::ui::HELP.len()) {
             return;
@@ -705,9 +763,11 @@ impl App {
                     }
                 } else if shift {
                     self.deck().clear_hot_cue(i);
+                    self.remember();
                     self.set_status(format!("Hot cue {letter} cleared"));
                 } else {
                     self.deck().set_hot_cue(i);
+                    self.remember();
                     self.set_status(format!("Hot cue {letter} stored"));
                 }
             }
@@ -718,28 +778,24 @@ impl App {
 
             KeyCode::Char('w') if once => {
                 let stored = self.deck().store_memory();
+                if stored.is_some() {
+                    self.remember();
+                }
                 match stored {
                     Some(n) => self.set_status(format!("Memory {n} stored")),
                     None => self.set_status("Already in memory"),
                 }
             }
             KeyCode::Char(c @ ('j' | 'k')) if once => {
-                let which = match (c, shift) {
-                    ('j', false) => MemoryCall::Previous,
-                    ('j', true) => MemoryCall::Current,
-                    _ => MemoryCall::Next,
-                };
+                let which = if c == 'j' { MemoryCall::Left } else { MemoryCall::Right };
                 let called = self.deck().call_memory(which);
                 match called {
                     Some(n) => self.set_status(format!("Memory {n} called")),
-                    None if which == MemoryCall::Current => self.set_status("No memory point before the playhead"),
-                    None => self.set_status("No more memory points this way"),
+                    None if which == MemoryCall::Left => self.set_status("No memory point before the playhead"),
+                    None => self.set_status("No memory point after the playhead"),
                 }
             }
-            KeyCode::Char('x') if once => {
-                let deleted = self.deck().delete_memory();
-                self.set_status(if deleted { "Memory deleted" } else { "No memory at the cue point" });
-            }
+            KeyCode::Char('x') if once => self.delete_memory_key(),
             KeyCode::Char('i') if once => self.deck().loop_in(),
             KeyCode::Char('o') if once => {
                 let adjusting = {
@@ -758,6 +814,9 @@ impl App {
                     let had_loop = deck.snapshot().loop_in.is_some();
                     (deck.store_last_loop(), had_loop)
                 };
+                if stored.is_some() {
+                    self.remember();
+                }
                 match stored {
                     Some(n) => self.set_status(format!("Memory {n} stored")),
                     None if had_loop => self.set_status("Already in memory"),
@@ -975,7 +1034,6 @@ fn normalize(key: &KeyEvent) -> (KeyCode, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use odj_core::memory::TrackMemory;
     use odj_core::track::test_util::click_track;
     use ratatui::crossterm::event::KeyEventState;
 
@@ -1083,6 +1141,92 @@ mod tests {
     }
 
     #[test]
+    fn w_saves_to_disk_immediately_not_just_on_track_switch_or_quit() {
+        let dir = std::env::temp_dir().join(format!("odj-save-on-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let id = "deadbeef00000000000000000000beef".to_string();
+        let mut loaded = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
+        loaded.id = id.clone();
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
+        deck.lock().unwrap().load(Arc::new(loaded), &mem, false);
+        let mut app = App::new(deck, Browser::new(dir), true, String::new(), Memory::load());
+
+        press(&mut app, KeyCode::Char('w'), false); // store a memory
+
+        // Read back with a *separate* `Memory` pointed at the same files —
+        // not this App's own in-process state — to prove it actually hit
+        // disk rather than just sitting in RAM until a later checkpoint.
+        let mut probe = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, vec![0.0; 2]);
+        probe.id = id;
+        let on_disk = Memory::load().get(&probe);
+        assert_eq!(on_disk.memories.len(), 1, "W should save immediately, not wait for a track switch or quit");
+    }
+
+    #[test]
+    fn x_deletes_a_plain_cue_immediately_no_confirmation_needed() {
+        let mut app = app();
+        app.deck().store_memory(); // a plain cue at pos 0
+        press(&mut app, KeyCode::Char('x'), false);
+        assert!(app.deck().snapshot().memories.is_empty());
+        assert!(app.pending_memory_delete.is_none());
+    }
+
+    #[test]
+    fn x_arms_a_loop_memory_and_a_second_x_confirms_it() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'), false); // also sets the cue here
+        app.deck().step_paused(75.0); // 1 s
+        press(&mut app, KeyCode::Char('o'), false);
+        app.deck().store_last_loop();
+        assert_eq!(app.deck().snapshot().memories.len(), 1);
+
+        press(&mut app, KeyCode::Char('x'), false); // first X: arms, doesn't delete
+        assert_eq!(app.deck().snapshot().memories.len(), 1, "not deleted yet");
+        assert!(app.pending_memory_delete.is_some());
+
+        press(&mut app, KeyCode::Char('x'), false); // second X: confirms
+        assert!(app.deck().snapshot().memories.is_empty());
+    }
+
+    #[test]
+    fn any_other_key_cancels_a_pending_loop_delete() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'), false);
+        app.deck().step_paused(75.0);
+        press(&mut app, KeyCode::Char('o'), false);
+        app.deck().store_last_loop();
+
+        press(&mut app, KeyCode::Char('x'), false); // arm
+        press(&mut app, KeyCode::Char(' '), false); // unrelated key: cancels the arm
+        assert!(app.pending_memory_delete.is_none());
+
+        press(&mut app, KeyCode::Char('x'), false); // only re-arms, doesn't confirm
+        assert_eq!(app.deck().snapshot().memories.len(), 1, "still there — the earlier arm was cancelled");
+    }
+
+    #[test]
+    fn x_deletes_a_memory_you_just_jumped_to_while_playing() {
+        let mut app = app();
+        app.deck().store_memory(); // a memory at pos 0
+        app.deck().step_paused(150.0); // 2 s in, still paused
+        press(&mut app, KeyCode::Char('c'), false); // sets a new cue here, away from the memory
+        press(&mut app, KeyCode::Char(' '), false); // start playing
+
+        press(&mut app, KeyCode::Char('j'), false); // J: jump back to it, still playing
+        let s = app.deck().snapshot();
+        assert!((s.pos - 0.0).abs() < 1.0, "jumped to the memory");
+        assert!((s.cue - 2.0 * 48_000.0).abs() < 1.0, "cue stayed put — it doesn't follow a call while playing");
+
+        press(&mut app, KeyCode::Char('x'), false);
+        assert!(app.deck().snapshot().memories.is_empty(), "X finds it via pos even though cue never moved");
+    }
+
+    #[test]
     fn jog_keys_adjust_loop_out_in_adjust_mode() {
         let mut app = app();
         press(&mut app, KeyCode::Char('i'), false);
@@ -1187,7 +1331,7 @@ mod tests {
             .collect();
         for k in [
             "Space", "C", "Space while holding C", "1 2 3", "E", "Shift+1 2 3", "I / O / P", "O while looping", "L",
-            "- / =", "Shift+- / =", "; (hold)", "Z", "W / J / K / X", "Shift+J", "[ / ]", "↑ / ↓", "0 / G", "M",
+            "- / =", "Shift+- / =", "; (hold)", "Z", "W / J / K / X", "[ / ]", "↑ / ↓", "0 / G", "M",
             ", / .", "Q", "F", "Shift+F", "A", "Shift+A", "D", "Y", "← / →", "B / N", "R", "T", "Shift+T", "S / V",
             "Tab",
         ] {

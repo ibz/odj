@@ -2,8 +2,9 @@
 //!
 //! Each track gets its own file, `$XDG_DATA_HOME/odj/tracks/<id[..2]>/<id>.json`, named
 //! by the track's audio fingerprint so cues survive renames, moves and tag edits, and
-//! several odj instances only ever write the tracks they changed. Settings live in
-//! `$XDG_CONFIG_HOME/odj/settings.json`.
+//! several odj instances only ever write the tracks they changed. `save_track_merged`
+//! three-way merges against whatever's on disk, so two instances with the same track
+//! open don't clobber each other's saves. Settings live in `$XDG_CONFIG_HOME/odj/settings.json`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -61,6 +62,52 @@ pub fn user_grid(grid: Option<BeatGrid>, tapped_bpm: Option<f64>, track: &Track)
         let anchor = track.grid.map_or(track.first_sound, |g| g.anchor);
         Some(BeatGrid { bpm, anchor })
     })
+}
+
+/// Same position, for merge purposes — matches the tolerance `Deck` itself
+/// uses to recognize "the same cue" (e.g. when deduping on store).
+fn same_pos(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1.0
+}
+
+/// Three-way merge of this deck's change against whatever's on disk now.
+/// `base` is what this deck loaded before making any changes of its own;
+/// `mine` is its current state; `theirs` is the file as it stands right
+/// now, which may have been written by another odj instance since `base`
+/// was read. `hot` and `memories` are unioned/subtracted against `base` so
+/// an add or delete either side made is preserved rather than one
+/// overwriting the other; the remaining fields are single "current
+/// session" values with no sensible merge, so `mine` wins if it moved from
+/// `base`, else `theirs` is kept.
+fn merge(base: &TrackMemory, mine: &TrackMemory, theirs: &TrackMemory) -> TrackMemory {
+    fn scalar<T: PartialEq>(base: T, mine: T, theirs: T) -> T {
+        if mine != base { mine } else { theirs }
+    }
+    TrackMemory {
+        hot: std::array::from_fn(|i| scalar(base.hot[i], mine.hot[i], theirs.hot[i])),
+        memories: merge_cues(&base.memories, &mine.memories, &theirs.memories),
+        loop_in: scalar(base.loop_in, mine.loop_in, theirs.loop_in),
+        loop_out: scalar(base.loop_out, mine.loop_out, theirs.loop_out),
+        grid: scalar(base.grid, mine.grid, theirs.grid),
+        bpm: scalar(base.bpm, mine.bpm, theirs.bpm),
+        quantize: scalar(base.quantize, mine.quantize, theirs.quantize),
+    }
+}
+
+/// Applies this deck's additions and deletions (`mine` vs. `base`) onto
+/// `theirs`, so a concurrent change on the other side survives too.
+fn merge_cues(base: &[Cue], mine: &[Cue], theirs: &[Cue]) -> Vec<Cue> {
+    let added = mine.iter().filter(|m| !base.iter().any(|b| same_pos(b.pos, m.pos)));
+    let removed: Vec<&Cue> = base.iter().filter(|b| !mine.iter().any(|m| same_pos(m.pos, b.pos))).collect();
+    let mut merged: Vec<Cue> =
+        theirs.iter().filter(|t| !removed.iter().any(|r| same_pos(r.pos, t.pos))).copied().collect();
+    for a in added {
+        if !merged.iter().any(|m| same_pos(m.pos, a.pos)) {
+            merged.push(*a);
+        }
+    }
+    merged.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+    merged
 }
 
 /// A track's entry in the library, as its file stores it.
@@ -254,6 +301,26 @@ impl Memory {
         write_json(&file, &TrackFile::new(track, mem))
     }
 
+    /// Like `save_track`, but merges with whatever's on disk right now
+    /// instead of overwriting it outright — so a second odj instance with
+    /// the same track loaded, which saved its own changes in the
+    /// meantime, doesn't have them silently discarded. `base` is this
+    /// deck's own memory as it was when loaded (before any of *its*
+    /// changes); see `merge`.
+    pub fn save_track_merged(&self, track: &Track, base: &TrackMemory, mine: &TrackMemory) -> std::io::Result<()> {
+        if track.id.is_empty() {
+            return Ok(());
+        }
+        let file = self.track_file(&track.id);
+        let theirs = read_json::<TrackFile>(&file).map(|f| f.memory()).unwrap_or_default();
+        let merged = merge(base, mine, &theirs);
+        if merged.is_empty() && !file.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(file.parent().expect("track files live in a shard folder"))?;
+        write_json(&file, &TrackFile::new(track, &merged))
+    }
+
     pub fn save_settings(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.config_dir)?;
         write_json(&self.config_dir.join("settings.json"), &self.settings)
@@ -331,6 +398,52 @@ mod tests {
         m.save_track(&t, &sample()).unwrap();
         assert!(m.tracks_dir.join("ab/abcdef0123456789abcdef0123456789.json").exists());
         assert_eq!(m.get(&t), sample());
+    }
+
+    #[test]
+    fn concurrent_decks_merge_instead_of_clobbering() {
+        let mut m = memory("concurrent");
+        let t = track("ab00000000000000000000000000ab00", "/music/b.flac");
+
+        // The shared starting point both decks loaded.
+        let base = sample();
+        m.save_track(&t, &base).unwrap();
+
+        // Deck A adds a memory point, based on what it loaded.
+        let mut a = base.clone();
+        a.memories.push(Cue { pos: 500.0, loop_out: None });
+        m.save_track_merged(&t, &base, &a).unwrap();
+
+        // Deck B, independently based on the same original load, clears a
+        // hot cue — and saves *after* A, which would clobber A's addition
+        // outright with a plain overwrite.
+        let mut b = base.clone();
+        b.hot[0] = None;
+        m.save_track_merged(&t, &base, &b).unwrap();
+
+        let result = m.get(&t);
+        assert!(result.memories.iter().any(|c| c.pos == 500.0), "A's addition survived B's later save");
+        assert_eq!(result.hot[0], None, "B's deletion also survived");
+        assert_eq!(result.hot[2], base.hot[2], "untouched fields keep their value");
+    }
+
+    #[test]
+    fn scalar_fields_dont_get_stomped_by_a_save_that_never_touched_them() {
+        let mut m = memory("scalar-conflict");
+        let t = track("cd00000000000000000000000000cd00", "/music/c.flac");
+        let base = sample();
+        m.save_track(&t, &base).unwrap();
+
+        let mut a = base.clone();
+        a.quantize = Some(true);
+        m.save_track_merged(&t, &base, &a).unwrap();
+
+        // B saves after A, but never changed quantize itself (still equal
+        // to base) — its save shouldn't carry the old value back over A's.
+        let b = base.clone();
+        m.save_track_merged(&t, &base, &b).unwrap();
+
+        assert_eq!(m.get(&t).quantize, Some(true), "A's real change outlives B's unrelated save");
     }
 
     #[test]

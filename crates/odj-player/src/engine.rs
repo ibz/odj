@@ -988,8 +988,11 @@ impl Deck {
     }
 
     /// Halves (0.5) or doubles (2.0) the roll held down or the running loop,
-    /// else the next beatloop. The loop size follows.
-    pub fn resize_loop(&mut self, factor: f64) {
+    /// else the next beatloop. The loop size follows. `from_left` extends
+    /// or shrinks from the in point (keeping the out point fixed) instead
+    /// of the usual the other way around — meaningless for a roll or the
+    /// next beatloop's size, since neither has an in/out point yet.
+    pub fn resize_loop(&mut self, factor: f64, from_left: bool) {
         if let Some(r) = self.roll {
             self.loop_size = (r.beats * factor).clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
             self.roll_down(self.loop_size);
@@ -999,7 +1002,11 @@ impl Deck {
             self.loop_size = (self.loop_size * factor).clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
             return;
         }
-        self.scale_loop(factor);
+        if from_left {
+            self.scale_loop_left(factor);
+        } else {
+            self.scale_loop(factor);
+        }
         // A loop of a power-of-two beats becomes the size of the next one.
         if let Some(beats) = self.loop_beats() {
             let p = beats.log2().round();
@@ -1044,6 +1051,22 @@ impl Deck {
         self.loop_out = Some(start + len);
         if self.looping && self.pos >= start + len {
             self.jump(start + (self.pos - start) % len);
+        }
+    }
+
+    /// Like `scale_loop`, but keeps the out point fixed and moves the in
+    /// point instead — extends or shrinks the loop to the left rather than
+    /// the right.
+    pub fn scale_loop_left(&mut self, factor: f64) {
+        let (Some(start), Some(end)) = (self.loop_in, self.loop_out) else { return };
+        let len = ((end - start) * factor).max(self.sample_rate() * 0.01);
+        let new_start = end - len;
+        if new_start < 0.0 {
+            return;
+        }
+        self.loop_in = Some(new_start);
+        if self.looping && self.pos < new_start {
+            self.jump(end - (end - self.pos) % len);
         }
     }
 
@@ -1772,11 +1795,11 @@ mod tests {
     #[test]
     fn beat_loop_sizes_and_toggle() {
         let mut d = deck_with(Some(true));
-        d.resize_loop(0.5);
-        d.resize_loop(0.5);
-        d.resize_loop(0.5);
+        d.resize_loop(0.5, false);
+        d.resize_loop(0.5, false);
+        d.resize_loop(0.5, false);
         assert_eq!(d.loop_size, 0.5);
-        d.resize_loop(0.5);
+        d.resize_loop(0.5, false);
         d.step_paused(41.0); // between steps of a quarter beat
         assert!(d.beat_loop());
         assert!(d.looping);
@@ -1784,14 +1807,52 @@ mod tests {
         let steps = (d.loop_in.unwrap() - beat(0.0)) / 6_000.0;
         assert!((steps - steps.round()).abs() < 1e-6, "on a quarter beat: {steps}");
         // While looping, [ ] change the loop and the size follows.
-        d.resize_loop(2.0);
+        d.resize_loop(2.0, false);
         assert_eq!((d.loop_size, d.loop_beats().map(|b| (b * 1e6).round() / 1e6)), (0.5, Some(0.5)));
         assert!(d.beat_loop());
         assert!(!d.looping, "L again leaves the loop");
         for _ in 0..12 {
-            d.resize_loop(2.0);
+            d.resize_loop(2.0, false);
         }
         assert_eq!(d.loop_size, MAX_LOOP_BEATS);
+    }
+
+    #[test]
+    fn resize_loop_left_keeps_the_out_point_and_moves_the_in_point() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, SR as usize); // 1 s
+        d.loop_in();
+        run(&mut d, 24_000); // +0.5 s
+        d.loop_out();
+        let (start, end) = (d.loop_in.unwrap(), d.loop_out.unwrap());
+        let len = end - start;
+
+        // Double from the left: the out point stays, the in point moves
+        // earlier by the loop's length — the mirror of plain `[`/`]`,
+        // which always keeps the in point fixed instead.
+        d.resize_loop(2.0, true);
+        assert_eq!(d.loop_out, Some(end), "the out point doesn't move");
+        assert_eq!(d.loop_in, Some(start - len));
+
+        // Halve from the left: back toward the out point, still anchored there.
+        d.resize_loop(0.5, true);
+        assert_eq!(d.loop_out, Some(end));
+        assert!((d.loop_in.unwrap() - start).abs() < 1.0);
+    }
+
+    #[test]
+    fn resize_loop_left_wont_extend_past_the_start_of_the_track() {
+        let mut d = deck();
+        d.play_pause();
+        run(&mut d, 12_000);
+        d.loop_in();
+        run(&mut d, 6_000);
+        d.loop_out();
+        for _ in 0..20 {
+            d.resize_loop(2.0, true);
+        }
+        assert!(d.loop_in.unwrap() >= 0.0);
     }
 
     #[test]
@@ -1861,7 +1922,7 @@ mod tests {
         run(&mut d, 24_000);
         assert!(d.pos >= 24_000.0 && d.pos < 36_000.0);
         // Halving while rolling keeps the one ghost, and sets the loop size.
-        d.resize_loop(0.5);
+        d.resize_loop(0.5, false);
         assert_eq!((d.snapshot().roll, d.loop_size), (Some(0.25), 0.25));
         assert!((d.loop_beats().unwrap() - 0.25).abs() < 1e-9);
         d.roll_up();

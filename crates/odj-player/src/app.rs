@@ -770,7 +770,7 @@ impl App {
                 }
             }
             KeyCode::Char(c @ ('[' | ']')) => {
-                self.deck().resize_loop(if c == '[' { 0.5 } else { 2.0 });
+                self.deck().resize_loop(if c == '[' { 0.5 } else { 2.0 }, shift);
                 self.save_sizes();
             }
             KeyCode::Char(c @ ('-' | '=')) if shift => {
@@ -1062,6 +1062,24 @@ mod tests {
         assert_eq!(app.deck().search, -SUPER_SEARCH);
         key(&mut app, KeyCode::Left, true, KeyEventKind::Release);
         assert_eq!(app.deck().search, 0.0);
+    }
+
+    #[test]
+    fn shift_bracket_resizes_the_loop_from_the_left() {
+        let mut app = app();
+        app.deck().step_paused(150.0); // 2 s in, so there's room to extend left
+        press(&mut app, KeyCode::Char('i'), false);
+        app.deck().step_paused(75.0); // +1 s
+        press(&mut app, KeyCode::Char('o'), false);
+        let (start, end) = {
+            let s = app.deck().snapshot();
+            (s.loop_in.unwrap(), s.loop_out.unwrap())
+        };
+
+        press(&mut app, KeyCode::Char(']'), true); // Shift+]: double from the left
+        let s = app.deck().snapshot();
+        assert_eq!(s.loop_out, Some(end), "the out point doesn't move");
+        assert_eq!(s.loop_in, Some(start - (end - start)));
     }
 
     #[test]

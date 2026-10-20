@@ -165,6 +165,7 @@ along their bottom edge, as does the output picker at start.
 | `L` | Beat loop of the loop size / exit the loop |
 | `Shift+L` | Promote the last loop (set by I/O/L, in or out of it) to a memory |
 | `[ / ]` | Halve / double the roll or loop, else the next beat loop's size |
+| `Shift+[ / ]` | Same, but from the in point: extends or shrinks the loop to the left |
 | `; (hold)` | Loop roll of the loop size, [ / ] change it; back to where the track would be |
 | `- / =` | Beatjump back / forward (moves the loop while looping) |
 | `Shift+- / =` | Beatjump size 1 … 64 beats |

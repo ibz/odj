@@ -1,0 +1,14 @@
+Embedded default kit for odj-sampler
+
+Kick, snare, closed/open hi-hat, tom 1/2, crash, clap — a small subset of
+the Acoustic starter kit, bundled into the binary so odj-sampler has
+something to play on first run with no network needed.
+
+Source: Versilian Community Sample Library (VCSL) by Sam Gossner
+https://github.com/sgossner/VCSL
+
+License: CC0 1.0 Universal (public domain dedication). No attribution is
+legally required; it's given here anyway as a thank-you.
+
+Each file is a single hit trimmed from a VCSL multisample, downmixed to
+mono and resampled to 22.05kHz to keep the binary small.

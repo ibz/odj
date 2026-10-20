@@ -5,6 +5,7 @@ mod engine;
 mod kit;
 mod loader;
 mod midi;
+mod starter_kit;
 mod ui;
 
 use std::sync::{Arc, Mutex};
@@ -24,8 +25,10 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
         println!(
             "usage: odj-sampler\n\nPlays the cues stored by odj-player from 16 pads. Press ? inside for keys.\n\
-             The kit is kept in {}. Optionally triggered by MIDI Note On/Off too, picked at\n\
-             startup; the port and each pad's note are kept in {}.",
+             The kit is kept in {}; on first run (no kit yet) you're offered a starter kit\n\
+             to download or the one built in, or you can skip and build your own. Optionally\n\
+             triggered by MIDI Note On/Off too, picked at startup; the port and each pad's\n\
+             note are kept in {}.",
             Kit::file().display(),
             midi::MidiConfig::file().display()
         );
@@ -75,6 +78,13 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         }
         None => None,
     };
+
+    let kit_file = Kit::file();
+    if !kit_file.exists()
+        && let Some(kit) = starter_kit::pick_starter_kit(terminal)?
+    {
+        let _ = kit.save(&kit_file);
+    }
 
     let name =
         format!("{} · {} Hz{}", output.name, output.sample_rate(), if midi_conn.is_some() { " · MIDI" } else { "" });

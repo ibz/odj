@@ -14,6 +14,8 @@ anyhow.workspace = true
 midir = "0.11"
 ratatui.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+ureq = "3"
 
 [dev-dependencies]
 odj-core = { workspace = true, features = ["test-util"] }

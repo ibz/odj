@@ -112,6 +112,13 @@ pad, the trimmed end and the pad settings) is saved as you go to
 `~/.local/share/odj/kit.json`, and the pads are cut from the files again at the
 next start. A pad whose file has moved or changed shows so.
 
+On first run, with no kit yet, you're offered a starter kit: a small one
+built into the binary (works offline, no setup), a fuller kit downloaded
+from the companion [odj-kits](https://github.com/ibz/odj-kits) repo
+(currently Acoustic and Latin percussion, both CC0), or skip and build your
+own kit from your cues as above. The pick only happens once — once
+`kit.json` exists (even empty), odj-sampler never asks again.
+
 Pads can also be triggered over MIDI — Note On/Off from an external
 sequencer (hardware or software) works exactly like a key press, including
 one-shot/gate/toggle behaviour. At startup, if any MIDI input is available,

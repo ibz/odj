@@ -112,6 +112,15 @@ pad, the trimmed end and the pad settings) is saved as you go to
 `~/.local/share/odj/kit.json`, and the pads are cut from the files again at the
 next start. A pad whose file has moved or changed shows so.
 
+Pads can also be triggered over MIDI — Note On/Off from an external
+sequencer (hardware or software) works exactly like a key press, including
+one-shot/gate/toggle behaviour. At startup, if any MIDI input is available,
+you're asked which one to use (or none). The first time you pick a given
+device, you're walked through pressing each of the 16 pads in order so its
+notes are learned rather than assumed (controllers don't agree on how they
+number pads); after that it's remembered. The chosen port and each device's
+learned notes are kept in `~/.local/share/odj/midi.json`.
+
 ## Keys
 
 Press `?` in either app for these keys, on the same pages as here: `Tab` and

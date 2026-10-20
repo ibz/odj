@@ -28,10 +28,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let memory = Memory::load();
+    // No folder named on the command line, and more than one saved to
+    // choose from: let the user pick instead of silently guessing one.
+    let mut pick_music_dir = false;
     let (dir, file) = match arg {
         Some(p) if p.is_file() => (p.parent().map(PathBuf::from).unwrap_or_default(), Some(p)),
         Some(p) => (p, None),
-        None => (default_music_dir(&memory), None),
+        None => {
+            pick_music_dir = memory.settings.music_dirs.len() > 1;
+            (default_music_dir(&memory), None)
+        }
     };
     let dir = dir.canonicalize().unwrap_or(dir);
 
@@ -42,7 +48,7 @@ fn main() -> Result<()> {
     }
 
     let (mut terminal, key_release) = tui::init();
-    let result = start(&mut terminal, browser, file, key_release, memory);
+    let result = start(&mut terminal, browser, file, key_release, memory, pick_music_dir);
     tui::restore(key_release);
     result
 }
@@ -69,6 +75,7 @@ fn start(
     file: Option<PathBuf>,
     key_release: bool,
     memory: Memory,
+    pick_music_dir: bool,
 ) -> Result<()> {
     let host = audio::host();
     let Some(output) = tui::pick_output(terminal, &host)? else {
@@ -94,6 +101,10 @@ fn start(
         // Nothing configured yet: straight to "my music folders" instead of
         // a browser that has nowhere useful to call home.
         _ if app.music_dirs().is_empty() => app.settings_screen.open_to_music_dirs(),
+        // Several saved folders and no folder named on the command line:
+        // let the user pick instead of opening whichever one happened to
+        // be saved first.
+        _ if pick_music_dir => app.settings_screen.open_to_switch(0),
         _ => app.browser.open = true,
     }
     let result = run(terminal, &mut app, &output.errors);

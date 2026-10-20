@@ -117,6 +117,17 @@ impl SettingsScreen {
         self.onboarding = true;
     }
 
+    /// Opens the non-editable quick switcher, folder `i` selected — for
+    /// picking among several saved folders without being able to add or
+    /// remove any.
+    pub fn open_to_switch(&mut self, i: usize) {
+        self.open = true;
+        self.row = 1;
+        self.folder = Some(i);
+        self.editable = false;
+        self.onboarding = false;
+    }
+
     /// Esc: out of the folder list first, else closes. The quick switcher
     /// has no row list to step back to, so it always closes outright.
     fn back(&mut self) {
@@ -337,10 +348,7 @@ impl App {
         match at {
             Some(i) => {
                 self.browser.close();
-                self.settings_screen.open = true;
-                self.settings_screen.row = 1;
-                self.settings_screen.folder = Some(i);
-                self.settings_screen.editable = false;
+                self.settings_screen.open_to_switch(i);
             }
             None => self.browser.parent(),
         }
@@ -1448,6 +1456,25 @@ mod tests {
         press_ctrl(&mut app, KeyCode::Char('u'));
         assert_eq!(app.music_dirs(), [dir]);
         assert!(!app.settings_screen.is_open(), "picking a folder concludes setup");
+    }
+
+    #[test]
+    fn open_to_switch_picks_among_folders_without_editing_them() {
+        let mut app = app();
+        let dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        app.memory.settings.music_dirs = dirs.clone();
+        app.settings_screen.open_to_switch(1);
+        assert!(app.settings_screen.is_open());
+        assert!(!app.settings_screen.editable(), "a quick pick, not the real settings screen");
+        assert!(!app.settings_screen.onboarding());
+        assert_eq!(app.settings_screen.folder(), Some(1));
+
+        // X does nothing here — it's not editable — only Enter jumps.
+        press(&mut app, KeyCode::Char('x'), false);
+        assert_eq!(app.music_dirs(), dirs, "nothing removed");
+        press(&mut app, KeyCode::Enter, false);
+        assert!(!app.settings_screen.is_open());
+        assert!(app.browser.open);
     }
 
     #[test]

@@ -13,9 +13,10 @@ cargo run --release -p odj-sampler                # 16 pads of stored cues
 ```
 
 The first run (or whenever no music folder is set yet) asks you to pick one
-and remembers it; passing a folder on the command line just browses there
-for that session, without changing what's remembered. Manage saved folders
-any time from Settings (`` ` ``).
+and remembers it; with more than one saved, it asks which to open instead of
+guessing. Passing a folder on the command line just browses there for that
+session, without changing what's remembered. Manage saved folders any time
+from Settings (`` ` ``).
 
 Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
 needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF.

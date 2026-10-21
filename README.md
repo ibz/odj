@@ -9,6 +9,7 @@ Keyboard-driven DJ tools for the Linux terminal:
 cargo run --release -p odj-player                 # first run: pick & remember a music folder
 cargo run --release -p odj-player -- ~/Music      # or browse this folder just this once
 cargo run --release -p odj-player -- track.mp3    # load a track straight away
+cargo run --release -p odj-player -- --deck 2     # forces deck 2 (defaults to whichever's free, usually 1)
 cargo run --release -p odj-sampler                # 16 pads of stored cues
 ```
 
@@ -27,6 +28,18 @@ output, or one side of it in mono. HDMI outputs are not listed. Audio goes
 through PipeWire, so you can run one odj-player per output, e.g. two decks on
 the two line outs of an interface. Without PipeWire, odj-player opens the card
 directly and holds it while it runs.
+
+Each running odj-player claims a deck number — shown as "DECK n" in the
+header — defaulting to the first one free (1, unless another instance is
+already running); pass `--deck 1`/`--deck 2` to force a specific one, e.g.
+to start deck 2 before deck 1. That number is also what disambiguates the
+Mixer's MIDI knobs (`M`: volume + 3-band EQ) — 4 per deck (Volume, Low,
+Mid, High) — when a MIDI input is available: at startup you're asked which
+one to use (or none), then, the first time, walked through turning each of
+the 4 knobs in order so their CCs are learned rather than assumed. One
+controller's 8 knobs can serve both decks, since each learns and remembers
+only its own half — kept, along with the chosen port, in the settings file
+shared with odj-sampler (`~/.config/odj/settings.json`).
 
 Use a terminal with the kitty keyboard protocol (Ghostty, kitty, foot,
 Alacritty, WezTerm) and run it outside tmux. Hold-to-preview cue, jog nudges
@@ -122,8 +135,8 @@ the memory panel show how much memory the pads take.
 properties, and the samples themselves — each its own self-contained
 folder under `~/.local/share/odj/kits/<name>/` (a `kit.json` plus its
 `samples/`). Press `K` any time to switch kits or create a new, empty one;
-odj-sampler remembers the last one used (in `~/.local/share/odj/settings.json`)
-and loads it directly next time. On first run, with no kit yet, the same
+odj-sampler remembers the last one used (in the settings file shared with
+odj-player, `~/.config/odj/settings.json`) and loads it directly next time. On first run, with no kit yet, the same
 browser offers "Acoustic (Embedded)", a small kit built into the binary
 (works offline, no setup) — picking it doesn't create a kit folder either,
 until it's actually changed, same as above — fuller kits downloaded from
@@ -141,7 +154,7 @@ you're asked which one to use (or none). The first time you pick a given
 device, you're walked through pressing each of the 16 pads in order so its
 notes are learned rather than assumed (controllers don't agree on how they
 number pads); after that it's remembered. The chosen port and each device's
-learned notes are kept in `~/.local/share/odj/midi.json`.
+learned notes are kept in the same shared settings file.
 
 ## Keys
 

@@ -1657,6 +1657,26 @@ mod tests {
     }
 
     #[test]
+    fn mixer_strip_shows_the_current_values_without_opening_the_overlay() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        press(&mut app, KeyCode::Left, false); // Volume: 95%
+        press(&mut app, KeyCode::Esc, false); // back to the normal screen
+        assert!(!app.mixer.is_open());
+
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let text = t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+
+        assert!(text.contains("High") && text.contains("Mid") && text.contains("Low") && text.contains("Vol"));
+        assert!(text.contains("95%"), "the strip reflects the change made before closing the overlay");
+    }
+
+    #[test]
     fn h_toggles_master_tempo() {
         let mut app = app();
         press(&mut app, KeyCode::Char('h'), false);

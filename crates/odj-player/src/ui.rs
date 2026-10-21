@@ -48,6 +48,8 @@ const ZOOM_SPAN: f64 = 8.0;
 /// it's pointless, and the waveform always keeps at least this much room.
 const MIN_VIDEO_COLS: u16 = 24;
 const MIN_WAVE_COLS: u16 = 30;
+/// Wide enough for "High -26.0 dB", the longest row the Mixer strip shows.
+const MIXER_STRIP_COLS: u16 = 14;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     // The status rows wrap inside their box, which grows to fit them.
@@ -73,6 +75,13 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     let overview_inner = overview_block.inner(overview);
     f.render_widget(zoom_block, zoom);
     f.render_widget(overview_block, overview);
+    // A thin strip at the right, always on screen, so the Mixer's current
+    // values (set from the keyboard overlay or MIDI knobs) are visible
+    // without opening it — carved off first, so it's to the right of the
+    // waveform whether or not a video is also showing to its left.
+    let [zoom_main, mixer_strip] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(MIXER_STRIP_COLS)]).areas(zoom_inner);
+    draw_mixer_strip(f, mixer_strip, s);
     if let Some(track) = &s.track {
         let now = s.pos / track.sample_rate as f64;
         let wave_inner = match app.video.as_ref().and_then(|v| v.frame.as_ref()) {
@@ -81,15 +90,15 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
                 // video's own aspect ratio (`video::ASPECT`) then fills it
                 // top-to-bottom instead of being letterboxed down to fit a
                 // mismatched box.
-                let ideal = (zoom_inner.height as f64 * video::ASPECT).round() as u16;
-                let max_video_cols = zoom_inner.width.saturating_sub(MIN_WAVE_COLS).max(MIN_VIDEO_COLS);
+                let ideal = (zoom_main.height as f64 * video::ASPECT).round() as u16;
+                let max_video_cols = zoom_main.width.saturating_sub(MIN_WAVE_COLS).max(MIN_VIDEO_COLS);
                 let video_cols = ideal.clamp(MIN_VIDEO_COLS, max_video_cols);
                 let [video_area, wave_area] =
-                    Layout::horizontal([Constraint::Length(video_cols), Constraint::Fill(1)]).areas(zoom_inner);
+                    Layout::horizontal([Constraint::Length(video_cols), Constraint::Fill(1)]).areas(zoom_main);
                 draw_video(f, video_area, frame);
                 wave_area
             }
-            None => zoom_inner,
+            None => zoom_main,
         };
         f.render_widget(
             Wave { track, s, start: now - ZOOM_SPAN / 2.0, end: now + ZOOM_SPAN / 2.0, dim_played: false, beats: s.show_grid, lanes: true },
@@ -101,9 +110,9 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         );
     } else if let Some(name) = app.loading() {
         let msg = format!("Loading {name}…");
-        f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).fg(DIM), zoom_inner);
+        f.render_widget(Paragraph::new(msg).alignment(Alignment::Center).fg(DIM), zoom_main);
     } else {
-        draw_no_track(f, zoom_inner);
+        draw_no_track(f, zoom_main);
     }
 
     draw_info(f, info, app, s);
@@ -672,6 +681,22 @@ fn draw_settings(f: &mut Frame, app: &App) {
 /// `0.0` as plain `"0.0 dB"` rather than `"+0.0 dB"`.
 fn db_label(db: f32) -> String {
     if db == 0.0 { "0.0 dB".to_string() } else { format!("{db:+.1} dB") }
+}
+
+/// A thin, always-on read-out of the Mixer's current values (High, Mid,
+/// Low, Vol) at the right of the waveform — unlike `draw_mixer`'s overlay,
+/// this needs no key to open, so it's still visible while turning MIDI
+/// knobs or just glancing at where the keyboard overlay left things.
+fn draw_mixer_strip(f: &mut Frame, area: Rect, s: &Snapshot) {
+    let rows = [
+        ("High", db_label(s.high_db)),
+        ("Mid ", db_label(s.mid_db)),
+        ("Low ", db_label(s.low_db)),
+        ("Vol ", format!("{:.0}%", s.volume * 100.0)),
+    ];
+    let lines: Vec<Line> =
+        rows.into_iter().map(|(label, value)| Line::from(vec![Span::styled(format!("{label} "), Style::new().fg(DIM)), Span::raw(value)])).collect();
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// The Mixer overlay: volume and the 3-band EQ, live performance controls

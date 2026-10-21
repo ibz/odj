@@ -15,20 +15,29 @@ const PERIOD: Duration = Duration::from_millis(10);
 
 /// Runs while alive; dropping it leaves the other decks cleanly.
 pub struct SyncLink {
+    deck: u8,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SyncLink {
-    /// Joins the other decks.
-    pub fn start(deck: Arc<Mutex<Deck>>) -> io::Result<Self> {
-        let link = Link::open()?;
+    /// Joins the other decks. With `prefer`, claims exactly that deck
+    /// number (failing if it's already running) instead of the first free
+    /// one — see `Link::open`.
+    pub fn start(deck: Arc<Mutex<Deck>>, prefer: Option<u8>) -> io::Result<Self> {
+        let link = Link::open(prefer)?;
+        let number = link.deck;
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = thread::Builder::new()
             .name("odj-sync".into())
             .spawn(move || run(&link, &deck, &stopping))?;
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { deck: number, stop, thread: Some(thread) })
+    }
+
+    /// This deck's claimed number (1..=`link::MAX_DECKS`).
+    pub fn deck(&self) -> u8 {
+        self.deck
     }
 }
 

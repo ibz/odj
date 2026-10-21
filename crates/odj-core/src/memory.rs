@@ -152,6 +152,16 @@ pub struct Settings {
     /// odj-sampler. odj-sampler.
     #[serde(default)]
     pub midi_devices: HashMap<String, Vec<[u8; 16]>>,
+    /// Each Mixer knob's learned MIDI CC, per device, slot, and deck — `0`
+    /// for `--deck 1`, `1` for `--deck 2` (odj-player runs one process per
+    /// deck; this has nothing to do with `link::Decks`' own, unrelated
+    /// deck numbering): `midi_knobs[name][slot][deck]` is `[cc; 4]` in the
+    /// Mixer's own row order (Volume, Low, Mid, High), `None` until that
+    /// deck's half is actually learned — a bare all-zero array would be
+    /// ambiguous with "not learned yet", since the `Vec` grows one slot at
+    /// a time for both deck halves together. odj-player.
+    #[serde(default)]
+    pub midi_knobs: HashMap<String, Vec<[Option<[u8; 4]>; 2]>>,
 }
 
 impl Default for Settings {
@@ -164,6 +174,7 @@ impl Default for Settings {
             kit: None,
             midi_port_id: None,
             midi_devices: HashMap::new(),
+            midi_knobs: HashMap::new(),
         }
     }
 }

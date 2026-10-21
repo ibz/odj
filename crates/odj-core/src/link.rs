@@ -116,15 +116,19 @@ pub struct Link {
 }
 
 impl Link {
-    /// Joins the decks of this user, in `$XDG_RUNTIME_DIR/odj/decks`.
-    pub fn open() -> io::Result<Self> {
-        Self::open_in(&default_dir())
+    /// Joins the decks of this user, in `$XDG_RUNTIME_DIR/odj/decks`. With
+    /// `prefer`, claims exactly that deck number (failing if it's already
+    /// taken) instead of the first free one.
+    pub fn open(prefer: Option<u8>) -> io::Result<Self> {
+        Self::open_in(&default_dir(), prefer)
     }
 
-    /// Joins the decks in `dir`, taking the first free deck number.
-    pub fn open_in(dir: &Path) -> io::Result<Self> {
+    /// Joins the decks in `dir`, taking the first free deck number, or
+    /// exactly `prefer`'s if given.
+    pub fn open_in(dir: &Path, prefer: Option<u8>) -> io::Result<Self> {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        for deck in 1..=MAX_DECKS {
+        let range = prefer.map_or(1..=MAX_DECKS, |n| n..=n);
+        for deck in range {
             let path = dir.join(format!("deck-{deck}"));
             let socket = match UnixDatagram::bind(&path) {
                 Ok(s) => s,
@@ -142,7 +146,10 @@ impl Link {
             socket.set_nonblocking(true)?;
             return Ok(Self { socket, dir: dir.to_path_buf(), path, deck });
         }
-        Err(io::Error::other(format!("{MAX_DECKS} decks are running already")))
+        Err(io::Error::other(match prefer {
+            Some(n) => format!("deck {n} is already running"),
+            None => format!("{MAX_DECKS} decks are running already"),
+        }))
     }
 
     /// Sends `p` to every other deck, clearing away sockets nobody listens on.
@@ -294,10 +301,25 @@ mod tests {
     }
 
     #[test]
+    fn prefer_claims_an_exact_number_or_fails() {
+        let dir = temp_dir("prefer");
+        let a = Link::open_in(&dir, Some(2)).unwrap();
+        assert_eq!(a.deck, 2, "claims exactly the preferred number, not the first free one");
+
+        let Err(err) = Link::open_in(&dir, Some(2)) else { panic!("deck 2 is already taken") };
+        assert!(err.to_string().contains('2'), "names the taken number: {err}");
+
+        // A free preferred number still works alongside a taken one.
+        let b = Link::open_in(&dir, Some(1)).unwrap();
+        assert_eq!(b.deck, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn decks_find_each_other_with_their_own_numbers() {
         let dir = temp_dir("find");
-        let a = Link::open_in(&dir).unwrap();
-        let b = Link::open_in(&dir).unwrap();
+        let a = Link::open_in(&dir, None).unwrap();
+        let b = Link::open_in(&dir, None).unwrap();
         assert_eq!((a.deck, b.deck), (1, 2));
         a.send(&packet(a.deck));
         b.send(&packet(b.deck));
@@ -307,7 +329,7 @@ mod tests {
 
         // A deck that quits frees its number.
         drop(a);
-        let c = Link::open_in(&dir).unwrap();
+        let c = Link::open_in(&dir, None).unwrap();
         assert_eq!(c.deck, 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -319,7 +341,7 @@ mod tests {
         // A crash leaves the socket file behind, unbound.
         drop(UnixDatagram::bind(dir.join("deck-1")).unwrap());
         drop(UnixDatagram::bind(dir.join("deck-3")).unwrap());
-        let a = Link::open_in(&dir).unwrap();
+        let a = Link::open_in(&dir, None).unwrap();
         assert_eq!(a.deck, 1, "its number is free");
         assert!(dir.join("deck-3").exists());
         a.send(&packet(1));
@@ -331,8 +353,8 @@ mod tests {
     #[test]
     fn decks_run_out() {
         let dir = temp_dir("full");
-        let decks: Vec<Link> = (0..MAX_DECKS).map(|_| Link::open_in(&dir).unwrap()).collect();
-        assert!(Link::open_in(&dir).is_err());
+        let decks: Vec<Link> = (0..MAX_DECKS).map(|_| Link::open_in(&dir, None).unwrap()).collect();
+        assert!(Link::open_in(&dir, None).is_err());
         drop(decks);
         let _ = fs::remove_dir_all(&dir);
     }

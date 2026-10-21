@@ -2,19 +2,15 @@
 //! so an external sequencer (hardware or software) can drive odj-sampler
 //! instead of — or alongside — the keyboard. Config lives in the settings
 //! file odj-sampler shares with odj-player (see
-//! `odj_core::memory::Settings`'s `midi_port_id`/`midi_devices`).
+//! `odj_core::memory::Settings`'s `midi_port_id`/`midi_devices`). Port
+//! listing/picking and the stable device identity used to key
+//! [`MidiConfig::devices`] live in `odj_core::midi`, shared with
+//! odj-player's own MIDI knobs.
 //!
 //! Controllers don't agree on how they number their pads (confirmed on real
 //! hardware: some send a straight ascending range, others group and jump
 //! around), so each pad's note is learned from the device itself rather
-//! than assumed — see [`learn_pad_notes`] — and kept per device in
-//! [`MidiConfig::devices`], keyed by a *stable* device name rather than
-//! port id: a port id (e.g. an ALSA client:port number) is just a
-//! connection-order number that can change across a replug, where the name
-//! (once its own connection-order suffix is stripped — see
-//! [`stable_name`]) is not. Two identical controllers plugged in at once
-//! share that stable name, so each gets its own slot in that name's `Vec`
-//! instead — see [`device_slot`].
+//! than assumed — see [`learn_pad_notes`].
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -26,8 +22,8 @@ use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::Alignment;
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::style::Style;
+use ratatui::widgets::{Block, Clear, Paragraph};
 
 use odj_core::memory::{load_settings, save_settings};
 use odj_core::tui::{AMBER, centered};
@@ -39,9 +35,10 @@ pub struct MidiConfig {
     pub port_id: Option<String>,
     /// The MIDI note each pad responds to, per device: `devices[name][slot][i]`
     /// for pad `i`, where `slot` distinguishes multiple simultaneously
-    /// connected devices that report the same name (see [`device_slot`]).
-    /// Learned once per slot (see [`learn_pad_notes`]) rather than assumed,
-    /// since pad numbering varies across controllers.
+    /// connected devices that report the same name (see
+    /// `odj_core::midi::device_slot`). Learned once per slot (see
+    /// [`learn_pad_notes`]) rather than assumed, since pad numbering varies
+    /// across controllers.
     pub devices: HashMap<String, Vec<[u8; PADS]>>,
 }
 
@@ -81,42 +78,6 @@ impl MidiConfig {
 /// The pad whose entry in `pad_notes` is `note`, if any.
 pub fn note_to_pad(note: u8, pad_notes: &[u8; PADS]) -> Option<usize> {
     pad_notes.iter().position(|&n| n == note)
-}
-
-/// Available MIDI input ports as `(id, display name)` — the id is what
-/// `connect` and `MidiConfig::port_id` use; it stays valid across runs
-/// (backend-dependent), unlike a plain index into this list.
-pub fn list_ports() -> Vec<(String, String)> {
-    let Ok(input) = midir::MidiInput::new("odj-sampler") else { return Vec::new() };
-    input.ports().iter().filter_map(|p| input.port_name(p).ok().map(|name| (p.id(), name))).collect()
-}
-
-/// `port_id`'s stable name, with its connection-order suffix removed —
-/// confirmed by reading midir's ALSA backend source, `list_ports`'s display
-/// name always ends in literally " {id}" (it's appended deliberately, to
-/// keep same-named devices visually distinct in a list), so a straight
-/// `strip_suffix` recovers the name as the device itself reports it, with
-/// nothing connection-order-dependent left in it.
-fn stable_name(id: &str, name: &str) -> String {
-    name.strip_suffix(&format!(" {id}")).unwrap_or(name).to_string()
-}
-
-/// `port_id`'s stable name, and its slot: how many *other* currently
-/// connected ports share that same stable name and sort before it. Two
-/// identical controllers plugged in together get slots 0 and 1 under their
-/// shared name, so each keeps its own entry in [`MidiConfig::devices`]; a
-/// single controller keeps slot 0 across replugs even though its port id
-/// (and the raw display name's suffix) changes. `None` if `port_id` isn't
-/// currently connected.
-pub fn device_slot(port_id: &str) -> Option<(String, usize)> {
-    let ports = list_ports();
-    let name = stable_name(port_id, &ports.iter().find(|(id, _)| id == port_id)?.1);
-    let slot = ports
-        .iter()
-        .take_while(|(id, _)| id != port_id)
-        .filter(|(id, n)| stable_name(id, n) == name)
-        .count();
-    Some((name, slot))
 }
 
 /// Opens `port_id`, wiring Note On (velocity > 0) to `press` and Note Off
@@ -184,7 +145,8 @@ fn listen_notes(port_id: &str) -> Option<(midir::MidiInputConnection<()>, mpsc::
 /// whichever note each press sends — so a newly-picked device works
 /// regardless of how it numbers its pads. `Ok(None)` if the port can't be
 /// opened, or the user cancels with Esc/Ctrl+C (nothing is saved either
-/// way; the caller decides what to do, same as `pick_midi_input` skipping).
+/// way; the caller decides what to do, same as
+/// `odj_core::midi::pick_midi_input` skipping).
 pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<Option<[u8; PADS]>> {
     let Some((_conn, rx)) = listen_notes(port_id) else { return Ok(None) };
     let mut notes = [0u8; PADS];
@@ -255,47 +217,6 @@ fn draw_learn_screen(f: &mut Frame, pad: usize) {
     text.push_str(&format!("\n\npress pad {} of {}", pad + 1, PADS));
     let paragraph = Paragraph::new(text).alignment(Alignment::Center).style(Style::new().fg(AMBER)).block(block);
     f.render_widget(paragraph, area);
-}
-
-/// Lists available MIDI inputs and lets the user pick one, or skip —
-/// unlike the (mandatory) audio output picker, there's always a
-/// reasonable "no MIDI" outcome, so this returns `Ok(None)` rather than
-/// ending the program: no ports found, or the user backed out.
-pub fn pick_midi_input(terminal: &mut DefaultTerminal, config: &MidiConfig) -> Result<Option<String>> {
-    let ports = list_ports();
-    if ports.is_empty() {
-        return Ok(None);
-    }
-    let mut selected =
-        config.port_id.as_ref().and_then(|id| ports.iter().position(|(pid, _)| pid == id)).unwrap_or(0);
-    loop {
-        terminal.draw(|f| draw_midi_picker(f, &ports, selected))?;
-        let Event::Key(key) = event::read()? else { continue };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match key.code {
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(ports.len() - 1),
-            KeyCode::Enter => return Ok(Some(ports[selected].0.clone())),
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
-            KeyCode::Esc | KeyCode::Char('q' | 'Q' | 'n' | 'N') => return Ok(None),
-            _ => {}
-        }
-    }
-}
-
-fn draw_midi_picker(f: &mut Frame, ports: &[(String, String)], selected: usize) {
-    let area = centered(f.area(), 70, 50);
-    f.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" MIDI input (optional) ")
-        .title_bottom(" ↑↓ select  Enter use  Esc/N skip  Ctrl+C quit ")
-        .border_style(Style::new().fg(AMBER));
-    let items: Vec<ListItem> = ports.iter().map(|(_, name)| ListItem::new(name.as_str())).collect();
-    let list = List::new(items).block(block).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, area, &mut state);
 }
 
 #[cfg(test)]
@@ -415,6 +336,7 @@ mod tests {
     fn real_midi_note_triggers_a_pad() {
         use crate::engine::{Mode, Props, Sample};
         use midir::os::unix::VirtualOutput;
+        use odj_core::midi::list_ports;
         use std::time::{Duration, Instant};
 
         let sampler = Arc::new(Mutex::new(Sampler::new()));
@@ -449,34 +371,5 @@ mod tests {
             sampler.lock().unwrap().render(&mut buf);
         }
         assert!(!sampler.lock().unwrap().snapshot().pads[0].playing, "pad stopped after the fade-out");
-    }
-
-    #[test]
-    #[ignore = "needs a real ALSA sequencer; exercises list_ports against two virtual ports"]
-    fn device_slot_tells_identical_names_apart() {
-        use midir::os::unix::VirtualOutput;
-
-        // Two virtual ports sharing a name — including the client name,
-        // which `port_name` folds in too — standing in for two identical
-        // physical controllers plugged in at once (same make and model
-        // reports the same client and port name both times).
-        let _a = midir::MidiOutput::new("odj-sampler-test-twin")
-            .unwrap()
-            .create_virtual("odj-sampler-test-twin")
-            .unwrap();
-        let _b = midir::MidiOutput::new("odj-sampler-test-twin")
-            .unwrap()
-            .create_virtual("odj-sampler-test-twin")
-            .unwrap();
-
-        let ports = list_ports();
-        let mut twins = ports.iter().filter(|(_, name)| name.contains("odj-sampler-test-twin"));
-        let (id_a, _) = twins.next().expect("first virtual twin visible");
-        let (id_b, _) = twins.next().expect("second virtual twin visible");
-
-        let (name_a, slot_a) = device_slot(id_a).expect("a connected port resolves");
-        let (name_b, slot_b) = device_slot(id_b).expect("a connected port resolves");
-        assert_eq!(name_a, name_b, "both report the same name");
-        assert_ne!(slot_a, slot_b, "but each gets its own slot under that name");
     }
 }

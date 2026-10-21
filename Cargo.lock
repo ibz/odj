@@ -1542,6 +1542,7 @@ dependencies = [
  "blake3",
  "cpal",
  "libc",
+ "midir",
  "pipewire",
  "ratatui",
  "rustfft",
@@ -1564,6 +1565,7 @@ name = "odj-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "midir",
  "odj-core",
  "ratatui",
  "tui-big-text",

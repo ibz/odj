@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 odj-core.workspace = true
 anyhow.workspace = true
+midir.workspace = true
 ratatui.workspace = true
 tui-big-text = "0.8.10"
 

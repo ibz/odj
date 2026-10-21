@@ -56,11 +56,11 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
     }
 
     let mut midi_config = midi::MidiConfig::load();
-    let midi_port = midi::pick_midi_input(terminal, &midi_config)?;
+    let midi_port = odj_core::midi::pick_midi_input(terminal, midi_config.port_id.as_deref())?;
     // Kept alive for the rest of `start`, closing automatically when it
     // returns; `None` (no port picked, or setup below didn't finish) just
     // means plain keyboard use.
-    let midi_conn = match midi_port.as_deref().and_then(midi::device_slot) {
+    let midi_conn = match midi_port.as_deref().and_then(odj_core::midi::device_slot) {
         Some((name, slot)) => {
             let id = midi_port.unwrap();
             midi_config.port_id = Some(id.clone());

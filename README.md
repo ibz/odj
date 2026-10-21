@@ -171,6 +171,7 @@ along their bottom edge, as does the output picker at start.
 | `Tab` | File browser |
 | `Ctrl+U in the browser` | Add this folder to your music folders |
 | `` ` `` | Settings: auto-cue, music folders |
+| `M` | Mixer: volume + 3-band EQ (low/mid/high) |
 
 #### Cues
 
@@ -209,7 +210,7 @@ along their bottom edge, as does the output picker at start.
 | --- | --- |
 | `↑ / ↓` | Tempo fader (Shift: ×10) |
 | `0 / G` | Reset tempo / cycle range ±6 ±10 ±16 WIDE |
-| `M` | Master Tempo (key lock) |
+| `H` | Master Tempo (key lock) |
 | `F` | Sync to the master deck's tempo and beats |
 | `Shift+F` | Make this deck the master |
 | `, / .` | Jog: hold to slow down / speed up 3% (Shift: 12%) · paused: 1 frame (Shift: 1 beat, 1 s without a BPM) |

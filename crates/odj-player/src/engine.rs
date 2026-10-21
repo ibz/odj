@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use odj_core::audio::Source;
+use odj_core::filter::ThreeBandEq;
 use odj_core::grid::BeatGrid;
 use odj_core::key::Key;
 use odj_core::link::{self, Packet};
@@ -214,6 +215,11 @@ pub struct Snapshot {
     pub jump_beats: f64,
     pub loop_size: f64,
     pub sync: SyncView,
+    /// The Mixer overlay's live values — see `Deck::volume`/`Deck::low_db`.
+    pub volume: f32,
+    pub low_db: f32,
+    pub mid_db: f32,
+    pub high_db: f32,
 }
 
 /// Which memory point to call: always the nearest one in that direction,
@@ -298,6 +304,12 @@ pub struct Deck {
     mt_lag: usize,
     xfade: Option<(f64, usize)>,
     gain: f32,
+    /// The Mixer overlay's channel fader, 0.0..=1.0 — a live performance
+    /// control like tempo/speed, not a saved preference; never touched by
+    /// `load()`.
+    volume: f32,
+    /// Likewise live, not saved, and not reset by `load()`.
+    eq: ThreeBandEq,
     stretch: Option<Stretcher>,
     stretch_primed: bool,
     discard: usize,
@@ -353,6 +365,8 @@ impl Deck {
             mt_lag: 0,
             xfade: None,
             gain: 0.0,
+            volume: 1.0,
+            eq: ThreeBandEq::new(out_rate),
             stretch: Stretcher::new(out_rate, MAX_BLOCK),
             stretch_primed: false,
             discard: 0,
@@ -414,6 +428,10 @@ impl Deck {
                 lanes: self.lanes(),
                 others: self.link.others.clone(),
             },
+            volume: self.volume,
+            low_db: self.eq.low_db(),
+            mid_db: self.eq.mid_db(),
+            high_db: self.eq.high_db(),
         }
     }
 
@@ -1495,6 +1513,40 @@ impl Deck {
         self.master_tempo
     }
 
+    // --- Mixer: volume and 3-band EQ --------------------------------------------
+
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    pub fn set_volume(&mut self, v: f32) {
+        self.volume = v.clamp(0.0, 1.0);
+    }
+
+    pub fn low_db(&self) -> f32 {
+        self.eq.low_db()
+    }
+
+    pub fn set_low_db(&mut self, db: f32) {
+        self.eq.set_low_db(db);
+    }
+
+    pub fn mid_db(&self) -> f32 {
+        self.eq.mid_db()
+    }
+
+    pub fn set_mid_db(&mut self, db: f32) {
+        self.eq.set_mid_db(db);
+    }
+
+    pub fn high_db(&self) -> f32 {
+        self.eq.high_db()
+    }
+
+    pub fn set_high_db(&mut self, db: f32) {
+        self.eq.set_high_db(db);
+    }
+
     // --- Audio -----------------------------------------------------------------
 
     /// Fills `out` (interleaved stereo) with the next block of audio.
@@ -1529,6 +1581,15 @@ impl Deck {
         } else {
             self.stretch_primed = false;
             self.generate(&mut l[..n], &mut r[..n], heard_at);
+        }
+        self.eq.process_stereo(&mut l[..n], &mut r[..n]);
+        if self.volume != 1.0 {
+            for x in &mut l[..n] {
+                *x *= self.volume;
+            }
+            for x in &mut r[..n] {
+                *x *= self.volume;
+            }
         }
         for (i, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             frame[0] = l[i];
@@ -2793,5 +2854,71 @@ mod tests {
         assert_eq!(d.packet(0.0).key, Some(up.0), "the other decks hear it too");
         d.master_tempo = true;
         assert_eq!(d.heard_key(), Some((am, 0)));
+    }
+
+    /// A sine test tone, for the mixer tests below — distinct from
+    /// `click_track`'s broadband clicks, so low/high content is controlled.
+    fn sine_track(hz: f64, seconds: f64) -> Track {
+        let n = (SR as f64 * seconds) as usize;
+        let samples: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let x = (2.0 * std::f64::consts::PI * hz * i as f64 / SR as f64).sin() as f32;
+                [x, x]
+            })
+            .collect();
+        Track::from_samples("t".into(), "t".into(), None, SR, samples)
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn mixer_defaults_are_neutral() {
+        let d = Deck::new(SR);
+        assert_eq!(d.volume(), 1.0);
+        assert_eq!((d.low_db(), d.mid_db(), d.high_db()), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn set_volume_zero_silences_the_deck() {
+        let mut d = Deck::new(SR);
+        d.load(Arc::new(sine_track(440.0, 1.0)), &TrackMemory::default(), false);
+        d.play_pause();
+        d.set_volume(0.0);
+        let out = run(&mut d, 4800);
+        assert!(out.iter().all(|&x| x == 0.0), "volume 0 should silence the deck");
+    }
+
+    #[test]
+    fn eq_bands_shape_the_rendered_mix() {
+        let low = || Arc::new(sine_track(100.0, 1.0));
+        let high = || Arc::new(sine_track(8000.0, 1.0));
+
+        let render = |track: Arc<Track>, set: fn(&mut Deck)| {
+            let mut d = Deck::new(SR);
+            d.load(track, &TrackMemory::default(), false);
+            d.play_pause();
+            set(&mut d);
+            run(&mut d, 20_000)
+        };
+
+        let low_flat = render(low(), |_| {});
+        let low_boosted = render(low(), |d| d.set_low_db(odj_core::filter::MAX_DB));
+        assert!(rms(&low_boosted) > rms(&low_flat) * 1.3, "boosting the low band should raise a low tone");
+
+        let high_flat = render(high(), |_| {});
+        let high_cut = render(high(), |d| d.set_high_db(odj_core::filter::MIN_DB));
+        assert!(rms(&high_cut) < rms(&high_flat) * 0.3, "cutting the high band hard should quiet a high tone");
+    }
+
+    #[test]
+    fn mixer_values_are_deck_level_not_track_level() {
+        let mut d = deck();
+        d.set_volume(0.5);
+        d.set_low_db(3.0);
+        d.load(Arc::new(sine_track(440.0, 1.0)), &TrackMemory::default(), false);
+        assert_eq!(d.volume(), 0.5, "loading a track doesn't reset the mixer");
+        assert_eq!(d.low_db(), 3.0);
     }
 }

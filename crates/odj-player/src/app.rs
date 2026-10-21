@@ -144,6 +144,42 @@ impl SettingsScreen {
     }
 }
 
+/// How many rows the Mixer overlay has: Volume, Low, Mid, High.
+const MIXER_ROWS: usize = 4;
+/// The Mixer's EQ rows step by this many dB (Shift: ×4).
+const EQ_STEP: f32 = 1.0;
+/// The Mixer's Volume row steps by this fraction (Shift: ×4).
+const VOLUME_STEP: f32 = 0.05;
+
+/// The Mixer overlay: only while it's open do its own keys (arrows, 0, Esc)
+/// mean volume/EQ instead of Tempo/Search — see `App::mixer_key`. A live
+/// performance control, not a saved preference, so unlike `SettingsScreen`
+/// there's nothing here to persist.
+#[derive(Default)]
+pub struct MixerScreen {
+    open: bool,
+    row: usize,
+}
+
+impl MixerScreen {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    fn toggle(&mut self) {
+        self.open = !self.open;
+        self.row = 0;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+    }
+}
+
 pub struct App {
     pub deck: Arc<Mutex<Deck>>,
     pub browser: Browser,
@@ -155,6 +191,7 @@ pub struct App {
     status: Option<(String, Instant)>,
     pub help: Help,
     pub settings_screen: SettingsScreen,
+    pub mixer: MixerScreen,
     /// Browsing to pick a new music folder (from Settings' Tab): a plain
     /// file browser, so going up stays a filesystem "up" even at an
     /// existing music folder, rather than jumping to the quick switcher.
@@ -207,6 +244,7 @@ impl App {
             status: None,
             help: Help::default(),
             settings_screen: SettingsScreen::default(),
+            mixer: MixerScreen::default(),
             picking_music_dir: false,
             show_remaining: false,
             hot_rec: false,
@@ -396,6 +434,62 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    /// Volume/EQ, while the Mixer overlay is open — otherwise these same
+    /// keys are Tempo (Up/Down) and Search (Left/Right), so this must
+    /// return `false` at once when it's closed, same as `settings_key`.
+    fn mixer_key(&mut self, code: KeyCode, shift: bool) -> bool {
+        if !self.mixer.open {
+            return false;
+        }
+        let step = if shift { 4.0 } else { 1.0 };
+        match code {
+            KeyCode::Esc => return false,
+            KeyCode::Up => self.mixer.row = self.mixer.row.saturating_sub(1),
+            KeyCode::Down => self.mixer.row = (self.mixer.row + 1).min(MIXER_ROWS - 1),
+            KeyCode::Left | KeyCode::Right => {
+                let sign = if code == KeyCode::Left { -1.0 } else { 1.0 };
+                self.nudge_mixer_row(sign * step);
+            }
+            KeyCode::Char('0') => self.reset_mixer_row(),
+            _ => {}
+        }
+        true
+    }
+
+    /// Moves the Mixer's selected row by `steps` (negative to decrease),
+    /// already scaled for Shift by the caller.
+    fn nudge_mixer_row(&mut self, steps: f32) {
+        let mut d = self.deck();
+        match self.mixer.row {
+            0 => {
+                let v = d.volume() + steps * VOLUME_STEP;
+                d.set_volume(v);
+            }
+            1 => {
+                let v = d.low_db() + steps * EQ_STEP;
+                d.set_low_db(v);
+            }
+            2 => {
+                let v = d.mid_db() + steps * EQ_STEP;
+                d.set_mid_db(v);
+            }
+            _ => {
+                let v = d.high_db() + steps * EQ_STEP;
+                d.set_high_db(v);
+            }
+        }
+    }
+
+    fn reset_mixer_row(&mut self) {
+        let mut d = self.deck();
+        match self.mixer.row {
+            0 => d.set_volume(1.0),
+            1 => d.set_low_db(0.0),
+            2 => d.set_mid_db(0.0),
+            _ => d.set_high_db(0.0),
+        }
     }
 
     pub fn loading(&self) -> Option<String> {
@@ -734,22 +828,40 @@ impl App {
         if self.help.is_open() && self.help.key(code, shift, crate::ui::HELP.len()) {
             return;
         }
+        // Settings and the Mixer are each otherwise fully modal — everything
+        // but Esc is swallowed rather than reaching the deck underneath, see
+        // `settings_key`/`mixer_key` — so their own open/close keys are
+        // checked first, ahead of either gate: without this, flipping
+        // straight from one to the other would be swallowed by whichever is
+        // currently open, same as any other key, and only Esc could back out.
+        if once && code == KeyCode::Char('`') {
+            self.help.close();
+            self.mixer.close();
+            self.settings_screen.toggle();
+            return;
+        }
+        if once && code == KeyCode::Char('m') {
+            self.help.close();
+            self.settings_screen.close();
+            self.mixer.toggle();
+            return;
+        }
         if self.settings_key(code) {
+            return;
+        }
+        if self.mixer_key(code, shift) {
             return;
         }
         match code {
             KeyCode::Esc => {
                 self.help.close();
                 self.settings_screen.back();
+                self.mixer.close();
                 if self.deck().is_adjusting_grid() {
                     self.deck().toggle_grid_adjust();
                 }
             }
             KeyCode::Char('/') if once => self.help.toggle(),
-            KeyCode::Char('`') if once => {
-                self.help.close();
-                self.settings_screen.toggle();
-            }
             KeyCode::Tab if once => {
                 self.browser.open = true;
                 self.picking_music_dir = false;
@@ -905,7 +1017,7 @@ impl App {
                 }
             }
             KeyCode::Char('g') if once => self.deck().cycle_range(),
-            KeyCode::Char('m') if once => {
+            KeyCode::Char('h') if once => {
                 let (on, latency) = {
                     let mut deck = self.deck();
                     (deck.toggle_master_tempo(), deck.stretch_latency_ms())
@@ -1439,6 +1551,116 @@ mod tests {
         assert!(app.settings_screen.is_open());
         press(&mut app, KeyCode::Esc, false);
         assert!(!app.settings_screen.is_open());
+    }
+
+    #[test]
+    fn m_opens_the_mixer_and_esc_closes_it() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        assert!(app.mixer.is_open());
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.mixer.is_open());
+    }
+
+    #[test]
+    fn mixer_rows_cycle_and_adjust_the_right_deck_parameter() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        assert_eq!(app.mixer.row(), 0);
+
+        // Volume row: starts at 100% (1.0, the top of its 0.0..=1.0 range),
+        // so Right has nothing left to do; Left lowers it, Right raises it
+        // back.
+        press(&mut app, KeyCode::Right, false);
+        assert_eq!(app.deck().volume(), 1.0, "already at the top of the range");
+        press(&mut app, KeyCode::Left, false);
+        press(&mut app, KeyCode::Left, false);
+        assert!((app.deck().volume() - 0.9).abs() < 1e-6);
+        press(&mut app, KeyCode::Right, false);
+        assert!((app.deck().volume() - 0.95).abs() < 1e-6);
+
+        // Down steps onto Low, then Mid, then High.
+        press(&mut app, KeyCode::Down, false);
+        assert_eq!(app.mixer.row(), 1);
+        press(&mut app, KeyCode::Right, false);
+        assert_eq!(app.deck().low_db(), 1.0);
+
+        press(&mut app, KeyCode::Down, false);
+        assert_eq!(app.mixer.row(), 2);
+        press(&mut app, KeyCode::Right, false);
+        assert_eq!(app.deck().mid_db(), 1.0);
+
+        press(&mut app, KeyCode::Down, false);
+        assert_eq!(app.mixer.row(), 3);
+        press(&mut app, KeyCode::Right, false);
+        assert_eq!(app.deck().high_db(), 1.0);
+
+        // Down again stays on the last row (High), doesn't wrap.
+        press(&mut app, KeyCode::Down, false);
+        assert_eq!(app.mixer.row(), 3);
+
+        // While the Mixer is open, Up/Down/Left/Right don't also reach the
+        // deck's Tempo/Search bindings.
+        assert_eq!(app.deck().snapshot().tempo, 0.0);
+    }
+
+    #[test]
+    fn shift_adjusts_the_mixer_in_bigger_steps() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        press(&mut app, KeyCode::Left, true);
+        assert!((app.deck().volume() - 0.8).abs() < 1e-6, "Shift: ×4 the plain 5% step");
+    }
+
+    #[test]
+    fn zero_resets_the_selected_mixer_row() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        press(&mut app, KeyCode::Left, true);
+        assert_ne!(app.deck().volume(), 1.0);
+        press(&mut app, KeyCode::Char('0'), false);
+        assert_eq!(app.deck().volume(), 1.0);
+    }
+
+    #[test]
+    fn opening_the_mixer_closes_help_and_settings_and_vice_versa() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('/'), false);
+        assert!(app.help.is_open());
+        press(&mut app, KeyCode::Char('m'), false);
+        assert!(app.mixer.is_open());
+        assert!(!app.help.is_open());
+
+        press(&mut app, KeyCode::Char('`'), false);
+        assert!(app.settings_screen.is_open());
+        assert!(!app.mixer.is_open(), "opening Settings closes the Mixer");
+    }
+
+    #[test]
+    fn mixer_overlay_draws_its_rows_and_values() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app();
+        press(&mut app, KeyCode::Char('m'), false);
+        press(&mut app, KeyCode::Left, false); // Volume: 95%, so it's not just the default label
+
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let snapshot = app.deck().snapshot();
+        t.draw(|f| crate::ui::draw(f, &app, &snapshot)).unwrap();
+        let text = t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>();
+
+        assert!(text.contains("Mixer"));
+        assert!(text.contains("Volume") && text.contains("95%"));
+        assert!(text.contains("Low") && text.contains("Mid") && text.contains("High"));
+        assert!(text.contains("0.0 dB"), "the untouched EQ rows show flat, not +0.0");
+    }
+
+    #[test]
+    fn h_toggles_master_tempo() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('h'), false);
+        assert!(app.deck().snapshot().master_tempo, "H now does what M used to");
     }
 
     #[test]

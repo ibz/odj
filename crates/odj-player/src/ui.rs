@@ -113,6 +113,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_browser(f, app);
     } else if app.settings_screen.is_open() {
         draw_settings(f, app);
+    } else if app.mixer.is_open() {
+        draw_mixer(f, app, s);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -666,6 +668,31 @@ fn draw_settings(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// A gain in dB, signed except right at 0 (flat) — `-6.0` as `"-6.0 dB"`,
+/// `0.0` as plain `"0.0 dB"` rather than `"+0.0 dB"`.
+fn db_label(db: f32) -> String {
+    if db == 0.0 { "0.0 dB".to_string() } else { format!("{db:+.1} dB") }
+}
+
+/// The Mixer overlay: volume and the 3-band EQ, live performance controls
+/// (not saved — see `Deck::volume`/`ThreeBandEq`) only adjustable while
+/// this is open, same modal shape as `draw_settings`.
+fn draw_mixer(f: &mut Frame, app: &App, s: &Snapshot) {
+    let area = centered(f.area(), 40, 40);
+    let block = Block::bordered().title(" Mixer ").border_style(Style::new().fg(AMBER));
+    let items = vec![
+        ListItem::new(format!("Volume      {:.0}%", s.volume * 100.0)),
+        ListItem::new(format!("Low         {}", db_label(s.low_db))),
+        ListItem::new(format!("Mid         {}", db_label(s.mid_db))),
+        ListItem::new(format!("High        {}", db_label(s.high_db))),
+    ];
+    let hints = ["↑↓ select", "←/→ adjust (Shift ×4)", "0 reset", "Esc close"];
+    let list_area = hinted_box(f, area, block, &hints);
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(app.mixer.row()));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
 /// The help's pages: the keys for playing first, the rest by topic.
 pub const HELP: &[Page] = &[
     Page::Keys(
@@ -684,6 +711,7 @@ pub const HELP: &[Page] = &[
             ("Tab", "File browser"),
             ("Ctrl+U in the browser", "Add this folder to your music folders"),
             ("`", "Settings: auto-cue, music folders"),
+            ("M", "Mixer: volume + 3-band EQ (low/mid/high)"),
         ],
     ),
     Page::Keys(
@@ -722,7 +750,7 @@ pub const HELP: &[Page] = &[
         &[
             ("↑ / ↓", "Tempo fader (Shift: ×10)"),
             ("0 / G", "Reset tempo / cycle range ±6 ±10 ±16 WIDE"),
-            ("M", "Master Tempo (key lock)"),
+            ("H", "Master Tempo (key lock)"),
             ("F", "Sync to the master deck's tempo and beats"),
             ("Shift+F", "Make this deck the master"),
             (", / .", "Jog: hold to slow down / speed up 3% (Shift: 12%) · paused: 1 frame (Shift: 1 beat, 1 s without a BPM)"),

@@ -1,7 +1,8 @@
 //! Optional MIDI input: Note On/Off trigger pads exactly like a key press,
 //! so an external sequencer (hardware or software) can drive odj-sampler
-//! instead of — or alongside — the keyboard. Config saved as
-//! `$XDG_DATA_HOME/odj/midi.json`.
+//! instead of — or alongside — the keyboard. Config lives in the settings
+//! file odj-sampler shares with odj-player (see
+//! `odj_core::memory::Settings`'s `midi_port_id`/`midi_devices`).
 //!
 //! Controllers don't agree on how they number their pads (confirmed on real
 //! hardware: some send a straight ascending range, others group and jump
@@ -16,7 +17,6 @@
 //! instead — see [`device_slot`].
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,14 +28,13 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::Alignment;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
-use serde::{Deserialize, Serialize};
 
-use odj_core::memory::{data_dir, read_json, write_json};
+use odj_core::memory::{load_settings, save_settings};
 use odj_core::tui::{AMBER, centered};
 
 use crate::engine::{PADS, Sampler};
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq)]
 pub struct MidiConfig {
     pub port_id: Option<String>,
     /// The MIDI note each pad responds to, per device: `devices[name][slot][i]`
@@ -43,26 +42,25 @@ pub struct MidiConfig {
     /// connected devices that report the same name (see [`device_slot`]).
     /// Learned once per slot (see [`learn_pad_notes`]) rather than assumed,
     /// since pad numbering varies across controllers.
-    #[serde(default)]
     pub devices: HashMap<String, Vec<[u8; PADS]>>,
 }
 
 impl MidiConfig {
-    pub fn file() -> PathBuf {
-        data_dir().join("midi.json")
+    /// This app's slice of the shared settings file, or the default (no
+    /// port, no devices learned) when there is none yet.
+    pub fn load() -> Self {
+        let settings = load_settings();
+        Self { port_id: settings.midi_port_id, devices: settings.midi_devices }
     }
 
-    /// The saved config, or the default (no port, no devices learned) when
-    /// there is none (or it can't be read).
-    pub fn load(file: &Path) -> Self {
-        read_json(file).unwrap_or_default()
-    }
-
-    pub fn save(&self, file: &Path) -> std::io::Result<()> {
-        if let Some(dir) = file.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        write_json(file, self)
+    /// Saves this app's fields back into the shared settings file, leaving
+    /// odj-player's and odj-sampler's own other fields (`auto_cue`, `kit`,
+    /// …) exactly as they were.
+    pub fn save(&self) -> std::io::Result<()> {
+        let mut settings = load_settings();
+        settings.midi_port_id = self.port_id.clone();
+        settings.midi_devices = self.devices.clone();
+        save_settings(&settings)
     }
 
     /// The learned notes for `name`'s `slot`-th connected instance, if any.
@@ -303,9 +301,33 @@ fn draw_midi_picker(f: &mut Frame, ports: &[(String, String)], selected: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kits;
 
     fn default_pad_notes() -> [u8; PADS] {
         std::array::from_fn(|i| 36 + i as u8)
+    }
+
+    /// Isolates both settings-file env vars together — `MidiConfig` now
+    /// reads/writes through the shared settings file, which lives under
+    /// `XDG_CONFIG_HOME` with an `XDG_DATA_HOME` fallback (see
+    /// `load_settings`), so a test touching one without the other risks
+    /// leaking into the real file.
+    fn with_temp_dirs<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-midi-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only, same pattern used throughout this crate's tests.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        result
     }
 
     #[test]
@@ -340,19 +362,36 @@ mod tests {
 
     #[test]
     fn config_round_trips() {
-        let dir = std::env::temp_dir().join(format!("odj-midi-config-{}", std::process::id()));
-        let file = dir.join("midi.json");
-        let mut devices = HashMap::new();
-        devices.insert("Some Pad".to_string(), vec![default_pad_notes()]);
-        let config = MidiConfig { port_id: Some("24:0".into()), devices };
-        config.save(&file).unwrap();
-        assert_eq!(MidiConfig::load(&file), config);
-        std::fs::remove_dir_all(dir).unwrap();
+        with_temp_dirs(|| {
+            let mut devices = HashMap::new();
+            devices.insert("Some Pad".to_string(), vec![default_pad_notes()]);
+            let config = MidiConfig { port_id: Some("24:0".into()), devices };
+            config.save().unwrap();
+            assert_eq!(MidiConfig::load(), config);
+        });
     }
 
     #[test]
-    fn missing_file_is_the_default_config() {
-        assert_eq!(MidiConfig::load(Path::new("/nonexistent/midi.json")), MidiConfig::default());
+    fn config_round_trip_preserves_the_rest_of_the_shared_settings() {
+        with_temp_dirs(|| {
+            let mut settings = load_settings();
+            settings.auto_cue = false;
+            settings.music_dirs = vec!["/music".into()];
+            save_settings(&settings).unwrap();
+
+            let config = MidiConfig { port_id: Some("24:0".into()), devices: HashMap::new() };
+            config.save().unwrap();
+
+            let after = load_settings();
+            assert_eq!(after.midi_port_id, Some("24:0".into()), "odj-sampler's own field changed");
+            assert!(!after.auto_cue, "odj-player's fields survived the save");
+            assert_eq!(after.music_dirs, vec![std::path::PathBuf::from("/music")]);
+        });
+    }
+
+    #[test]
+    fn missing_settings_is_the_default_config() {
+        with_temp_dirs(|| assert_eq!(MidiConfig::load(), MidiConfig::default()));
     }
 
     #[test]

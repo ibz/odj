@@ -22,6 +22,7 @@ use odj_core::{audio, tui};
 
 use app::App;
 use engine::Sampler;
+use kit::Kit;
 
 fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
@@ -29,9 +30,10 @@ fn main() -> Result<()> {
             "usage: odj-sampler\n\nPlays the cues stored by odj-player from 16 pads. Press ? inside for keys.\n\
              Kits are folders under {}, each with its own samples; pick one (or create a new\n\
              one) at startup, and press K any time to switch. Optionally triggered by MIDI\n\
-             Note On/Off too, picked at startup; the port and each pad's note are kept in {}.",
+             Note On/Off too, picked at startup; the port and each pad's note are kept in the\n\
+             settings file shared with odj-player, {}.",
             kits::kits_dir().display(),
-            midi::MidiConfig::file().display()
+            odj_core::memory::settings_file().display()
         );
         return Ok(());
     }
@@ -53,8 +55,7 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         return Err(e);
     }
 
-    let midi_file = midi::MidiConfig::file();
-    let mut midi_config = midi::MidiConfig::load(&midi_file);
+    let mut midi_config = midi::MidiConfig::load();
     let midi_port = midi::pick_midi_input(terminal, &midi_config)?;
     // Kept alive for the rest of `start`, closing automatically when it
     // returns; `None` (no port picked, or setup below didn't finish) just
@@ -73,27 +74,33 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
             };
             pad_notes.and_then(|notes| {
                 midi_config.set_pad_notes_for(name, slot, notes);
-                let _ = midi_config.save(&midi_file);
+                let _ = midi_config.save();
                 midi::connect(&id, sampler.clone(), notes)
             })
         }
         None => None,
     };
 
-    kits::migrate_legacy_kit();
-    let kit_dir = match settings::load_active_kit() {
-        Some(dir) => dir,
-        None => {
-            let dir = kit_browser::pick_initial_kit(terminal)?;
-            let _ = settings::Settings { kit: dir.file_name().map(|n| n.to_string_lossy().into_owned()) }
-                .save(&settings::Settings::file());
-            dir
+    let (kit_dir, kit) = match settings::load_active_kit() {
+        Some(dir) => {
+            let kit = Kit::load(&dir.join("kit.json"));
+            (Some(dir), kit)
         }
+        None => match kit_browser::pick_initial_kit(terminal)? {
+            kit_browser::MaterializedKit::Saved(dir) => {
+                let kit = Kit::load(&dir.join("kit.json"));
+                let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+                settings::set_active_kit(slug);
+                (Some(dir), kit)
+            }
+            // Nothing written to disk yet — see `App::ensure_kit_dir`.
+            kit_browser::MaterializedKit::Unsaved(kit) => (None, *kit),
+        },
     };
 
     let name =
         format!("{} · {} Hz{}", output.name, output.sample_rate(), if midi_conn.is_some() { " · MIDI" } else { "" });
-    let mut app = App::new(sampler, output.sample_rate(), kit_dir, key_release, name);
+    let mut app = App::new(sampler, output.sample_rate(), kit_dir, kit, key_release, name);
     run(terminal, &mut app, &output.errors)
 }
 

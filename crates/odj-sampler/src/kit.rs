@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use odj_core::memory::{data_dir, read_json, write_json};
+use odj_core::memory::{read_json, write_json};
 
 use crate::engine::{PADS, Props};
 
@@ -74,12 +74,6 @@ impl Default for Kit {
 impl Kit {
     pub fn new(name: String, pads: [KitPad; PADS]) -> Self {
         Self { version: VERSION, name, pads }
-    }
-
-    /// Where a single kit used to live, before multiple kits existed. Only
-    /// `kits::migrate_legacy_kit` still reads this path.
-    pub fn legacy_file() -> PathBuf {
-        data_dir().join("kit.json")
     }
 
     /// The saved kit, or an empty one when there is none (or it can't be read).

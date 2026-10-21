@@ -4,7 +4,9 @@
 //! by the track's audio fingerprint so cues survive renames, moves and tag edits, and
 //! several odj instances only ever write the tracks they changed. `save_track_merged`
 //! three-way merges against whatever's on disk, so two instances with the same track
-//! open don't clobber each other's saves. Settings live in `$XDG_CONFIG_HOME/odj/settings.json`.
+//! open don't clobber each other's saves. Settings live in
+//! `$XDG_CONFIG_HOME/odj/settings.json`, shared by odj-player and
+//! odj-sampler — see [`Settings`], [`load_settings`], [`save_settings`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -122,25 +124,92 @@ pub struct LibraryTrack {
     pub memory: TrackMemory,
 }
 
-/// Player settings that survive a restart.
+/// Settings shared by both odj-player and odj-sampler, one file between
+/// them — each app only ever touches the field(s) it owns, always through
+/// a full read-modify-write of this whole struct (see [`load_settings`]/
+/// [`save_settings`]), so neither app's save ever clobbers the other's
+/// fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Cue to the first sound on load instead of the very start.
+    /// Cue to the first sound on load instead of the very start. odj-player.
     pub auto_cue: bool,
-    /// Beatjump size, in beats.
+    /// Beatjump size, in beats. odj-player.
     pub jump_beats: f64,
-    /// Size of the next beatloop, in beats.
+    /// Size of the next beatloop, in beats. odj-player.
     pub loop_beats: f64,
     /// Folders the browser can jump into; the first that still exists is
-    /// where it opens when no folder is given on the command line.
+    /// where it opens when no folder is given on the command line. odj-player.
     pub music_dirs: Vec<PathBuf>,
+    /// The active kit's directory name under `kits/`. odj-sampler.
+    pub kit: Option<String>,
+    /// The MIDI input port last used, if any. odj-sampler.
+    pub midi_port_id: Option<String>,
+    /// Each pad's learned MIDI note, per device: `midi_devices[name][slot][i]`
+    /// for pad `i` — see `odj_sampler::midi` for how device/slot keys are
+    /// chosen. The array is sized to odj-sampler's pad count (16) directly
+    /// rather than via its constant, since odj-core doesn't depend on
+    /// odj-sampler. odj-sampler.
+    #[serde(default)]
+    pub midi_devices: HashMap<String, Vec<[u8; 16]>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_cue: true, jump_beats: 4.0, loop_beats: 4.0, music_dirs: Vec::new() }
+        Self {
+            auto_cue: true,
+            jump_beats: 4.0,
+            loop_beats: 4.0,
+            music_dirs: Vec::new(),
+            kit: None,
+            midi_port_id: None,
+            midi_devices: HashMap::new(),
+        }
     }
+}
+
+/// `settings.json`'s old shape, back when odj-sampler kept MIDI config in
+/// its own file — read once by [`load_settings`] as a fallback so an
+/// existing `midi.json` isn't silently dropped by the merge into
+/// [`Settings`].
+#[derive(Deserialize)]
+struct LegacyMidiConfig {
+    port_id: Option<String>,
+    #[serde(default)]
+    devices: HashMap<String, Vec<[u8; 16]>>,
+}
+
+/// Where the shared settings file lives, `$XDG_CONFIG_HOME/odj/settings.json`.
+pub fn settings_file() -> PathBuf {
+    xdg_dir("XDG_CONFIG_HOME", ".config").join("settings.json")
+}
+
+/// The saved settings, or the default when there are none yet (or they
+/// can't be read) — checks [`settings_file`] first, then the old
+/// `$XDG_DATA_HOME/odj/settings.json` location. If neither has MIDI config
+/// yet, falls back once more to the even older `$XDG_DATA_HOME/odj/midi.json`.
+pub fn load_settings() -> Settings {
+    let mut settings: Settings =
+        read_json(&settings_file()).or_else(|| read_json(&data_dir().join("settings.json"))).unwrap_or_default();
+    if settings.midi_port_id.is_none()
+        && settings.midi_devices.is_empty()
+        && let Some(legacy) = read_json::<LegacyMidiConfig>(&data_dir().join("midi.json"))
+    {
+        settings.midi_port_id = legacy.port_id;
+        settings.midi_devices = legacy.devices;
+    }
+    settings
+}
+
+/// Saves the whole shared struct to [`settings_file`]. Callers that only
+/// own one field should [`load_settings`] first, change just that field,
+/// and save the result — not construct a fresh default.
+pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
+    let file = settings_file();
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    write_json(&file, settings)
 }
 
 /// A track's file in the library. Positions are frames at the track's sample rate.
@@ -227,28 +296,13 @@ impl TrackFile {
 
 pub struct Memory {
     tracks_dir: PathBuf,
-    config_dir: PathBuf,
-    /// The pre-library `memory.json`, keyed by path, read on first need so cues
-    /// move into the library as their tracks get loaded.
-    legacy_file: PathBuf,
-    legacy: Option<HashMap<String, TrackMemory>>,
     pub settings: Settings,
 }
 
 impl Memory {
     pub fn load() -> Self {
         let data_dir = data_dir();
-        let config_dir = xdg_dir("XDG_CONFIG_HOME", ".config");
-        let settings = read_json(&config_dir.join("settings.json"))
-            .or_else(|| read_json(&data_dir.join("settings.json")))
-            .unwrap_or_default();
-        Self {
-            tracks_dir: data_dir.join("tracks"),
-            config_dir,
-            legacy_file: data_dir.join("memory.json"),
-            legacy: None,
-            settings,
-        }
+        Self { tracks_dir: data_dir.join("tracks"), settings: load_settings() }
     }
 
     fn track_file(&self, id: &str) -> PathBuf {
@@ -259,11 +313,7 @@ impl Memory {
         if track.id.is_empty() {
             return TrackMemory::default();
         }
-        if let Some(file) = read_json::<TrackFile>(&self.track_file(&track.id)) {
-            return file.memory();
-        }
-        let legacy = self.legacy.get_or_insert_with(|| read_json(&self.legacy_file).unwrap_or_default());
-        legacy.get(&key(&track.path)).cloned().unwrap_or_default()
+        read_json::<TrackFile>(&self.track_file(&track.id)).map(|file| file.memory()).unwrap_or_default()
     }
 
     /// Every track in the library, in no particular order; unreadable files are skipped.
@@ -322,8 +372,7 @@ impl Memory {
     }
 
     pub fn save_settings(&self) -> std::io::Result<()> {
-        fs::create_dir_all(&self.config_dir)?;
-        write_json(&self.config_dir.join("settings.json"), &self.settings)
+        save_settings(&self.settings)
     }
 }
 
@@ -352,11 +401,6 @@ pub fn write_json<T: Serialize>(file: &Path, value: &T) -> std::io::Result<()> {
     fs::rename(tmp, file)
 }
 
-/// The legacy `memory.json` key.
-fn key(path: &Path) -> String {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,13 +414,7 @@ mod tests {
     fn memory(name: &str) -> Memory {
         let dir = std::env::temp_dir().join(format!("odj-memory-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        Memory {
-            tracks_dir: dir.join("tracks"),
-            config_dir: dir.join("config"),
-            legacy_file: dir.join("memory.json"),
-            legacy: None,
-            settings: Settings::default(),
-        }
+        Memory { tracks_dir: dir.join("tracks"), settings: Settings::default() }
     }
 
     fn sample() -> TrackMemory {
@@ -502,13 +540,4 @@ mod tests {
         assert!(!m.track_file("ab22").exists());
     }
 
-    #[test]
-    fn imports_from_legacy_memory_json() {
-        let mut m = memory("legacy");
-        fs::create_dir_all(m.legacy_file.parent().unwrap()).unwrap();
-        let legacy = HashMap::from([("/music/old.mp3".to_string(), sample())]);
-        write_json(&m.legacy_file, &legacy).unwrap();
-        assert_eq!(m.get(&track("ab33", "/music/old.mp3")), sample());
-        assert_eq!(m.get(&track("ab44", "/music/other.mp3")), TrackMemory::default());
-    }
 }

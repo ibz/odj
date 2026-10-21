@@ -20,6 +20,7 @@ use crate::kit_browser::{self, KitRow};
 use crate::kits;
 use crate::loader::{Done, Failure, Job, Loader};
 use crate::settings;
+use crate::starter_kit;
 
 /// The pad keys, row by row: a 4×4 block on the left of the keyboard.
 pub const PAD_KEYS: [char; PADS] = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
@@ -300,7 +301,8 @@ impl App {
     pub fn new(
         sampler: Arc<Mutex<Sampler>>,
         out_rate: u32,
-        kit_dir: PathBuf,
+        kit_dir: Option<PathBuf>,
+        kit: Kit,
         key_release: bool,
         output_name: String,
     ) -> Self {
@@ -322,18 +324,15 @@ impl App {
             memory_at: None,
             quit: false,
         };
-        app.load_kit(Some(kit_dir));
+        app.load_kit(kit_dir, kit);
         app
     }
 
-    /// Loads `dir`'s `kit.json` (or an empty, unnamed kit if `dir` is
-    /// `None`), replacing every pad — shared by the initial load above
-    /// and [`Self::switch_kit`]/[`Self::switch_to_unnamed_kit`]'s later ones.
-    fn load_kit(&mut self, dir: Option<PathBuf>) {
-        let kit = match &dir {
-            Some(d) => Kit::load(&d.join("kit.json")),
-            None => Kit::default(),
-        };
+    /// Replaces every pad with `kit`'s — shared by the initial load above
+    /// and [`Self::switch_kit`]/[`Self::switch_to_unsaved_kit`]'s later
+    /// ones. `dir` is `None` for a kit with nothing on disk yet (see
+    /// [`Self::ensure_kit_dir`]).
+    fn load_kit(&mut self, dir: Option<PathBuf>, kit: Kit) {
         self.kit_dir = dir;
         self.kit_name = kit.name;
         self.slots = kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, generation: 0 });
@@ -348,22 +347,26 @@ impl App {
         }
     }
 
-    /// Switches to a different kit: stops every pad, loads it, and
-    /// remembers it as the active one for next time.
+    /// Switches to a different, already-saved kit: stops every pad, loads
+    /// it, and remembers it as the active one for next time.
     fn switch_kit(&mut self, dir: PathBuf) {
         self.sampler().stop_all();
-        self.load_kit(Some(dir));
+        let kit = Kit::load(&dir.join("kit.json"));
+        self.load_kit(Some(dir), kit);
         let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-        let _ = settings::Settings { kit: slug }.save(&settings::Settings::file());
+        settings::set_active_kit(slug);
     }
 
-    /// Drops to a fresh, unnamed kit with no directory yet — nothing is
-    /// written to disk until the first real change asks for a name (see
-    /// [`Self::save_kit`], [`Self::ensure_kit_dir`]) and creates one.
-    fn switch_to_unnamed_kit(&mut self) {
+    /// Switches to `kit`, but with no directory of its own yet — nothing
+    /// is written to disk until the first real change asks for a name
+    /// (see [`Self::save_kit`], [`Self::ensure_kit_dir`]) and creates one.
+    /// Used both for a fresh, nameless kit (`Kit::default()`) and for the
+    /// embedded kit (already named, its pads already pointing at the
+    /// binary's bundled assets — see `kit_browser::MaterializedKit`).
+    fn switch_to_unsaved_kit(&mut self, kit: Kit) {
         self.sampler().stop_all();
-        self.load_kit(None);
-        let _ = settings::Settings { kit: None }.save(&settings::Settings::file());
+        self.load_kit(None, kit);
+        settings::set_active_kit(None);
     }
 
     fn sampler(&self) -> MutexGuard<'_, Sampler> {
@@ -411,7 +414,7 @@ impl App {
         if self.kit_dir.is_some() {
             return true;
         }
-        self.screen = Screen::NamingKit(String::new());
+        self.screen = Screen::NamingKit(self.kit_name.clone());
         false
     }
 
@@ -420,7 +423,7 @@ impl App {
     /// just can't be written anywhere yet.
     fn save_kit(&mut self) {
         let Some(kit_file) = self.kit_file() else {
-            self.screen = Screen::NamingKit(String::new());
+            self.screen = Screen::NamingKit(self.kit_name.clone());
             return;
         };
         let kit = Kit::new(self.kit_name.clone(), std::array::from_fn(|i| self.slots[i].kit.clone()));
@@ -553,7 +556,7 @@ impl App {
         enum Action {
             None,
             StartNaming,
-            Switch(PathBuf),
+            Switch(kit_browser::MaterializedKit),
             Cancel,
             Delete(usize),
         }
@@ -572,7 +575,7 @@ impl App {
                     }
                     KeyCode::Enter if !name.trim().is_empty() => {
                         match kit_browser::materialize_local(&KitRow::CreateNew, Some(name.trim())) {
-                            Some(dir) => Action::Switch(dir),
+                            Some(m) => Action::Switch(m),
                             None => Action::None,
                         }
                     }
@@ -604,7 +607,7 @@ impl App {
                 }
                 KeyCode::Enter if matches!(state.rows[state.selected], KitRow::CreateNew) => Action::StartNaming,
                 KeyCode::Enter => match kit_browser::materialize_local(&state.rows[state.selected], None) {
-                    Some(dir) => Action::Switch(dir),
+                    Some(m) => Action::Switch(m),
                     None => Action::None,
                 },
                 KeyCode::Delete | KeyCode::Backspace if matches!(state.rows[state.selected], KitRow::Existing(..)) => {
@@ -621,8 +624,12 @@ impl App {
                 let Screen::KitBrowser(state) = &mut self.screen else { return };
                 state.mode = KitBrowserMode::Naming(String::new());
             }
-            Action::Switch(dir) => {
+            Action::Switch(kit_browser::MaterializedKit::Saved(dir)) => {
                 self.switch_kit(dir);
+                self.screen = Screen::Pads;
+            }
+            Action::Switch(kit_browser::MaterializedKit::Unsaved(kit)) => {
+                self.switch_to_unsaved_kit(*kit);
                 self.screen = Screen::Pads;
             }
             Action::Cancel => self.screen = Screen::Pads,
@@ -646,7 +653,7 @@ impl App {
                             self.set_status(format!("Deleted \"{name}\" — switched to \"{fallback_name}\""));
                         }
                         None => {
-                            self.switch_to_unnamed_kit();
+                            self.switch_to_unsaved_kit(Kit::default());
                             self.set_status(format!("Deleted \"{name}\" — switched to a new, unnamed kit"));
                         }
                     }
@@ -681,7 +688,7 @@ impl App {
                         self.screen = Screen::Pads;
                         self.save_kit();
                         let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-                        let _ = settings::Settings { kit: slug }.save(&settings::Settings::file());
+                        settings::set_active_kit(slug);
                     }
                     Err(e) => self.set_status(format!("Could not create \"{name}\": {e}")),
                 }
@@ -1195,8 +1202,18 @@ fn build_browser_entries(dir: &std::path::Path) -> Vec<BrowserEntry> {
     let mut entries = Vec::new();
     if dir == kits::kits_dir() {
         entries.extend(kits::list_kits().into_iter().map(|(d, name)| BrowserEntry::Kit(d, name)));
+        // Always reachable here too, even though it's never a real, listed
+        // kit on its own (see `kit_browser::embedded_cache_dir`) — picking
+        // a sample from it still copies into the active kit as usual.
+        entries.push(BrowserEntry::Kit(kit_browser::embedded_cache_dir(), kit_browser::EMBEDDED_NAME.to_string()));
     } else {
         entries.push(BrowserEntry::Up);
+        // The embedded kit's files are only written on first visit, same
+        // as `materialize_embedded` already does for picking it from the
+        // kit browser (it's a cheap no-op once they're already there).
+        if dir == kit_browser::embedded_cache_dir().join("samples") {
+            starter_kit::materialize_embedded(dir);
+        }
         if let Ok(read) = std::fs::read_dir(dir) {
             let mut samples: Vec<PathBuf> = read
                 .filter_map(|e| e.ok())
@@ -1312,7 +1329,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("odj-sampler-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sampler = Arc::new(Mutex::new(Sampler::new()));
-        App::new(sampler, 48_000, dir, true, String::new())
+        App::new(sampler, 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, String::new())
     }
 
     fn key(app: &mut App, c: char, kind: KeyEventKind) {
@@ -1367,16 +1384,20 @@ mod tests {
         use ratatui::crossterm::event::KeyEventState;
 
         // See `kits::ENV_LOCK`: serializes against other tests that also
-        // point `XDG_DATA_HOME` (a process-global) at a scratch directory.
+        // point `XDG_DATA_HOME`/`XDG_CONFIG_HOME` (process-global) at a
+        // scratch directory.
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-kit-switch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: test-only, same pattern odj-player's tests already use.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
         a.slots[3].kit.source = Some(source());
         a.save_kit();
         let kit_a_json_before = std::fs::read_to_string(kit_a.join("kit.json")).unwrap();
@@ -1393,11 +1414,14 @@ mod tests {
         assert_eq!(a.kit_name, "Kit B");
         assert!(a.slots[3].kit.source.is_none(), "the other kit starts with its own, empty pads");
 
-        let active = settings::Settings::load(&settings::Settings::file()).kit.unwrap();
+        let active = odj_core::memory::load_settings().kit.unwrap();
         assert_eq!(kits::kits_dir().join(active), kit_b);
         assert_eq!(std::fs::read_to_string(kit_a.join("kit.json")).unwrap(), kit_a_json_before, "switching away doesn't touch the other kit's file");
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1409,11 +1433,14 @@ mod tests {
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-kit-delete-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Rows: "Kit A" (active, row 0), "Kit B" (row 1), Embedded, Create new.
@@ -1437,7 +1464,10 @@ mod tests {
         assert!(!kit_b.exists(), "confirmed: the whole directory is gone");
         assert!(matches!(a.screen, Screen::KitBrowser(_)), "stays in the browser, doesn't bounce to Pads");
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1449,11 +1479,14 @@ mod tests {
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-kit-delete-active-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
         a.slots[0].kit.source = Some(source());
         a.set_sample(0, Some(Sample::new(vec![0.1; 9600], 4800)));
         a.save_kit();
@@ -1468,9 +1501,12 @@ mod tests {
         assert_eq!(a.kit_dir, Some(kit_b), "fell back to the other kit");
         assert_eq!(a.kit_name, "Kit B");
         assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to \"Kit B\""));
-        assert_eq!(settings::Settings::load(&settings::Settings::file()).kit.unwrap(), "kit-b");
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), "kit-b");
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1482,10 +1518,13 @@ mod tests {
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-kit-delete-only-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Only "Kit A" exists, so row 0 (active) is selected by default.
@@ -1499,9 +1538,12 @@ mod tests {
         assert!(a.slots.iter().all(|s| s.kit.source.is_none()));
         assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to a new, unnamed kit"));
         assert!(kits::list_kits().is_empty(), "no kit directory was created just from switching to it");
-        assert!(settings::Settings::load(&settings::Settings::file()).kit.is_none());
+        assert!(odj_core::memory::load_settings().kit.is_none());
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1511,11 +1553,14 @@ mod tests {
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-kit-naming-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
 
         let starter = kits::create_kit("Starter").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, starter, true, String::new());
-        a.switch_to_unnamed_kit();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter.clone()), Kit::load(&starter.join("kit.json")), true, String::new());
+        a.switch_to_unsaved_kit(Kit::default());
         assert_eq!(a.kit_dir, None);
 
         // A prop change is the simplest "something changed" — no file to write, just a save.
@@ -1542,10 +1587,65 @@ mod tests {
         let kit = Kit::load(&dir.join("kit.json"));
         assert_eq!(kit.name, "Trap");
         assert_eq!(kit.pads[2].props.mode, Mode::Gate, "the change that triggered the prompt was kept, not lost");
-        assert_eq!(settings::Settings::load(&settings::Settings::file()).kit.unwrap(), dir.file_name().unwrap().to_string_lossy());
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), dir.file_name().unwrap().to_string_lossy());
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn picking_the_embedded_kit_writes_nothing_until_changed() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-embedded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
+
+        let starter = kits::create_kit("Starter").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter), Kit::default(), true, String::new());
+
+        let Some(kit_browser::MaterializedKit::Unsaved(kit)) = kit_browser::materialize_local(&KitRow::Embedded, None) else {
+            panic!("picking Embedded is never a saved kit");
+        };
+        assert_eq!(kit.name, "Acoustic (Embedded)");
+        assert!(kit.pads[0].source.is_some(), "the embedded pads are already filled");
+        a.switch_to_unsaved_kit(*kit);
+
+        assert_eq!(a.kit_dir, None, "nothing kit-shaped on disk yet");
+        assert_eq!(a.kit_name, "Acoustic (Embedded)");
+        assert_eq!(kits::list_kits().len(), 1, "only Starter — not a real, listed kit until it's changed");
+
+        // Press pad 1: playing it doesn't count as "changing" the kit.
+        key(&mut a, '1', KeyEventKind::Press);
+        assert_eq!(a.kit_dir, None, "merely playing a pad doesn't materialize it either");
+        assert_eq!(kits::list_kits().len(), 1);
+
+        // Now actually change something — same deferred-naming flow as any other unsaved kit.
+        a.selected = 0;
+        key(&mut a, 'l', KeyEventKind::Press); // toggle looping
+        let Screen::NamingKit(name) = &a.screen else { panic!("expected the naming prompt") };
+        assert_eq!(name, "Acoustic (Embedded)", "pre-filled with the name it already has");
+
+        a.handle_key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE });
+
+        assert!(matches!(a.screen, Screen::Pads));
+        let saved_dir = a.kit_dir.clone().expect("now it has a directory");
+        assert_eq!(Kit::load(&saved_dir.join("kit.json")).name, "Acoustic (Embedded)");
+        assert_eq!(kits::list_kits().len(), 2, "Starter, plus this one now that it's real");
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1556,13 +1656,16 @@ mod tests {
         let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("odj-sample-browser-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
         odj_core::wav::write_wav(&kit_b.join("samples").join("snare.wav"), &vec![0.1; 400], 1, 8_000).unwrap();
 
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         a.handle_key(press(KeyCode::Enter)); // open the sample browser on pad 0
@@ -1588,7 +1691,63 @@ mod tests {
         assert_eq!(source.path.parent(), a.samples_dir().as_deref(), "copied into Kit A, not left pointing at Kit B");
         assert!(source.path.is_file());
 
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sample_browser_reaches_the_embedded_kit_even_though_its_never_a_real_one() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-sample-browser-embedded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests above.
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a), Kit::default(), true, String::new());
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+
+        a.handle_key(press(KeyCode::Enter)); // open the sample browser on pad 0
+        a.handle_key(press(KeyCode::Enter)); // Up -> the list of kits
+        let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
+        assert_eq!(browser.dir, kits::kits_dir());
+        let embedded_at = browser.entries.iter().position(|e| {
+            matches!(e, BrowserEntry::Kit(d, name) if d == &kit_browser::embedded_cache_dir() && name == kit_browser::EMBEDDED_NAME)
+        });
+        assert!(embedded_at.is_some(), "the embedded kit is reachable here even with no real kit directory");
+        assert_eq!(kits::list_kits().len(), 1, "...and still isn't a real, listed kit — just Kit A");
+
+        for _ in 0..embedded_at.unwrap() {
+            a.handle_key(press(KeyCode::Down));
+        }
+        a.handle_key(press(KeyCode::Enter)); // descend into it — materializes the assets on first visit
+        let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
+        assert_eq!(browser.dir, kit_browser::embedded_cache_dir().join("samples"));
+        assert!(
+            browser.entries.iter().any(|e| matches!(e, BrowserEntry::Sample(p) if p.extension().is_some_and(|e| e == "wav"))),
+            "the embedded .wav files are listed, not empty"
+        );
+
+        a.handle_key(press(KeyCode::Down)); // Up, <first sample>, ... — select the first sample
+        a.handle_key(press(KeyCode::Enter)); // assign it
+
+        assert!(matches!(a.screen, Screen::Pads));
+        let source = a.slots[0].kit.source.as_ref().expect("the pad got a source");
+        assert_eq!(source.path.parent(), a.samples_dir().as_deref(), "copied into Kit A, not left pointing at the cache");
+        assert!(source.path.is_file());
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1626,7 +1785,7 @@ mod tests {
         let mut kit = Kit::default();
         kit.pads[0].source = Some(source());
         kit.save(&dir.join("kit.json")).unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, dir, true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, String::new());
         assert_eq!(a.slots[0].status, PadStatus::Loading);
         let t = Instant::now();
         while a.slots[0].status == PadStatus::Loading && t.elapsed() < Duration::from_secs(5) {

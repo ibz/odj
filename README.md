@@ -100,8 +100,10 @@ cues survive renaming, moving and retagging. Settings such as Auto Cue live in
 
 Sixteen pads on the keys `1234 / QWER / ASDF / ZXCV`. Press Enter to browse
 samples for the selected pad: the active kit's own samples first, `Up` to
-browse any other kit's, or jump straight to a shortcut that browses your
-stored odj-player cues (hot cues, memory points, last loops) instead. A
+browse any other kit's (the embedded "Acoustic (Embedded)" kit is always
+there too, even before you've ever picked it — see Kits below), or jump
+straight to a shortcut that browses your stored odj-player cues (hot cues,
+memory points, last loops) instead. A
 loop from a cue goes on as it is; a cue without an end opens the sample
 editor, which starts at 4 bars and lets you move the start and the end
 along the beat grid by beats or bars, or by milliseconds, and preview it;
@@ -122,14 +124,15 @@ folder under `~/.local/share/odj/kits/<name>/` (a `kit.json` plus its
 `samples/`). Press `K` any time to switch kits or create a new, empty one;
 odj-sampler remembers the last one used (in `~/.local/share/odj/settings.json`)
 and loads it directly next time. On first run, with no kit yet, the same
-browser offers a small kit built into the binary (works offline, no setup),
-fuller kits downloaded from the companion
-[odj-kits](https://github.com/ibz/odj-kits) repo (currently Acoustic and
-Latin percussion, both CC0), or creating a new, empty kit of your own.
-Deleting the kit you're on falls back to another one if you have one, or
-to a fresh, unnamed kit otherwise — nothing's written to disk for *that*
-until you actually change something, at which point you're asked to name
-it, which creates its folder.
+browser offers "Acoustic (Embedded)", a small kit built into the binary
+(works offline, no setup) — picking it doesn't create a kit folder either,
+until it's actually changed, same as above — fuller kits downloaded from
+the companion [odj-kits](https://github.com/ibz/odj-kits) repo (currently
+Acoustic and Latin percussion, both CC0), or creating a new, empty kit of
+your own. Deleting the kit you're on falls back to another one if you have
+one, or to a fresh, unnamed kit otherwise — nothing's written to disk for
+*that* until you actually change something, at which point you're asked to
+name it, which creates its folder.
 
 Pads can also be triggered over MIDI — Note On/Off from an external
 sequencer (hardware or software) works exactly like a key press, including

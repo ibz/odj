@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use odj_core::memory::data_dir;
 
 use crate::kit::Kit;
-use crate::settings::Settings;
 
 pub fn kits_dir() -> PathBuf {
     data_dir().join("kits")
@@ -73,29 +72,6 @@ pub fn create_kit(name: &str) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// One-time upgrade from the single global kit this app used to have: if
-/// nothing is active yet (per `settings.rs`) and the old `kit.json` exists,
-/// turn it into a real kit directory ("My Kit") and make it active. A no-op
-/// once that's done, or on a fresh install with no legacy file to migrate.
-/// Pad sources keep pointing at wherever they already pointed — only new
-/// assignments start copying into the kit's own `samples/` (see `app.rs`).
-pub fn migrate_legacy_kit() {
-    let settings_file = Settings::file();
-    if Settings::load(&settings_file).kit.is_some() {
-        return;
-    }
-    let legacy = Kit::legacy_file();
-    let Some(mut kit) = odj_core::memory::read_json::<Kit>(&legacy) else { return };
-    kit.name = "My Kit".to_string();
-    let dir = kits_dir().join(unique_slug(&kit.name));
-    if std::fs::create_dir_all(dir.join("samples")).is_err() || kit.save(&dir.join("kit.json")).is_err() {
-        return;
-    }
-    let _ = std::fs::remove_file(&legacy);
-    let slug = dir.file_name().unwrap().to_string_lossy().into_owned();
-    let _ = Settings { kit: Some(slug) }.save(&settings_file);
-}
-
 /// `XDG_DATA_HOME` is process-global, but `cargo test` runs tests on several
 /// threads at once — anything (here, or in `app.rs`) that points it at a
 /// scratch directory for the duration of a test holds this lock first, so
@@ -152,32 +128,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn migrate_legacy_kit_moves_the_old_file_once() {
-        with_temp_data_dir(|| {
-            let legacy = Kit::legacy_file();
-            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-            Kit::default().save(&legacy).unwrap();
-
-            migrate_legacy_kit();
-            assert!(!legacy.exists(), "the legacy file is moved, not left behind");
-            let active = Settings::load(&Settings::file()).kit.expect("migration activates a kit");
-            let dir = kits_dir().join(&active);
-            assert!(dir.join("kit.json").is_file());
-            assert_eq!(Kit::load(&dir.join("kit.json")).name, "My Kit");
-
-            // Running it again (nothing left to migrate) must not create a second kit.
-            migrate_legacy_kit();
-            assert_eq!(list_kits().len(), 1);
-        });
-    }
-
-    #[test]
-    fn migrate_legacy_kit_is_a_noop_on_a_fresh_install() {
-        with_temp_data_dir(|| {
-            migrate_legacy_kit();
-            assert!(Settings::load(&Settings::file()).kit.is_none());
-            assert_eq!(list_kits(), Vec::new());
-        });
-    }
 }

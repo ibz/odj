@@ -3,8 +3,11 @@
 mod app;
 mod engine;
 mod kit;
+mod kit_browser;
+mod kits;
 mod loader;
 mod midi;
+mod settings;
 mod starter_kit;
 mod ui;
 
@@ -19,17 +22,15 @@ use odj_core::{audio, tui};
 
 use app::App;
 use engine::Sampler;
-use kit::Kit;
 
 fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
         println!(
             "usage: odj-sampler\n\nPlays the cues stored by odj-player from 16 pads. Press ? inside for keys.\n\
-             The kit is kept in {}; on first run (no kit yet) you're offered a starter kit\n\
-             to download or the one built in, or you can skip and build your own. Optionally\n\
-             triggered by MIDI Note On/Off too, picked at startup; the port and each pad's\n\
-             note are kept in {}.",
-            Kit::file().display(),
+             Kits are folders under {}, each with its own samples; pick one (or create a new\n\
+             one) at startup, and press K any time to switch. Optionally triggered by MIDI\n\
+             Note On/Off too, picked at startup; the port and each pad's note are kept in {}.",
+            kits::kits_dir().display(),
             midi::MidiConfig::file().display()
         );
         return Ok(());
@@ -79,16 +80,20 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         None => None,
     };
 
-    let kit_file = Kit::file();
-    if !kit_file.exists()
-        && let Some(kit) = starter_kit::pick_starter_kit(terminal)?
-    {
-        let _ = kit.save(&kit_file);
-    }
+    kits::migrate_legacy_kit();
+    let kit_dir = match settings::load_active_kit() {
+        Some(dir) => dir,
+        None => {
+            let dir = kit_browser::pick_initial_kit(terminal)?;
+            let _ = settings::Settings { kit: dir.file_name().map(|n| n.to_string_lossy().into_owned()) }
+                .save(&settings::Settings::file());
+            dir
+        }
+    };
 
     let name =
         format!("{} · {} Hz{}", output.name, output.sample_rate(), if midi_conn.is_some() { " · MIDI" } else { "" });
-    let mut app = App::new(sampler, output.sample_rate(), Kit::file(), key_release, name);
+    let mut app = App::new(sampler, output.sample_rate(), kit_dir, key_release, name);
     run(terminal, &mut app, &output.errors)
 }
 

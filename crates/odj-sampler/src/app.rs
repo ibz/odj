@@ -11,12 +11,15 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::library::fuzzy_match;
 use odj_core::memory::{Cue, Memory, user_grid};
-use odj_core::track::Track;
+use odj_core::track::{Track, decode};
 use odj_core::tui::Help;
 
 use crate::engine::{MAX_GAIN_DB, MIN_GAIN_DB, Mode, PADS, Props, Sample, Sampler, cut};
 use crate::kit::{Kit, KitPad, PadSource};
+use crate::kit_browser::{self, KitRow};
+use crate::kits;
 use crate::loader::{Done, Failure, Job, Loader};
+use crate::settings;
 
 /// The pad keys, row by row: a 4×4 block on the left of the keyboard.
 pub const PAD_KEYS: [char; PADS] = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
@@ -101,6 +104,42 @@ impl Picker {
     }
 }
 
+/// A row in the sample browser (see [`SampleBrowser`]).
+pub enum BrowserEntry {
+    /// Back to the list of kits — not shown while already there.
+    Up,
+    /// A sibling kit's own samples, one level up — only shown there.
+    Kit(PathBuf, String),
+    /// A `.wav` already in whichever directory is open.
+    Sample(PathBuf),
+    /// Always listed last: the original fuzzy cue picker, unchanged.
+    BrowsePlayerCues,
+}
+
+impl BrowserEntry {
+    pub fn label(&self) -> String {
+        match self {
+            BrowserEntry::Up => ".. (back to kits)".to_string(),
+            BrowserEntry::Kit(_, name) => name.clone(),
+            BrowserEntry::Sample(path) => {
+                path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            }
+            BrowserEntry::BrowsePlayerCues => "Browse odj-player's cues…".to_string(),
+        }
+    }
+}
+
+/// What `Enter` on a pad opens: samples already in a kit, with a shortcut
+/// to browse odj-player's cues instead (the old, now-nested, fuzzy
+/// picker). Starts in the active kit's own `samples/`; `Up` reaches every
+/// other kit's, one level up, at `kits_dir()`.
+pub struct SampleBrowser {
+    pub pad: usize,
+    pub dir: PathBuf,
+    pub entries: Vec<BrowserEntry>,
+    pub selected: usize,
+}
+
 /// Trimming a region of a track before it goes on a pad. It starts at the cue;
 /// both ends move, one at a time.
 pub struct Editor {
@@ -179,10 +218,48 @@ impl Editor {
     }
 }
 
+/// What [`App::copy_into_kit`] needs: `samples` (interleaved stereo at
+/// `rate`) and the `start..end` region of it to keep, plus the metadata a
+/// fresh `PadSource` needs once that's written and decoded.
+struct NewSample<'a> {
+    samples: &'a [f32],
+    rate: u32,
+    start: f64,
+    end: f64,
+    title: String,
+    artist: Option<String>,
+    cue: String,
+}
+
 pub enum Screen {
     Pads,
     Picker(Picker),
     Editor(Box<Editor>),
+    KitBrowser(KitBrowserState),
+    SampleBrowser(SampleBrowser),
+    /// Naming the kit a change just landed on, so it can actually be
+    /// saved — see `App::ensure_kit_dir`/`App::save_kit`. The typed name.
+    NamingKit(String),
+}
+
+/// Switching the active kit, or creating a new one — see `kit_browser.rs`
+/// for the row list this picks from (no network here, unlike the
+/// mandatory bootstrap picker in `main.rs`: existing kits, Embedded, and
+/// "create new" only).
+pub struct KitBrowserState {
+    pub rows: Vec<KitRow>,
+    pub selected: usize,
+    pub mode: KitBrowserMode,
+}
+
+pub enum KitBrowserMode {
+    List,
+    /// Typing a name for a new kit.
+    Naming(String),
+    /// About to delete `rows[_]` — a row index, not acted on until a plain
+    /// `Enter` confirms it; anything else backs out, since this deletes
+    /// the kit's whole directory, every sample included, with no undo.
+    ConfirmingDelete(usize),
 }
 
 /// Memory figures, refreshed every `MEMORY_REFRESH`.
@@ -201,7 +278,12 @@ pub struct App {
     pub selected: usize,
     pub screen: Screen,
     pub help: Help,
-    kit_file: PathBuf,
+    /// This kit's own directory under `kits/` — `kit.json` plus the
+    /// `samples/` library it owns (see `kits.rs`). `None` for a kit that
+    /// hasn't been named yet — nothing is written to disk until it is
+    /// (see [`Self::save_kit`], [`Self::ensure_kit_dir`]).
+    kit_dir: Option<PathBuf>,
+    kit_name: String,
     loader: Loader,
     status: Option<(String, Instant)>,
     /// Whether the terminal reports key releases (kitty keyboard protocol).
@@ -218,19 +300,19 @@ impl App {
     pub fn new(
         sampler: Arc<Mutex<Sampler>>,
         out_rate: u32,
-        kit_file: PathBuf,
+        kit_dir: PathBuf,
         key_release: bool,
         output_name: String,
     ) -> Self {
-        let kit = Kit::load(&kit_file);
         let mut app = Self {
             sampler,
             out_rate,
-            slots: kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, generation: 0 }),
+            slots: std::array::from_fn(|_| Slot { kit: KitPad::default(), status: PadStatus::Empty, bytes: 0, generation: 0 }),
             selected: 0,
             screen: Screen::Pads,
             help: Help::default(),
-            kit_file,
+            kit_dir: None,
+            kit_name: String::new(),
             loader: Loader::new(out_rate),
             status: None,
             key_release,
@@ -240,14 +322,48 @@ impl App {
             memory_at: None,
             quit: false,
         };
+        app.load_kit(Some(kit_dir));
+        app
+    }
+
+    /// Loads `dir`'s `kit.json` (or an empty, unnamed kit if `dir` is
+    /// `None`), replacing every pad — shared by the initial load above
+    /// and [`Self::switch_kit`]/[`Self::switch_to_unnamed_kit`]'s later ones.
+    fn load_kit(&mut self, dir: Option<PathBuf>) {
+        let kit = match &dir {
+            Some(d) => Kit::load(&d.join("kit.json")),
+            None => Kit::default(),
+        };
+        self.kit_dir = dir;
+        self.kit_name = kit.name;
+        self.slots = kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, generation: 0 });
         for i in 0..PADS {
-            let props = app.slots[i].kit.props;
-            app.sampler().set_props(i, props);
-            if app.slots[i].kit.source.is_some() {
-                app.reload(i);
+            let props = self.slots[i].kit.props;
+            self.sampler().set_props(i, props);
+            if self.slots[i].kit.source.is_some() {
+                self.reload(i);
+            } else {
+                self.set_sample(i, None);
             }
         }
-        app
+    }
+
+    /// Switches to a different kit: stops every pad, loads it, and
+    /// remembers it as the active one for next time.
+    fn switch_kit(&mut self, dir: PathBuf) {
+        self.sampler().stop_all();
+        self.load_kit(Some(dir));
+        let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let _ = settings::Settings { kit: slug }.save(&settings::Settings::file());
+    }
+
+    /// Drops to a fresh, unnamed kit with no directory yet — nothing is
+    /// written to disk until the first real change asks for a name (see
+    /// [`Self::save_kit`], [`Self::ensure_kit_dir`]) and creates one.
+    fn switch_to_unnamed_kit(&mut self) {
+        self.sampler().stop_all();
+        self.load_kit(None);
+        let _ = settings::Settings { kit: None }.save(&settings::Settings::file());
     }
 
     fn sampler(&self) -> MutexGuard<'_, Sampler> {
@@ -276,11 +392,91 @@ impl App {
 
     // --- Kit -------------------------------------------------------------------
 
+    fn kit_file(&self) -> Option<PathBuf> {
+        self.kit_dir.as_ref().map(|d| d.join("kit.json"))
+    }
+
+    /// Where this kit's own sample library lives — every `.wav` ever
+    /// assigned from odj-player's cues, or copied in from another kit,
+    /// stays here even after being unassigned from a pad.
+    fn samples_dir(&self) -> Option<PathBuf> {
+        self.kit_dir.as_ref().map(|d| d.join("samples"))
+    }
+
+    /// `true` once this kit has a real directory to write samples into.
+    /// Otherwise (a freshly-switched-to kit that's never been named)
+    /// starts the naming prompt and returns `false`, so the caller should
+    /// stop rather than try to write anywhere — there's nowhere yet.
+    fn ensure_kit_dir(&mut self) -> bool {
+        if self.kit_dir.is_some() {
+            return true;
+        }
+        self.screen = Screen::NamingKit(String::new());
+        false
+    }
+
+    /// No-op — deferred, see [`Self::ensure_kit_dir`] — until the kit has
+    /// a name: the mutation already happened in memory regardless, it
+    /// just can't be written anywhere yet.
     fn save_kit(&mut self) {
-        let kit = Kit::new(std::array::from_fn(|i| self.slots[i].kit.clone()));
-        if let Err(e) = kit.save(&self.kit_file) {
+        let Some(kit_file) = self.kit_file() else {
+            self.screen = Screen::NamingKit(String::new());
+            return;
+        };
+        let kit = Kit::new(self.kit_name.clone(), std::array::from_fn(|i| self.slots[i].kit.clone()));
+        if let Err(e) = kit.save(&kit_file) {
             self.set_status(format!("Could not save the kit: {e}"));
         }
+    }
+
+    /// Cuts `new.start..new.end` out of `new.samples` (interleaved stereo,
+    /// native rate — no resampling, see `engine::cut`'s `rate == out_rate`
+    /// branch) and writes it into this kit's `samples/` dir, returning a
+    /// `PadSource` pointing at that local copy. A byte-identical cut
+    /// already in the library (by its decoded id) is reused rather than
+    /// duplicated.
+    fn copy_into_kit(&mut self, new: NewSample) -> Option<PadSource> {
+        if !self.ensure_kit_dir() {
+            return None;
+        }
+        let dir = self.samples_dir().expect("ensure_kit_dir just confirmed one");
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.set_status("Could not create the kit's samples folder");
+            return None;
+        }
+        let cut_sample = cut(new.samples, new.rate, new.start, new.end, new.rate);
+        let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+        if odj_core::wav::write_wav(&tmp, &cut_sample.data, 2, new.rate).is_err() {
+            self.set_status("Could not write the sample into the kit");
+            return None;
+        }
+        let decoded = match decode(&tmp) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                self.set_status(format!("Could not save the sample: {e}"));
+                return None;
+            }
+        };
+        let final_path = dir.join(format!("{}-{}.wav", kits::slugify(&new.title), &decoded.id[..8]));
+        if final_path.is_file() {
+            // The exact same audio is already in the library.
+            let _ = std::fs::remove_file(&tmp);
+        } else if std::fs::rename(&tmp, &final_path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            self.set_status("Could not save the sample into the kit");
+            return None;
+        }
+        Some(PadSource {
+            track_id: decoded.id,
+            path: final_path,
+            title: new.title,
+            artist: new.artist,
+            sample_rate: decoded.sample_rate,
+            cue: new.cue,
+            start: 0.0,
+            end: (decoded.samples.len() / 2) as f64,
+        })
     }
 
     /// Cuts the pad's sample from its file again, in the background.
@@ -346,6 +542,271 @@ impl App {
         self.save_kit();
     }
 
+    // --- Kit browser -------------------------------------------------------------
+
+    fn open_kit_browser(&mut self) {
+        let rows = kit_browser::build_rows(false);
+        self.screen = Screen::KitBrowser(KitBrowserState { rows, selected: 0, mode: KitBrowserMode::List });
+    }
+
+    fn kit_browser_key(&mut self, key: &KeyEvent) {
+        enum Action {
+            None,
+            StartNaming,
+            Switch(PathBuf),
+            Cancel,
+            Delete(usize),
+        }
+        let Screen::KitBrowser(state) = &mut self.screen else { return };
+        let action = match &mut state.mode {
+            KitBrowserMode::Naming(name) => {
+                let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Char(c) if typing => {
+                        name.push(c);
+                        Action::None
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                        Action::None
+                    }
+                    KeyCode::Enter if !name.trim().is_empty() => {
+                        match kit_browser::materialize_local(&KitRow::CreateNew, Some(name.trim())) {
+                            Some(dir) => Action::Switch(dir),
+                            None => Action::None,
+                        }
+                    }
+                    KeyCode::Esc => {
+                        state.mode = KitBrowserMode::List;
+                        Action::None
+                    }
+                    _ => Action::None,
+                }
+            }
+            // Only a plain Enter confirms; anything else — including Esc,
+            // arrows, a stray key — backs out, so a deletion this
+            // permanent never happens by reflex.
+            KitBrowserMode::ConfirmingDelete(i) => match key.code {
+                KeyCode::Enter => Action::Delete(*i),
+                _ => {
+                    state.mode = KitBrowserMode::List;
+                    Action::None
+                }
+            },
+            KitBrowserMode::List => match key.code {
+                KeyCode::Up => {
+                    state.selected = state.selected.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    state.selected = (state.selected + 1).min(state.rows.len().saturating_sub(1));
+                    Action::None
+                }
+                KeyCode::Enter if matches!(state.rows[state.selected], KitRow::CreateNew) => Action::StartNaming,
+                KeyCode::Enter => match kit_browser::materialize_local(&state.rows[state.selected], None) {
+                    Some(dir) => Action::Switch(dir),
+                    None => Action::None,
+                },
+                KeyCode::Delete | KeyCode::Backspace if matches!(state.rows[state.selected], KitRow::Existing(..)) => {
+                    state.mode = KitBrowserMode::ConfirmingDelete(state.selected);
+                    Action::None
+                }
+                KeyCode::Esc => Action::Cancel,
+                _ => Action::None,
+            },
+        };
+        match action {
+            Action::None => {}
+            Action::StartNaming => {
+                let Screen::KitBrowser(state) = &mut self.screen else { return };
+                state.mode = KitBrowserMode::Naming(String::new());
+            }
+            Action::Switch(dir) => {
+                self.switch_kit(dir);
+                self.screen = Screen::Pads;
+            }
+            Action::Cancel => self.screen = Screen::Pads,
+            Action::Delete(i) => {
+                let (dir, name) = {
+                    let Screen::KitBrowser(state) = &self.screen else { return };
+                    let KitRow::Existing(dir, name) = &state.rows[i] else { return };
+                    (dir.clone(), name.clone())
+                };
+                let is_active = self.kit_dir.as_deref() == Some(dir.as_path());
+                if std::fs::remove_dir_all(&dir).is_err() {
+                    self.set_status(format!("Could not delete \"{name}\""));
+                } else if is_active {
+                    // The kit you were using is gone too: fall back to
+                    // another one that still exists, or — if that was the
+                    // last kit — a fresh, unnamed kit (nothing's written
+                    // to disk for it until it's actually changed).
+                    match kits::list_kits().into_iter().next() {
+                        Some((fallback_dir, fallback_name)) => {
+                            self.switch_kit(fallback_dir);
+                            self.set_status(format!("Deleted \"{name}\" — switched to \"{fallback_name}\""));
+                        }
+                        None => {
+                            self.switch_to_unnamed_kit();
+                            self.set_status(format!("Deleted \"{name}\" — switched to a new, unnamed kit"));
+                        }
+                    }
+                } else {
+                    self.set_status(format!("Deleted \"{name}\""));
+                }
+                let Screen::KitBrowser(state) = &mut self.screen else { return };
+                state.rows = kit_browser::build_rows(false);
+                state.selected = state.selected.min(state.rows.len().saturating_sub(1));
+                state.mode = KitBrowserMode::List;
+            }
+        }
+    }
+
+    /// Naming an unnamed kit's first real change — see `ensure_kit_dir`.
+    /// The change that triggered this already happened in `self.slots`;
+    /// naming it here just creates the directory and finally saves it.
+    fn naming_kit_key(&mut self, key: &KeyEvent) {
+        let Screen::NamingKit(name) = &mut self.screen else { return };
+        let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char(c) if typing => name.push(c),
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Enter if !name.trim().is_empty() => {
+                let name = name.trim().to_string();
+                match kits::create_kit(&name) {
+                    Ok(dir) => {
+                        self.kit_dir = Some(dir);
+                        self.kit_name = name;
+                        self.screen = Screen::Pads;
+                        self.save_kit();
+                        let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
+                        let _ = settings::Settings { kit: slug }.save(&settings::Settings::file());
+                    }
+                    Err(e) => self.set_status(format!("Could not create \"{name}\": {e}")),
+                }
+            }
+            // The change itself stays (it's already in `self.slots`), just
+            // un-saved — asked again next time something changes.
+            KeyCode::Esc => self.screen = Screen::Pads,
+            _ => {}
+        }
+    }
+
+    // --- Sample browser ----------------------------------------------------------
+
+    fn open_sample_browser(&mut self) {
+        // An unnamed, not-yet-saved kit has no samples/ of its own to
+        // start in — go straight to the list of other kits instead.
+        let dir = self.samples_dir().unwrap_or_else(kits::kits_dir);
+        let entries = build_browser_entries(&dir);
+        self.screen = Screen::SampleBrowser(SampleBrowser { pad: self.selected, dir, entries, selected: 0 });
+    }
+
+    fn sample_browser_key(&mut self, key: &KeyEvent) {
+        enum Action {
+            None,
+            Navigate(PathBuf),
+            BrowseCues,
+            Assign(PathBuf),
+            Cancel,
+        }
+        let Screen::SampleBrowser(browser) = &mut self.screen else { return };
+        let pad = browser.pad;
+        let action = match key.code {
+            KeyCode::Up => {
+                browser.selected = browser.selected.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                browser.selected = (browser.selected + 1).min(browser.entries.len().saturating_sub(1));
+                Action::None
+            }
+            KeyCode::Enter => match &browser.entries[browser.selected] {
+                BrowserEntry::Up => Action::Navigate(kits::kits_dir()),
+                BrowserEntry::Kit(dir, _) => Action::Navigate(dir.join("samples")),
+                BrowserEntry::BrowsePlayerCues => Action::BrowseCues,
+                BrowserEntry::Sample(path) => Action::Assign(path.clone()),
+            },
+            KeyCode::Esc => Action::Cancel,
+            _ => Action::None,
+        };
+        match action {
+            Action::None => {}
+            Action::Navigate(dir) => {
+                let Screen::SampleBrowser(browser) = &mut self.screen else { return };
+                browser.entries = build_browser_entries(&dir);
+                browser.dir = dir;
+                browser.selected = 0;
+            }
+            Action::BrowseCues => self.open_picker(),
+            Action::Assign(path) => self.assign_library_sample(pad, &path),
+            Action::Cancel => self.screen = Screen::Pads,
+        }
+    }
+
+    /// Copies `path` (a sample owned by some other kit) into this one,
+    /// reusing a byte-identical copy already here (by its decoded id)
+    /// rather than duplicating it. `None` on any read/write failure.
+    fn copy_sample_into_kit(&mut self, path: &std::path::Path) -> Option<PathBuf> {
+        if !self.ensure_kit_dir() {
+            return None;
+        }
+        let dir = self.samples_dir().expect("ensure_kit_dir just confirmed one");
+        if std::fs::create_dir_all(&dir).is_err() {
+            self.set_status("Could not create the kit's samples folder");
+            return None;
+        }
+        let decoded = match decode(path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_status(format!("Could not read {}: {e}", path.display()));
+                return None;
+            }
+        };
+        let title = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let dest = dir.join(format!("{}-{}.wav", kits::slugify(&title), &decoded.id[..8]));
+        if !dest.is_file() && std::fs::copy(path, &dest).is_err() {
+            self.set_status("Could not copy the sample into this kit");
+            return None;
+        }
+        Some(dest)
+    }
+
+    /// Assigns an already-finished library sample straight to a pad — no
+    /// editor step, unlike a fresh odj-player cue: it's already a complete
+    /// one-shot/loop someone (maybe this kit, maybe another) finished.
+    fn assign_library_sample(&mut self, pad: usize, path: &std::path::Path) {
+        let local_path = if path.parent() == self.samples_dir().as_deref() {
+            path.to_path_buf()
+        } else {
+            let Some(copied) = self.copy_sample_into_kit(path) else { return };
+            copied
+        };
+        let decoded = match decode(&local_path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_status(format!("Could not read {}: {e}", local_path.display()));
+                return;
+            }
+        };
+        let title = local_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        self.slots[pad].kit.source = Some(PadSource {
+            track_id: decoded.id,
+            path: local_path,
+            title,
+            artist: None,
+            sample_rate: decoded.sample_rate,
+            cue: "kit".into(),
+            start: 0.0,
+            end: (decoded.samples.len() / 2) as f64,
+        });
+        self.reload(pad);
+        self.save_kit();
+        self.screen = Screen::Pads;
+        self.set_status(format!("Pad {} set", pad + 1));
+    }
+
     // --- Picking and editing ---------------------------------------------------
 
     fn open_picker(&mut self) {
@@ -379,7 +840,22 @@ impl App {
         };
         match e.cue.loop_out {
             Some(_) => {
-                self.slots[pad].kit.source = Some(source);
+                let Ok(decoded) = decode(&source.path) else {
+                    self.set_status(format!("Could not read {}", source.path.display()));
+                    return;
+                };
+                let Some(copied) = self.copy_into_kit(NewSample {
+                    samples: &decoded.samples,
+                    rate: decoded.sample_rate,
+                    start: source.start,
+                    end: source.end,
+                    title: source.title,
+                    artist: source.artist,
+                    cue: source.cue,
+                }) else {
+                    return;
+                };
+                self.slots[pad].kit.source = Some(copied);
                 self.slots[pad].kit.props.looped = true;
                 let props = self.slots[pad].kit.props;
                 self.sampler().set_props(pad, props);
@@ -473,8 +949,29 @@ impl App {
         }
         let Some(sample) = ed.cut(self.out_rate) else { return };
         let pad = ed.pad;
-        let secs = ed.source.seconds();
-        self.slots[pad].kit.source = Some(ed.source);
+        let mut source = ed.source;
+        // Already a file this (or re-trimming, the same) kit owns: just the
+        // region changed, not the audio — no need to copy it again. A pad
+        // picked fresh from odj-player's cues (or a legacy, pre-migration
+        // pad) still points outside the kit, so gets copied in now.
+        if source.path.parent() != self.samples_dir().as_deref()
+            && let Some(track) = &ed.track
+        {
+            let Some(copied) = self.copy_into_kit(NewSample {
+                samples: &track.samples,
+                rate: track.sample_rate,
+                start: source.start,
+                end: source.end,
+                title: source.title.clone(),
+                artist: source.artist.clone(),
+                cue: source.cue.clone(),
+            }) else {
+                return;
+            };
+            source = copied;
+        }
+        let secs = source.seconds();
+        self.slots[pad].kit.source = Some(source);
         self.set_sample(pad, Some(sample));
         self.save_kit();
         self.set_status(format!("Pad {} set, {secs:.2} s", pad + 1));
@@ -524,6 +1021,9 @@ impl App {
                 let (code, shift) = normalize(&key);
                 self.editor_key(code, shift);
             }
+            Screen::KitBrowser(_) if key.kind != KeyEventKind::Release => self.kit_browser_key(&key),
+            Screen::SampleBrowser(_) if key.kind != KeyEventKind::Release => self.sample_browser_key(&key),
+            Screen::NamingKit(_) if key.kind != KeyEventKind::Release => self.naming_kit_key(&key),
             Screen::Pads => {
                 let (code, shift) = normalize(&key);
                 match key.kind {
@@ -594,7 +1094,7 @@ impl App {
             KeyCode::Right => self.selected = i - i % 4 + (i % 4 + 1) % 4,
             KeyCode::Up => self.selected = (i + PADS - 4) % PADS,
             KeyCode::Down => self.selected = (i + 4) % PADS,
-            KeyCode::Enter => self.open_picker(),
+            KeyCode::Enter => self.open_sample_browser(),
             KeyCode::Char('t') => self.trim(),
             KeyCode::Char('m') => self.update_props(|p| p.mode = p.mode.next()),
             KeyCode::Char('l') => self.update_props(|p| p.looped = !p.looped),
@@ -604,6 +1104,7 @@ impl App {
             KeyCode::Char('0') => self.update_props(|p| p.gain_db = 0.0),
             KeyCode::Delete | KeyCode::Backspace => self.clear_pad(i),
             KeyCode::Char(' ') => self.sampler().stop_all(),
+            KeyCode::Char('k') => self.open_kit_browser(),
             _ => {}
         }
     }
@@ -687,6 +1188,29 @@ impl App {
 }
 
 /// Every stored cue in the library, by artist and title, then position.
+/// `.wav` files directly in `dir`, as `Sample` rows, sorted by name — or,
+/// at `kits_dir()` itself, every kit's directory instead (never raw
+/// filesystem entries like `kit.json`). `BrowsePlayerCues` is always last.
+fn build_browser_entries(dir: &std::path::Path) -> Vec<BrowserEntry> {
+    let mut entries = Vec::new();
+    if dir == kits::kits_dir() {
+        entries.extend(kits::list_kits().into_iter().map(|(d, name)| BrowserEntry::Kit(d, name)));
+    } else {
+        entries.push(BrowserEntry::Up);
+        if let Ok(read) = std::fs::read_dir(dir) {
+            let mut samples: Vec<PathBuf> = read
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "wav"))
+                .collect();
+            samples.sort();
+            entries.extend(samples.into_iter().map(BrowserEntry::Sample));
+        }
+    }
+    entries.push(BrowserEntry::BrowsePlayerCues);
+    entries
+}
+
 fn cue_entries() -> Vec<CueEntry> {
     let mut tracks = Memory::load().tracks();
     tracks.sort_by_cached_key(|t| (t.artist.clone().unwrap_or_default().to_lowercase(), t.title.to_lowercase()));
@@ -788,7 +1312,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("odj-sampler-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sampler = Arc::new(Mutex::new(Sampler::new()));
-        App::new(sampler, 48_000, dir.join("kit.json"), true, String::new())
+        App::new(sampler, 48_000, dir, true, String::new())
     }
 
     fn key(app: &mut App, c: char, kind: KeyEventKind) {
@@ -808,6 +1332,264 @@ mod tests {
             start: 0.0,
             end: 4800.0,
         }
+    }
+
+    #[test]
+    fn copy_into_kit_writes_a_local_wav_and_dedupes_identical_cuts() {
+        let mut a = app("copy-into-kit");
+        let samples = vec![0.2; 2_000];
+
+        let new_sample = || NewSample {
+            samples: &samples,
+            rate: 8_000,
+            start: 0.0,
+            end: 500.0,
+            title: "Kick".into(),
+            artist: Some("Me".into()),
+            cue: "hot A".into(),
+        };
+        let first = a.copy_into_kit(new_sample()).expect("decodes and writes");
+        assert_eq!(first.path.parent(), a.samples_dir().as_deref());
+        assert_ne!(first.path, PathBuf::from("/nonexistent.wav"));
+        assert_eq!(first.title, "Kick");
+        assert_eq!(first.artist, Some("Me".into()));
+        assert_eq!(first.cue, "hot A");
+        assert_eq!(first.start, 0.0);
+
+        let second = a.copy_into_kit(new_sample()).expect("decodes and writes");
+        assert_eq!(first.path, second.path, "identical audio reuses the same file, not a duplicate");
+        let files: Vec<_> = std::fs::read_dir(a.samples_dir().unwrap()).unwrap().collect();
+        assert_eq!(files.len(), 1, "no duplicate written to disk");
+    }
+
+    #[test]
+    fn kit_browser_switches_between_kits() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`: serializes against other tests that also
+        // point `XDG_DATA_HOME` (a process-global) at a scratch directory.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only, same pattern odj-player's tests already use.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let kit_b = kits::create_kit("Kit B").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        a.slots[3].kit.source = Some(source());
+        a.save_kit();
+        let kit_a_json_before = std::fs::read_to_string(kit_a.join("kit.json")).unwrap();
+
+        key(&mut a, 'k', KeyEventKind::Press);
+        assert!(matches!(a.screen, Screen::KitBrowser(_)));
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        // Rows sort existing kits by name: "Kit A" (the current one, row 0), "Kit B" (row 1).
+        a.handle_key(press(KeyCode::Down));
+        a.handle_key(press(KeyCode::Enter));
+
+        assert!(matches!(a.screen, Screen::Pads));
+        assert_eq!(a.kit_dir, Some(kit_b.clone()));
+        assert_eq!(a.kit_name, "Kit B");
+        assert!(a.slots[3].kit.source.is_none(), "the other kit starts with its own, empty pads");
+
+        let active = settings::Settings::load(&settings::Settings::file()).kit.unwrap();
+        assert_eq!(kits::kits_dir().join(active), kit_b);
+        assert_eq!(std::fs::read_to_string(kit_a.join("kit.json")).unwrap(), kit_a_json_before, "switching away doesn't touch the other kit's file");
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kit_browser_delete_needs_confirmation() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-delete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let kit_b = kits::create_kit("Kit B").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+
+        // Rows: "Kit A" (active, row 0), "Kit B" (row 1), Embedded, Create new.
+        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Delete));
+        let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
+        assert!(matches!(state.mode, KitBrowserMode::ConfirmingDelete(0)), "Delete asks first, it doesn't act yet");
+
+        // Anything but Enter backs out without deleting.
+        a.handle_key(press(KeyCode::Esc));
+        let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
+        assert!(matches!(state.mode, KitBrowserMode::List));
+        assert!(kit_a.join("kit.json").is_file(), "cancelling the confirmation keeps the kit");
+
+        // Kit B isn't active, so it just goes.
+        a.handle_key(press(KeyCode::Down));
+        a.handle_key(press(KeyCode::Delete));
+        let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
+        assert!(matches!(state.mode, KitBrowserMode::ConfirmingDelete(1)));
+        a.handle_key(press(KeyCode::Enter));
+        assert!(!kit_b.exists(), "confirmed: the whole directory is gone");
+        assert!(matches!(a.screen, Screen::KitBrowser(_)), "stays in the browser, doesn't bounce to Pads");
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_the_active_kit_falls_back_to_another_kit() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-delete-active-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let kit_b = kits::create_kit("Kit B").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        a.slots[0].kit.source = Some(source());
+        a.set_sample(0, Some(Sample::new(vec![0.1; 9600], 4800)));
+        a.save_kit();
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+
+        // Rows: "Kit A" (active, row 0), "Kit B" (row 1).
+        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Delete));
+        a.handle_key(press(KeyCode::Enter));
+
+        assert!(!kit_a.exists(), "actually removed, not just emptied");
+        assert_eq!(a.kit_dir, Some(kit_b), "fell back to the other kit");
+        assert_eq!(a.kit_name, "Kit B");
+        assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to \"Kit B\""));
+        assert_eq!(settings::Settings::load(&settings::Settings::file()).kit.unwrap(), "kit-b");
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_the_only_kit_switches_to_an_unnamed_kit() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-delete-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+
+        // Only "Kit A" exists, so row 0 (active) is selected by default.
+        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Delete));
+        a.handle_key(press(KeyCode::Enter));
+
+        assert!(!kit_a.exists(), "actually removed, not just emptied");
+        assert_eq!(a.kit_dir, None, "nothing written to disk for it yet");
+        assert_eq!(a.kit_name, "");
+        assert!(a.slots.iter().all(|s| s.kit.source.is_none()));
+        assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to a new, unnamed kit"));
+        assert!(kits::list_kits().is_empty(), "no kit directory was created just from switching to it");
+        assert!(settings::Settings::load(&settings::Settings::file()).kit.is_none());
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changing_an_unnamed_kit_asks_for_a_name_before_saving_it() {
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-kit-naming-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+
+        let starter = kits::create_kit("Starter").unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, starter, true, String::new());
+        a.switch_to_unnamed_kit();
+        assert_eq!(a.kit_dir, None);
+
+        // A prop change is the simplest "something changed" — no file to write, just a save.
+        a.selected = 2;
+        key(&mut a, 'm', KeyEventKind::Press);
+        assert!(matches!(a.screen, Screen::NamingKit(_)), "asks for a name before it can save");
+        assert_eq!(a.sampler().pad(2).props.mode, Mode::Gate, "the change itself already happened, in memory");
+
+        use ratatui::crossterm::event::KeyEventState;
+        for c in "Trap".chars() {
+            key(&mut a, c, KeyEventKind::Press);
+        }
+        a.handle_key(KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert!(matches!(a.screen, Screen::Pads));
+        assert_eq!(a.kit_name, "Trap");
+        let dir = a.kit_dir.clone().expect("named, so now it has a directory");
+        assert!(dir.join("kit.json").is_file());
+        let kit = Kit::load(&dir.join("kit.json"));
+        assert_eq!(kit.name, "Trap");
+        assert_eq!(kit.pads[2].props.mode, Mode::Gate, "the change that triggered the prompt was kept, not lost");
+        assert_eq!(settings::Settings::load(&settings::Settings::file()).kit.unwrap(), dir.file_name().unwrap().to_string_lossy());
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sample_browser_navigates_up_to_other_kits_and_copies_a_pick() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        // See `kits::ENV_LOCK`.
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-sample-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) }; // SAFETY: see other tests above.
+
+        let kit_a = kits::create_kit("Kit A").unwrap();
+        let kit_b = kits::create_kit("Kit B").unwrap();
+        odj_core::wav::write_wav(&kit_b.join("samples").join("snare.wav"), &vec![0.1; 400], 1, 8_000).unwrap();
+
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, kit_a.clone(), true, String::new());
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+
+        a.handle_key(press(KeyCode::Enter)); // open the sample browser on pad 0
+        // Kit A's own samples/ is empty, so entries are [Up, BrowsePlayerCues]; selected starts on Up.
+        a.handle_key(press(KeyCode::Enter));
+        let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
+        assert_eq!(browser.dir, kits::kits_dir(), "Up lands on the list of kits, not a raw filesystem dir");
+        assert!(
+            browser.entries.iter().any(|e| matches!(e, BrowserEntry::Kit(d, name) if d == &kit_b && name == "Kit B")),
+            "the other kit is listed here, not raw filesystem noise"
+        );
+
+        a.handle_key(press(KeyCode::Down)); // Kit A, Kit B, Browse cues — select Kit B
+        a.handle_key(press(KeyCode::Enter)); // descend into Kit B's samples/
+        let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
+        assert_eq!(browser.dir, kit_b.join("samples"));
+
+        a.handle_key(press(KeyCode::Down)); // Up, snare.wav, Browse cues — select snare.wav
+        a.handle_key(press(KeyCode::Enter)); // assign it
+
+        assert!(matches!(a.screen, Screen::Pads));
+        let source = a.slots[0].kit.source.as_ref().expect("the pad got a source");
+        assert_eq!(source.path.parent(), a.samples_dir().as_deref(), "copied into Kit A, not left pointing at Kit B");
+        assert!(source.path.is_file());
+
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -833,7 +1615,7 @@ mod tests {
         key(&mut a, '-', KeyEventKind::Press);
         assert_eq!(a.sampler().pad(2).props.mode, Mode::Gate);
         assert!(a.sampler().pad(2).props.looped);
-        let kit = Kit::load(&a.kit_file);
+        let kit = Kit::load(&a.kit_file().unwrap());
         assert_eq!(kit.pads[2].props.gain_db, -1.0);
         assert_eq!(kit.pads[2].props.mode, Mode::Gate);
     }
@@ -841,11 +1623,10 @@ mod tests {
     #[test]
     fn missing_files_are_reported_and_kept_in_the_kit() {
         let dir = std::env::temp_dir().join(format!("odj-sampler-test-{}-missing", std::process::id()));
-        let file = dir.join("kit.json");
         let mut kit = Kit::default();
         kit.pads[0].source = Some(source());
-        kit.save(&file).unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, file.clone(), true, String::new());
+        kit.save(&dir.join("kit.json")).unwrap();
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, dir, true, String::new());
         assert_eq!(a.slots[0].status, PadStatus::Loading);
         let t = Instant::now();
         while a.slots[0].status == PadStatus::Loading && t.elapsed() < Duration::from_secs(5) {
@@ -853,8 +1634,9 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(a.slots[0].status, PadStatus::Missing);
-        assert!(Kit::load(&file).pads[0].source.is_some());
-        std::fs::remove_dir_all(dir).unwrap();
+        let kit_file = a.kit_file().unwrap();
+        assert!(Kit::load(&kit_file).pads[0].source.is_some());
+        std::fs::remove_dir_all(kit_file.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -1035,7 +1817,37 @@ mod tests {
         };
         ed.set_len(16.0 * ed.beat().unwrap());
 
-        let screens = [Screen::Pads, Screen::Picker(picker), Screen::Editor(Box::new(ed))];
+        let kit_browser = Screen::KitBrowser(KitBrowserState {
+            rows: vec![kit_browser::KitRow::Embedded, kit_browser::KitRow::CreateNew],
+            selected: 0,
+            mode: KitBrowserMode::List,
+        });
+        let kit_browser_naming = Screen::KitBrowser(KitBrowserState {
+            rows: vec![kit_browser::KitRow::Embedded, kit_browser::KitRow::CreateNew],
+            selected: 1,
+            mode: KitBrowserMode::Naming("My New Kit".into()),
+        });
+        let kit_browser_deleting = Screen::KitBrowser(KitBrowserState {
+            rows: vec![kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/trap"), "Trap".into())],
+            selected: 0,
+            mode: KitBrowserMode::ConfirmingDelete(0),
+        });
+        let sample_browser = Screen::SampleBrowser(SampleBrowser {
+            pad: 3,
+            dir: PathBuf::from("/tmp"),
+            entries: vec![BrowserEntry::Up, BrowserEntry::Sample(PathBuf::from("/tmp/kick.wav")), BrowserEntry::BrowsePlayerCues],
+            selected: 1,
+        });
+        let screens = [
+            Screen::Pads,
+            Screen::Picker(picker),
+            Screen::Editor(Box::new(ed)),
+            kit_browser,
+            kit_browser_naming,
+            kit_browser_deleting,
+            sample_browser,
+            Screen::NamingKit("Trap".into()),
+        ];
         for screen in screens {
             a.screen = screen;
             for (w, h) in [(140, 40), (50, 12)] {

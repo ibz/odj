@@ -11,4 +11,4 @@ License: CC0 1.0 Universal (public domain dedication). No attribution is
 legally required; it's given here anyway as a thank-you.
 
 Each file is a single hit trimmed from a VCSL multisample, downmixed to
-mono and resampled to 22.05kHz to keep the binary small.
+mono to keep the binary small (full 44.1kHz rate kept for quality).

@@ -12,7 +12,7 @@ use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
 use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
 
-use crate::app::{App, Editor, PAD_KEYS, PadStatus, Picker, Screen, Slot};
+use crate::app::{App, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
 use crate::engine::{Mode, PADS, PadState, Snapshot, TAIL};
 
 const PLAYING: Color = Color::Rgb(60, 220, 100);
@@ -39,6 +39,12 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 
     if let Screen::Picker(p) = &app.screen {
         draw_picker(f, p);
+    } else if let Screen::KitBrowser(state) = &app.screen {
+        draw_kit_browser(f, state);
+    } else if let Screen::SampleBrowser(b) = &app.screen {
+        draw_sample_browser(f, b);
+    } else if let Screen::NamingKit(name) = &app.screen {
+        draw_naming_kit(f, name);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -142,7 +148,8 @@ fn draw_pad_info(f: &mut Frame, area: Rect, app: &App) {
     let i = match &app.screen {
         Screen::Editor(ed) => ed.pad,
         Screen::Picker(p) => p.pad,
-        Screen::Pads => app.selected,
+        Screen::SampleBrowser(b) => b.pad,
+        Screen::Pads | Screen::KitBrowser(_) | Screen::NamingKit(_) => app.selected,
     };
     let slot = &app.slots[i];
     let block = Block::bordered()
@@ -225,12 +232,15 @@ fn draw_memory(f: &mut Frame, area: Rect, app: &App) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hints = match &app.screen {
         Screen::Pads => {
-            " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  ? help  Ctrl+C quit"
+            " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  K kits  ? help  Ctrl+C quit"
         }
         Screen::Picker(_) => " type to filter  ↑↓ PgUp PgDn Home End select  Enter assign  Esc clear/close",
         Screen::Editor(_) => {
             " Tab start/end  ←/→ beat (Shift: bar)  ,/. ±10 ms (Shift: 1 ms)  [ ] halve/double  Space preview  Enter keep  Esc cancel"
         }
+        Screen::KitBrowser(_) => " ↑↓ select  Enter choose/create  Del delete  Esc cancel",
+        Screen::SampleBrowser(_) => " ↑↓ select  Enter choose/open  Esc cancel",
+        Screen::NamingKit(_) => " Enter save as this name  Esc leave unsaved for now",
     };
     let line = match app.status() {
         Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
@@ -290,6 +300,88 @@ fn draw_picker(f: &mut Frame, p: &Picker) {
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(p.selected));
     f.render_stateful_widget(list, list_area, &mut state);
+}
+
+fn draw_kit_browser(f: &mut Frame, browser: &KitBrowserState) {
+    let area = centered(f.area(), 70, 60);
+    match &browser.mode {
+        KitBrowserMode::Naming(name) => {
+            let block = Block::bordered().title(" Name the new kit ").border_style(Style::new().fg(AMBER));
+            let hints = ["Enter create", "Esc back"];
+            let inner = hinted_box(f, area, block, &hints);
+            f.render_widget(Paragraph::new(format!("{name}▏")), inner);
+        }
+        KitBrowserMode::ConfirmingDelete(i) => draw_delete_warning(f, area, &browser.rows[*i].label()),
+        KitBrowserMode::List => {
+            let block = Block::bordered().title(" Pick a kit ").border_style(Style::new().fg(AMBER));
+            let hints = ["↑↓ select", "Enter choose/create", "Del/Backspace delete", "Esc cancel"];
+            let inner = hinted_box(f, area, block, &hints);
+            let [list_area, detail_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
+            let items: Vec<ListItem> = browser
+                .rows
+                .iter()
+                .map(|r| {
+                    let item = ListItem::new(r.label());
+                    match r.color() {
+                        Some(c) => item.style(Style::new().fg(c)),
+                        None => item,
+                    }
+                })
+                .collect();
+            let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+            let mut state = ListState::default().with_selected(Some(browser.selected));
+            f.render_stateful_widget(list, list_area, &mut state);
+            let detail = browser.rows[browser.selected].detail();
+            f.render_widget(Paragraph::new(detail).fg(DIM), detail_area);
+        }
+    }
+}
+
+/// A hard-to-miss, all-red confirmation before a kit (its whole directory,
+/// every sample in it) is deleted with no way to undo it.
+fn draw_delete_warning(f: &mut Frame, area: Rect, kit_name: &str) {
+    let block = Block::bordered()
+        .title(Span::styled(" DELETE KIT ", Style::new().fg(Color::Black).bg(Color::Red).bold()))
+        .border_style(Style::new().fg(Color::Red));
+    let hints = ["Enter: DELETE permanently", "any other key: cancel"];
+    let inner = hinted_box(f, area, block, &hints);
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("Delete \"{kit_name}\"?"), Style::new().fg(Color::Red).bold())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "THIS DELETES THE WHOLE KIT FOLDER — EVERY SAMPLE IN IT.",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )),
+        Line::from(Span::styled("THIS CANNOT BE UNDONE.", Style::new().fg(Color::Red).bold())),
+    ];
+    f.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+}
+
+fn draw_sample_browser(f: &mut Frame, browser: &SampleBrowser) {
+    let area = centered(f.area(), 70, 70);
+    let block = Block::bordered()
+        .title(format!(" Assign a sample to pad {} ", browser.pad + 1))
+        .border_style(Style::new().fg(AMBER));
+    let hints = ["↑↓ select", "Enter choose/open", "Esc cancel"];
+    let list_area = hinted_box(f, area, block, &hints);
+    let items: Vec<ListItem> = browser.entries.iter().map(|e| ListItem::new(e.label())).collect();
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(browser.selected));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+fn draw_naming_kit(f: &mut Frame, name: &str) {
+    let area = centered(f.area(), 60, 20);
+    let block = Block::bordered().title(" Name this kit ").border_style(Style::new().fg(AMBER));
+    let hints = ["Enter save", "Esc leave unsaved for now"];
+    let inner = hinted_box(f, area, block, &hints);
+    let text = vec![
+        Line::from(format!("{name}▏")),
+        Line::from(""),
+        Line::from(Span::styled("This kit hasn't been saved yet.", Style::new().fg(DIM))),
+    ];
+    f.render_widget(Paragraph::new(text), inner);
 }
 
 fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u32) {
@@ -467,19 +559,47 @@ pub const HELP: &[Page] = &[
             ("Shift+pad", "Stop that pad"),
             ("Space", "Stop all pads"),
             ("← → ↑ ↓", "Select a pad"),
-            ("Enter", "Assign a stored cue to the selected pad"),
+            ("Enter", "Browse samples to assign to the selected pad"),
+            ("K", "Browse kits: switch, or create a new one"),
         ],
     ),
     Page::Keys(
         "Pads",
         &[
-            ("Enter", "Assign a stored cue to the selected pad"),
+            ("Enter", "Browse samples to assign to the selected pad"),
+            ("K", "Browse kits: switch, or create a new one"),
             ("T", "Trim: open the selected pad in the sample editor"),
             ("M", "Mode: one-shot · gate (plays while held) · toggle"),
             ("L", "Loop on/off"),
             ("G", "Retrigger: a one-shot press while playing restarts or is ignored"),
             ("- / = / 0", "Gain down / up / 0 dB"),
             ("Delete / Backspace", "Clear the selected pad"),
+        ],
+    ),
+    Page::Keys(
+        "Sample browser",
+        &[
+            ("↑ ↓", "Select a row"),
+            ("Enter", "Assign the sample, open the kit, or browse odj-player's cues"),
+            ("Esc", "Close without assigning"),
+        ],
+    ),
+    Page::Keys(
+        "Kit browser",
+        &[
+            ("↑ ↓", "Select a row"),
+            ("Enter", "Switch to that kit, or start naming a new one"),
+            ("Delete / Backspace", "Delete the selected kit (asks to confirm first, in red)"),
+            ("(typing)", "Name a new kit; Enter creates it, Esc cancels"),
+            ("Esc", "Close without switching"),
+        ],
+    ),
+    Page::Keys(
+        "Name this kit",
+        &[
+            ("(typing)", "A kit changed for the first time has no name yet"),
+            ("Enter", "Save it under this name, creating its folder"),
+            ("Esc", "Leave it unsaved for now; asked again next change"),
         ],
     ),
     Page::Keys(

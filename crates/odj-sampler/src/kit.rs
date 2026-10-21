@@ -1,8 +1,13 @@
-//! The kit: what each pad holds, saved as `$XDG_DATA_HOME/odj/kit.json`.
+//! The kit: what each pad holds, saved as `kit.json` inside the kit's own
+//! directory under `$XDG_DATA_HOME/odj/kits/` (see `kits.rs` for the
+//! directory layout, listing, and switching between multiple kits).
 //!
-//! Only references are saved, never audio: the track's fingerprint and last known
-//! path, the region in the track, and the pad's properties. At startup the pads are
-//! cut from the files again.
+//! A pad's `PadSource.path` always points at a `.wav` the kit owns in its
+//! own `samples/` directory — audio assigned from odj-player's cues is cut
+//! and copied there once, on assignment, rather than re-read from the
+//! original track every time (see `App::copy_into_kit`). Only the
+//! reference (fingerprint, path, region, pad properties) is saved here; the
+//! samples themselves live as files, and are decoded again at startup.
 
 use std::path::{Path, PathBuf};
 
@@ -12,7 +17,7 @@ use odj_core::memory::{data_dir, read_json, write_json};
 
 use crate::engine::{PADS, Props};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// One pad's region of a track. Positions are frames at the track's sample rate.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,21 +57,28 @@ pub struct KitPad {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Kit {
     version: u32,
+    /// Shown in the kit browser; the directory it lives in (see `kits.rs`)
+    /// is a separate, generated slug, so renaming later won't need to move
+    /// anything on disk.
+    #[serde(default)]
+    pub name: String,
     pub pads: [KitPad; PADS],
 }
 
 impl Default for Kit {
     fn default() -> Self {
-        Self::new(Default::default())
+        Self::new(String::new(), Default::default())
     }
 }
 
 impl Kit {
-    pub fn new(pads: [KitPad; PADS]) -> Self {
-        Self { version: VERSION, pads }
+    pub fn new(name: String, pads: [KitPad; PADS]) -> Self {
+        Self { version: VERSION, name, pads }
     }
 
-    pub fn file() -> PathBuf {
+    /// Where a single kit used to live, before multiple kits existed. Only
+    /// `kits::migrate_legacy_kit` still reads this path.
+    pub fn legacy_file() -> PathBuf {
         data_dir().join("kit.json")
     }
 

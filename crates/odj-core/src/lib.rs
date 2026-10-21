@@ -8,3 +8,4 @@ pub mod link;
 pub mod memory;
 pub mod track;
 pub mod tui;
+pub mod wav;

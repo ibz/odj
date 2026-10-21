@@ -98,26 +98,38 @@ cues survive renaming, moving and retagging. Settings such as Auto Cue live in
 
 ## odj-sampler
 
-Sixteen pads on the keys `1234 / QWER / ASDF / ZXCV`. Press Enter to put one
-of your stored cues (hot cues, memory points, last loops) on the selected pad.
-A loop goes on as it is. A cue without an end opens the sample editor, which
-starts at 4 bars and lets you move the start and the end along the beat grid
-by beats or bars, or by milliseconds, and preview it; `T` brings a pad back into it. Each pad can be one-shot, gate (plays while held) or toggle, loop
-or not, and has its own gain.
+Sixteen pads on the keys `1234 / QWER / ASDF / ZXCV`. Press Enter to browse
+samples for the selected pad: the active kit's own samples first, `Up` to
+browse any other kit's, or jump straight to a shortcut that browses your
+stored odj-player cues (hot cues, memory points, last loops) instead. A
+loop from a cue goes on as it is; a cue without an end opens the sample
+editor, which starts at 4 bars and lets you move the start and the end
+along the beat grid by beats or bars, or by milliseconds, and preview it;
+`T` brings a pad back into it. Each pad can be one-shot, gate (plays while
+held) or toggle, loop or not, and has its own gain.
 
 A pad holds its own copy of the audio, cut out and converted to the output
-rate, so the track file isn't read again while you play. The header and the
-memory panel show how much memory the pads take. The kit (which cue is on which
-pad, the trimmed end and the pad settings) is saved as you go to
-`~/.local/share/odj/kit.json`, and the pads are cut from the files again at the
-next start. A pad whose file has moved or changed shows so.
+rate, so the track file isn't read again while you play. The first time a
+cue is put on a pad, it's cut from the original track and saved as its own
+`.wav` inside the kit — from then on that kit owns the sample outright,
+even if you later clear the pad; picking it again (or giving it to another
+kit via the sample browser's `Up`) just reuses that file. The header and
+the memory panel show how much memory the pads take.
 
-On first run, with no kit yet, you're offered a starter kit: a small one
-built into the binary (works offline, no setup), a fuller kit downloaded
-from the companion [odj-kits](https://github.com/ibz/odj-kits) repo
-(currently Acoustic and Latin percussion, both CC0), or skip and build your
-own kit from your cues as above. The pick only happens once — once
-`kit.json` exists (even empty), odj-sampler never asks again.
+**Kits.** Everything above belongs to one kit at a time — pad assignments,
+properties, and the samples themselves — each its own self-contained
+folder under `~/.local/share/odj/kits/<name>/` (a `kit.json` plus its
+`samples/`). Press `K` any time to switch kits or create a new, empty one;
+odj-sampler remembers the last one used (in `~/.local/share/odj/settings.json`)
+and loads it directly next time. On first run, with no kit yet, the same
+browser offers a small kit built into the binary (works offline, no setup),
+fuller kits downloaded from the companion
+[odj-kits](https://github.com/ibz/odj-kits) repo (currently Acoustic and
+Latin percussion, both CC0), or creating a new, empty kit of your own.
+Deleting the kit you're on falls back to another one if you have one, or
+to a fresh, unnamed kit otherwise — nothing's written to disk for *that*
+until you actually change something, at which point you're asked to name
+it, which creates its folder.
 
 Pads can also be triggered over MIDI — Note On/Off from an external
 sequencer (hardware or software) works exactly like a key press, including
@@ -221,19 +233,47 @@ along their bottom edge, as does the output picker at start.
 | `Shift+pad` | Stop that pad |
 | `Space` | Stop all pads |
 | `← → ↑ ↓` | Select a pad |
-| `Enter` | Assign a stored cue to the selected pad |
+| `Enter` | Browse samples to assign to the selected pad |
+| `K` | Browse kits: switch, or create a new one |
 
 #### Pads
 
 | Key | Does |
 | --- | --- |
-| `Enter` | Assign a stored cue to the selected pad |
+| `Enter` | Browse samples to assign to the selected pad |
+| `K` | Browse kits: switch, or create a new one |
 | `T` | Trim: open the selected pad in the sample editor |
 | `M` | Mode: one-shot · gate (plays while held) · toggle |
 | `L` | Loop on/off |
 | `G` | Retrigger: a one-shot press while playing restarts or is ignored |
 | `- / = / 0` | Gain down / up / 0 dB |
 | `Delete / Backspace` | Clear the selected pad |
+
+#### Sample browser
+
+| Key | Does |
+| --- | --- |
+| `↑ ↓` | Select a row |
+| `Enter` | Assign the sample, open the kit, or browse odj-player's cues |
+| `Esc` | Close without assigning |
+
+#### Kit browser
+
+| Key | Does |
+| --- | --- |
+| `↑ ↓` | Select a row |
+| `Enter` | Switch to that kit, or start naming a new one |
+| `Delete / Backspace` | Delete the selected kit (asks to confirm first, in red) |
+| `(typing)` | Name a new kit; Enter creates it, Esc cancels |
+| `Esc` | Close without switching |
+
+#### Name this kit
+
+| Key | Does |
+| --- | --- |
+| `(typing)` | A kit changed for the first time has no name yet |
+| `Enter` | Save it under this name, creating its folder |
+| `Esc` | Leave it unsaved for now; asked again next change |
 
 #### Sample editor
 

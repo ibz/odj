@@ -172,6 +172,21 @@ it); `↑`/`↓` navigate the focused list; `x`/`Delete` removes a queued
 item; `Esc` clears the query or cancels a search in progress; `Ctrl+C`
 quits.
 
+## odj-mixer
+
+Mixes sound-card inputs — a turntable's line-in, a mixer channel, a mic —
+into one output, live, each with its own volume, so they come out
+alongside whatever else is playing. Needs PipeWire running (it refuses to
+start without it): routing between two different cards relies on
+PipeWire's shared graph clock to keep them in sync, which plain ALSA has
+no way to do. At startup you pick the output the same way odj-player does,
+then a checklist of every detected input; `Space` toggles any number of
+them on, `Enter` starts mixing whichever are checked. While running,
+`↑`/`↓` selects an input and `←`/`→` adjusts its volume (`Shift`: ×4
+steps), `0` resets it to 100%; `q`/`Esc`/`Ctrl+C` stops it. No per-input EQ
+yet — that's planned, reusing the same filters behind odj-player's own
+Mixer (`M`).
+
 ## Keys
 
 Press `?` in either app for these keys, on the same pages as here: `Tab` and
@@ -322,10 +337,11 @@ along their bottom edge, as does the output picker at start.
 
 ## Layout
 
-A Cargo workspace: `crates/odj-core` holds what both apps share (decoding and
-fingerprinting, the cue library, audio output, the file browser, the link
-between decks);
-`crates/odj-player` and `crates/odj-sampler` are the two binaries.
+A Cargo workspace: `crates/odj-core` holds what the apps share (decoding and
+fingerprinting, the cue library, audio input/output, the file browser, the
+link between decks);
+`crates/odj-player`, `crates/odj-sampler`, `crates/odj-downloader` and
+`crates/odj-mixer` are the four binaries.
 
 ## Install on Omarchy / Arch
 
@@ -334,10 +350,12 @@ git clone https://github.com/ibz/odj && cd odj/packaging/arch
 makepkg -si
 ```
 
-This builds the latest `master`, pulls in `rubberband`, `alsa-lib` and `libpipewire`, and
-installs `odj-player`, an `odj` alias and a launcher entry (Super+Space →
-"odj player"), which opens in your default terminal. Run `makepkg -si` again
-to update; `sudo pacman -R odj-git` removes it. Once it's on the AUR: `yay -S odj-git`.
+This builds the latest `master`, pulls in `rubberband`, `alsa-lib`, `libpipewire`
+and `yt-dlp`, and installs all four binaries (`odj-player`, `odj-sampler`,
+`odj-downloader`, `odj-mixer`), an `odj` alias for `odj-player`, and a launcher
+entry (Super+Space → "odj player"), which opens in your default terminal. Run
+`makepkg -si` again to update; `sudo pacman -R odj-git` removes it. Once it's
+on the AUR: `yay -S odj-git`.
 
 ## Install on Debian / Ubuntu
 
@@ -348,9 +366,10 @@ sudo apt install ./packaging/debian/dist/debian-trixie/odj_*.deb
 ```
 
 This builds the package in a Docker container of the release you name (Debian
-trixie by default), so it matches that release's libraries. It installs
-`odj-player`, an `odj` alias and the launcher entry, and pulls in rubberband,
-ALSA and PipeWire. `sudo apt remove odj` removes it.
+trixie by default), so it matches that release's libraries. It installs all
+four binaries, an `odj` alias for `odj-player` and the launcher entry, and
+pulls in rubberband, ALSA, PipeWire and `yt-dlp`. `sudo apt remove odj`
+removes it.
 
 ## License
 

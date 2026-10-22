@@ -1,5 +1,5 @@
 pkgbase = odj-git
-	pkgdesc = Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader and sampler for the terminal
+	pkgdesc = Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader, sampler and input mixer for the terminal
 	pkgver = r17.0915687
 	pkgrel = 1
 	url = https://github.com/ibz/odj

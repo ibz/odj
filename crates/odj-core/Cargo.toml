@@ -19,6 +19,7 @@ libc.workspace = true
 cpal.workspace = true
 midir.workspace = true
 pipewire.workspace = true
+ringbuf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 symphonia.workspace = true

@@ -26,7 +26,7 @@ copyright = "Ioan Bizău <odj@ibz.me>"
 license-file = ["../../LICENSE", "0"]
 section = "sound"
 priority = "optional"
-extended-description = "Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader and sampler for the terminal."
+extended-description = "Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader, sampler and input mixer for the terminal."
 # $auto picks up the shared libs each binary links (rubberband, ALSA,
 # PipeWire, …); yt-dlp is odj-downloader's runtime dependency — it shells
 # out to the `yt-dlp` binary directly, so that's never auto-detected.
@@ -35,6 +35,7 @@ assets = [
     ["target/release/odj-player", "usr/bin/", "755"],
     ["target/release/odj-sampler", "usr/bin/", "755"],
     ["target/release/odj-downloader", "usr/bin/", "755"],
+    ["target/release/odj-mixer", "usr/bin/", "755"],
     { dest = "usr/bin/odj", link_name = "odj-player" },
     ["../../packaging/odj-player.desktop", "usr/share/applications/", "644"],
     ["../../README.md", "usr/share/doc/odj/", "644"],

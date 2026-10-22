@@ -56,14 +56,14 @@ pub fn restore(key_release: bool) {
 /// would otherwise be unreachable. Only the system default is used without asking, and
 /// only when no outputs were found at all. `None` means the user quit the picker.
 pub fn pick_output(terminal: &mut DefaultTerminal, host: &audio::Host) -> Result<Option<audio::Output>> {
-    let cards = audio::cards(host)?;
+    let cards = audio::output_cards(host)?;
     let choices = audio::choices(&cards);
     if choices.is_empty() {
         return audio::Output::open_default(host)
             .context("no audio outputs found (does your user have access to /dev/snd, e.g. via the `audio` group?)")
             .map(Some);
     }
-    let items: Vec<(String, bool)> = choices.iter().map(|c| (c.label(&cards), c.available(&cards))).collect();
+    let items: Vec<(String, bool)> = choices.iter().map(|c| (c.label(&cards, "Out"), c.available(&cards))).collect();
     let mut selected = items.iter().position(|(_, ok)| *ok).unwrap_or(0);
     loop {
         terminal.draw(|f| draw_output_picker(f, &items, selected))?;

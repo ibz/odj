@@ -13,8 +13,8 @@ use crate::link;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::platform::PipeWireHost;
 use cpal::{
-    BufferSize, Error as CpalError, OutputCallbackInfo, Device, DeviceDirection, ErrorKind, FromSample, HostId,
-    SampleFormat, SizedSample, Stream, StreamConfig,
+    BufferSize, Error as CpalError, InputCallbackInfo, OutputCallbackInfo, Device, DeviceDirection, ErrorKind,
+    FromSample, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
 };
 use pipewire as pw;
 
@@ -54,7 +54,8 @@ pub struct Card {
     pub unavailable: Option<&'static str>,
 }
 
-/// One entry of the output picker.
+/// One entry of the output/input picker.
+#[derive(Clone, Copy)]
 pub struct Choice {
     pub card: usize,
     pub route: Route,
@@ -65,25 +66,29 @@ impl Choice {
         cards[self.card].unavailable.is_none()
     }
 
-    pub fn label(&self, cards: &[Card]) -> String {
+    /// `word` names the channels in a wider route ("Out 3–4", "In 3–4") —
+    /// "Out" for an output picker, "In" for an input one; [`Card`]/[`Route`]
+    /// don't track which themselves, since the exact same listing/routing
+    /// logic serves both.
+    pub fn label(&self, cards: &[Card], word: &str) -> String {
         let card = &cards[self.card];
         if let Some(why) = card.unavailable {
             return format!("{} · {why}", card.name);
         }
-        route_label(&card.name, card.channels, self.route)
+        route_label(&card.name, card.channels, self.route, word)
     }
 }
 
 /// Builds the choice label text from a card's name and channel count directly, so
-/// [`Output::open`] can label the card it actually resolved rather than the possibly
-/// stale one the picker showed.
-fn route_label(name: &str, channels: u16, route: Route) -> String {
+/// [`Output::open`]/[`Input::open`] can label the card it actually resolved rather
+/// than the possibly stale one the picker showed.
+fn route_label(name: &str, channels: u16, route: Route, word: &str) -> String {
     match (channels, route) {
         (2, Route::Stereo(..)) => format!("{name} · stereo"),
         (2, Route::Mono(0)) => format!("{name} · left only (mono)"),
         (2, Route::Mono(_)) => format!("{name} · right only (mono)"),
-        (_, Route::Stereo(l, r)) => format!("{name} · Out {}–{} (stereo)", l + 1, r + 1),
-        (_, Route::Mono(c)) => format!("{name} · Out {} (mono)", c + 1),
+        (_, Route::Stereo(l, r)) => format!("{name} · {word} {}–{} (stereo)", l + 1, r + 1),
+        (_, Route::Mono(c)) => format!("{name} · {word} {} (mono)", c + 1),
     }
 }
 
@@ -92,20 +97,42 @@ pub fn host() -> Host {
     cpal::default_host()
 }
 
+/// Whether a [`Card`] list is being built for playback or for capture — the
+/// `Card`/`Route`/`Choice`/`choices` shapes are identical either way; only
+/// how PipeWire nodes get filtered, and which `cpal` enumeration/config
+/// methods apply, differ.
+#[derive(Clone, Copy, PartialEq)]
+enum Direction {
+    Output,
+    Input,
+}
+
 /// Playback devices to choose from, including HDMI/DisplayPort — the picker is always
 /// shown, so there's no need to hide outputs nobody would want; the user just skips them.
 ///
 /// Fails when PipeWire runs but offers nothing: going around it to the hardware would
 /// lock cards away from PipeWire and other odj instances, and hide the real problem.
-pub fn cards(host: &Host) -> Result<Vec<Card>> {
+pub fn output_cards(host: &Host) -> Result<Vec<Card>> {
+    cards_in(host, Direction::Output, "outputs")
+}
+
+/// Recording devices to choose from (microphones, line-ins, a sound card's
+/// other input channels) — [`odj-mixer`](../../odj-mixer/index.html)'s
+/// own picker. Same shape and the same PipeWire/ALSA fallback as
+/// [`output_cards`].
+pub fn input_cards(host: &Host) -> Result<Vec<Card>> {
+    cards_in(host, Direction::Input, "inputs")
+}
+
+fn cards_in(host: &Host, direction: Direction, kind: &str) -> Result<Vec<Card>> {
     let pipewire = <PipeWireHost as HostTrait>::is_available();
     let cards = match host.id() {
-        HostId::PipeWire => pipewire_cards(host),
-        _ => alsa_cards(host),
+        HostId::PipeWire => pipewire_cards(host, direction),
+        _ => alsa_cards(host, direction),
     };
     if pipewire && (host.id() != HostId::PipeWire || cards.is_empty()) {
         bail!(
-            "PipeWire is running but has no usable audio outputs.\n\
+            "PipeWire is running but has no usable audio {kind}.\n\
              Check `wpctl status`. If it lists no devices, PipeWire probably can't open the \
              sound cards: make sure your user may use /dev/snd (e.g. is in the `audio` group), \
              then log in again or reboot so PipeWire restarts with that access."
@@ -114,26 +141,48 @@ pub fn cards(host: &Host) -> Result<Vec<Card>> {
     Ok(cards)
 }
 
-/// PipeWire sinks. Other programs' playback streams (including other odj instances)
-/// and the "follow the default" placeholders are left out.
-fn pipewire_cards(host: &Host) -> Vec<Card> {
-    let Ok(devices) = host.output_devices() else {
+/// PipeWire sinks (for [`Direction::Output`]) or sources (for
+/// [`Direction::Input`]). Other programs' own streams (including other odj
+/// instances) and the "follow the default" placeholders are left out.
+fn pipewire_cards(host: &Host, direction: Direction) -> Vec<Card> {
+    let found = match direction {
+        Direction::Output => host.output_devices(),
+        Direction::Input => host.input_devices(),
+    };
+    let Ok(devices) = found else {
         return Vec::new();
+    };
+    // A sink is listed as duplex (its monitor can be recorded) and a source
+    // as input-only; either way, a *stream* (another app's already-open
+    // playback/recording) reports the single matching direction instead,
+    // which is how `Direction::Output` below excludes them same as before.
+    // For `Direction::Input` this can't tell a real source apart from
+    // another app's input stream by direction alone — confirmed against
+    // cpal's PipeWire backend source, not (yet) against a live session
+    // with another app actually recording; if that turns out to let
+    // spurious entries through, it needs a name-based exclusion too, the
+    // way the output side already excludes `alsa_output.hw_*`.
+    let wanted = match direction {
+        Direction::Output => DeviceDirection::Duplex,
+        Direction::Input => DeviceDirection::Input,
     };
     let mut cards = Vec::new();
     for device in devices {
         let node = device.id().map(|id| id.id().to_string()).unwrap_or_default();
         let Ok(desc) = device.description() else { continue };
-        // Sinks are listed as duplex (their monitor can be recorded); streams as output only.
-        if desc.direction() != DeviceDirection::Duplex || node.ends_with("_default") {
+        if desc.direction() != wanted || node.ends_with("_default") {
             continue;
         }
         // The whole-card node that split sinks (e.g. "Line A", "Line B") are carved out of.
-        if node.starts_with("alsa_output.hw_") {
+        if direction == Direction::Output && node.starts_with("alsa_output.hw_") {
             continue;
         }
         let name = desc.name().to_string();
-        let Ok(config) = device.default_output_config() else { continue };
+        let config = match direction {
+            Direction::Output => device.default_output_config(),
+            Direction::Input => device.default_input_config(),
+        };
+        let Ok(config) = config else { continue };
         cards.push(Card {
             device,
             id: node,
@@ -149,8 +198,12 @@ fn pipewire_cards(host: &Host) -> Vec<Card> {
 }
 
 /// ALSA hardware cards. Cards that are busy or off-limits are listed as unavailable.
-fn alsa_cards(host: &Host) -> Vec<Card> {
-    let Ok(devices) = host.output_devices() else {
+fn alsa_cards(host: &Host, direction: Direction) -> Vec<Card> {
+    let found = match direction {
+        Direction::Output => host.output_devices(),
+        Direction::Input => host.input_devices(),
+    };
+    let Ok(devices) = found else {
         return Vec::new();
     };
     let devices: Vec<Device> = devices.collect();
@@ -167,7 +220,15 @@ fn alsa_cards(host: &Host) -> Vec<Card> {
         let name = desc.name().to_string();
         let Some(plug) = devices.iter().find(|d| pcm_id(d) == format!("plug{id}")) else { continue };
         // The raw hw device tells the real channel count and native rate.
-        let configs = match hw.supported_output_configs() {
+        // Collected into a `Vec` right away: `supported_input_configs`/
+        // `supported_output_configs` return different (if structurally
+        // identical) associated iterator types, which a bare `match` can't
+        // unify, but both yield the same `SupportedStreamConfigRange` item.
+        let configs: Result<Vec<_>, _> = match direction {
+            Direction::Output => hw.supported_output_configs().map(Iterator::collect),
+            Direction::Input => hw.supported_input_configs().map(Iterator::collect),
+        };
+        let configs = match configs {
             Ok(configs) => configs,
             Err(e) => {
                 let why = match e.kind() {
@@ -179,7 +240,7 @@ fn alsa_cards(host: &Host) -> Vec<Card> {
                 continue;
             }
         };
-        let Some(best) = configs.max_by(|a, b| {
+        let Some(best) = configs.into_iter().max_by(|a, b| {
             a.channels().cmp(&b.channels()).then(a.cmp_default_heuristics(b))
         }) else {
             continue;
@@ -271,7 +332,7 @@ impl Output {
         if let Some(why) = wanted.unavailable {
             bail!("{} is unavailable: {why}", wanted.name);
         }
-        let fresh = self::cards(host)?;
+        let fresh = self::output_cards(host)?;
         let card = fresh
             .iter()
             .find(|c| c.id == wanted.id)
@@ -304,7 +365,7 @@ impl Output {
             config: supported.into(),
             device: card.device.clone(),
             route: choice.route,
-            name: route_label(&card.name, card.channels, choice.route),
+            name: route_label(&card.name, card.channels, choice.route, "Out"),
             target_id: Some(card.id.clone()),
             errors: Errors::default(),
         })
@@ -396,6 +457,170 @@ fn route_frame<T: SizedSample + FromSample<f32>>(frame: &mut [T], lr: &[f32], ro
     }
 }
 
+/// Reads one stereo pair out of a (possibly wider) captured frame — the
+/// mirror of [`route_frame`].
+fn extract_frame<T: SizedSample>(frame: &[T], route: Route) -> (f32, f32)
+where
+    f32: FromSample<T>,
+{
+    match route {
+        Route::Stereo(l, r) => (f32::from_sample(frame[l as usize]), f32::from_sample(frame[r as usize])),
+        Route::Mono(c) => {
+            let v = f32::from_sample(frame[c as usize]);
+            (v, v)
+        }
+    }
+}
+
+/// Whether `host` is actually running against PipeWire —
+/// [`odj-mixer`](../../odj-mixer/index.html) needs this: routing
+/// between two different cards needs PipeWire's unified graph clock
+/// (every stream it carries ends up resampled to one shared clock, even
+/// across physically different cards); plain ALSA has no such thing, so
+/// two independent hardware clocks would drift apart with no way to
+/// correct it here.
+pub fn is_pipewire(host: &Host) -> bool {
+    host.id() == HostId::PipeWire
+}
+
+/// A recording device: the input-side counterpart to [`Output`]. Doesn't
+/// play anything itself — [`Input::start`] pushes captured, routed stereo
+/// frames into a ring buffer; read them back with an [`Source`]
+/// implementation wrapping the matching consumer (e.g.
+/// [`odj-mixer`](../../odj-mixer/index.html)'s own mixing source).
+pub struct Input {
+    device: Device,
+    config: StreamConfig,
+    format: SampleFormat,
+    route: Route,
+    pub name: String,
+    /// The card [`Input::open`]'s re-resolve checked against; see
+    /// [`Output::open`]'s doc comment for why this exists.
+    target_id: Option<String>,
+    pub errors: Errors,
+}
+
+impl Input {
+    /// Opens `choice` on one of `cards` — mirrors [`Output::open`]'s
+    /// re-resolve-before-connecting exactly, for the same reason (a stale
+    /// `Device` from an earlier listing can silently reconnect to the
+    /// wrong node by the time it's actually used).
+    pub fn open(host: &Host, cards: &[Card], choice: &Choice) -> Result<Self> {
+        let wanted = &cards[choice.card];
+        if let Some(why) = wanted.unavailable {
+            bail!("{} is unavailable: {why}", wanted.name);
+        }
+        let fresh = self::input_cards(host)?;
+        let card = fresh
+            .iter()
+            .find(|c| c.id == wanted.id)
+            .ok_or_else(|| anyhow!("{} is no longer available", wanted.name))?;
+        if let Some(why) = card.unavailable {
+            bail!("{} is unavailable: {why}", card.name);
+        }
+        if card.channels != wanted.channels {
+            bail!(
+                "{} changed ({} channels now, {} when it was picked)",
+                card.name,
+                card.channels,
+                wanted.channels
+            );
+        }
+        let configs: Vec<_> = card
+            .device
+            .supported_input_configs()
+            .with_context(|| format!("opening {}", card.name))?
+            .filter(|c| c.channels() == card.channels && c.contains_rate(card.rate))
+            .collect();
+        let supported = configs
+            .iter()
+            .find(|c| c.sample_format() == SampleFormat::F32)
+            .or_else(|| configs.iter().max_by(|a, b| a.cmp_default_heuristics(b)))
+            .ok_or_else(|| anyhow!("{} has no usable input format", card.name))?
+            .with_sample_rate(card.rate);
+        Ok(Self {
+            format: supported.sample_format(),
+            config: supported.into(),
+            device: card.device.clone(),
+            route: choice.route,
+            name: route_label(&card.name, card.channels, choice.route, "In"),
+            target_id: Some(card.id.clone()),
+            errors: Errors::default(),
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    /// Captures this input's routed channels and pushes them, interleaved
+    /// (L, R, L, R, …), into `into` — samples arriving faster than the
+    /// consumer drains them are dropped (same spirit as `Xrun`s on the
+    /// output side: audible already, not worth reporting every one).
+    /// Unlike [`Output::start`] this doesn't retry with a different buffer
+    /// size on failure — `into` isn't cheaply cloneable (a ring buffer has
+    /// exactly one producer), so there's nothing to retry with once it's
+    /// been moved into a failed attempt.
+    pub fn start(&self, into: ringbuf::HeapProd<f32>) -> Result<Stream> {
+        let mut config = self.config;
+        config.buffer_size = BufferSize::Fixed(BUFFER_FRAMES);
+        let route = self.route;
+        let errors = self.errors.clone();
+        let stream = match self.format {
+            SampleFormat::F32 => build_input::<f32>(&self.device, &config, route, into, errors),
+            SampleFormat::F64 => build_input::<f64>(&self.device, &config, route, into, errors),
+            SampleFormat::I16 => build_input::<i16>(&self.device, &config, route, into, errors),
+            SampleFormat::I32 => build_input::<i32>(&self.device, &config, route, into, errors),
+            SampleFormat::U16 => build_input::<u16>(&self.device, &config, route, into, errors),
+            other => return Err(anyhow!("unsupported sample format {other}")),
+        }?;
+        stream.play().context("starting audio stream")?;
+        Ok(stream)
+    }
+}
+
+fn build_input<T>(
+    device: &Device,
+    config: &StreamConfig,
+    route: Route,
+    mut into: ringbuf::HeapProd<f32>,
+    errors: Errors,
+) -> Result<Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    use ringbuf::traits::Producer;
+
+    let channels = config.channels as usize;
+    let mut stereo = vec![0.0f32; 8192];
+    let stream = device.build_input_stream(
+        *config,
+        move |data: &[T], _info: &InputCallbackInfo| {
+            let frames = data.len() / channels;
+            if stereo.len() < frames * 2 {
+                stereo.resize(frames * 2, 0.0);
+            }
+            for (frame, lr) in data.chunks_exact(channels).zip(stereo.chunks_exact_mut(2)) {
+                let (l, r) = extract_frame(frame, route);
+                lr[0] = l;
+                lr[1] = r;
+            }
+            let _ = into.push_slice(&stereo[..frames * 2]);
+        },
+        move |err: CpalError| {
+            if err.kind() != ErrorKind::Xrun {
+                errors.report(match err.message() {
+                    Some(m) => format!("Audio error: {m}"),
+                    None => format!("Audio error: {}", err.kind()),
+                });
+            }
+        },
+        None,
+    )?;
+    Ok(stream)
+}
+
 /// Confirms a PipeWire-routed [`Output`] actually connected to the card it was opened on,
 /// rather than PipeWire silently falling back to the default sink because the node we
 /// asked for had disappeared by the time the stream connected (the race [`Output::open`]'s
@@ -412,12 +637,31 @@ pub fn verify_route(host: &Host, output: &Output) -> Result<()> {
     if host.id() != HostId::PipeWire {
         return Ok(());
     }
-    match pipewire_peer_of_own_stream() {
+    match pipewire_peer_of_own_stream(true) {
         PeerCheck::Linked(got) if got == want => Ok(()),
         PeerCheck::Linked(got) => bail!(
             "expected to play on {} but PipeWire linked the stream to {got} instead \
              (the device likely disappeared and PipeWire fell back to its default)",
             output.name
+        ),
+        PeerCheck::Unconfirmed => Ok(()),
+    }
+}
+
+/// [`verify_route`]'s mirror for [`Input`] — same reasoning, same race,
+/// just checking the link the other way around: our node is the link's
+/// *input* side (receiving from a source), not its output side.
+pub fn verify_input_route(host: &Host, input: &Input) -> Result<()> {
+    let Some(want) = input.target_id.as_deref() else { return Ok(()) };
+    if host.id() != HostId::PipeWire {
+        return Ok(());
+    }
+    match pipewire_peer_of_own_stream(false) {
+        PeerCheck::Linked(got) if got == want => Ok(()),
+        PeerCheck::Linked(got) => bail!(
+            "expected to capture from {} but PipeWire linked the stream to {got} instead \
+             (the device likely disappeared and PipeWire fell back to its default)",
+            input.name
         ),
         PeerCheck::Unconfirmed => Ok(()),
     }
@@ -442,7 +686,7 @@ enum PeerCheck {
 /// dispatching the first sync's replies), so a second sync/wait round trip follows to be
 /// sure their `info` replies have also come back before giving up and reading what was
 /// collected.
-fn pipewire_peer_of_own_stream() -> PeerCheck {
+fn pipewire_peer_of_own_stream(we_are_output: bool) -> PeerCheck {
     pw::init();
     let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else { return PeerCheck::Unconfirmed };
     let Ok(context) = pw::context::ContextRc::new(&mainloop, None) else { return PeerCheck::Unconfirmed };
@@ -537,13 +781,13 @@ fn pipewire_peer_of_own_stream() -> PeerCheck {
     let Some((&our_id, _)) = nodes.iter().find(|(_, (_, ours))| *ours) else {
         return PeerCheck::Unconfirmed;
     };
-    links
-        .borrow()
-        .iter()
-        .find(|(output, _)| *output == our_id)
-        .and_then(|(_, input)| nodes.get(input))
-        .map(|(name, _)| PeerCheck::Linked(name.clone()))
-        .unwrap_or(PeerCheck::Unconfirmed)
+    let links = links.borrow();
+    let peer = if we_are_output {
+        links.iter().find(|(output, _)| *output == our_id).and_then(|(_, input)| nodes.get(input))
+    } else {
+        links.iter().find(|(_, input)| *input == our_id).and_then(|(output, _)| nodes.get(output))
+    };
+    peer.map(|(name, _)| PeerCheck::Linked(name.clone())).unwrap_or(PeerCheck::Unconfirmed)
 }
 
 #[cfg(test)]
@@ -564,6 +808,18 @@ mod tests {
         assert_eq!(frame, [0.0, -0.25, 0.0, 0.0]);
     }
 
+    #[test]
+    fn extract_frame_picks_the_routed_stereo_pair() {
+        let frame = [1.0f32, 2.0, 0.25, -0.5];
+        assert_eq!(extract_frame(&frame, Route::Stereo(2, 3)), (0.25, -0.5));
+    }
+
+    #[test]
+    fn extract_frame_mono_reads_one_channel_into_both_sides() {
+        let frame = [1.0f32, -0.75, 2.0, 3.0];
+        assert_eq!(extract_frame(&frame, Route::Mono(1)), (-0.75, -0.75));
+    }
+
     struct Silence;
     impl Source for Silence {
         fn render(&mut self, out: &mut [f32], _heard_at: f64) {
@@ -573,7 +829,7 @@ mod tests {
 
     /// Picks a usable stereo choice so the two tests below don't duplicate it.
     fn any_stereo_choice(host: &Host) -> (Vec<Card>, Choice) {
-        let cards = cards(host).unwrap();
+        let cards = output_cards(host).unwrap();
         let choice = choices(&cards)
             .into_iter()
             .find(|c| matches!(c.route, Route::Stereo(..)) && c.available(&cards))
@@ -590,7 +846,7 @@ mod tests {
         let stream = output.start(Arc::new(Mutex::new(Silence))).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
-            matches!(pipewire_peer_of_own_stream(), PeerCheck::Linked(_)),
+            matches!(pipewire_peer_of_own_stream(true), PeerCheck::Linked(_)),
             "should have actually found the link, not fallen back to Unconfirmed"
         );
         verify_route(&host, &output).unwrap();
@@ -614,12 +870,21 @@ mod tests {
     #[test]
     #[ignore = "lists this machine's sound cards"]
     fn list_cards() {
-        let cards = cards(&host()).unwrap();
+        println!("-- outputs --");
+        let cards = output_cards(&host()).unwrap();
         for c in &cards {
             println!("{} · {} ch · {} Hz", c.name, c.channels, c.rate);
         }
         for c in choices(&cards) {
-            println!("  {}", c.label(&cards));
+            println!("  {}", c.label(&cards, "Out"));
+        }
+        println!("-- inputs --");
+        let cards = input_cards(&host()).unwrap();
+        for c in &cards {
+            println!("{} · {} ch · {} Hz", c.name, c.channels, c.rate);
+        }
+        for c in choices(&cards) {
+            println!("  {}", c.label(&cards, "In"));
         }
     }
 }

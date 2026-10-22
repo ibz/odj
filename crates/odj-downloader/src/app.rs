@@ -408,4 +408,53 @@ mod tests {
         assert_eq!(app.status, Some("Search failed: no internet".to_string()));
         assert!(app.results.is_empty());
     }
+
+    /// Writes an ANSI dump of `app`'s current screen under
+    /// `target/screenshots/`, for a CI step to rasterize into the
+    /// README/website images — same shared directory and convention as
+    /// odj-player's/odj-sampler's own screenshot tests.
+    fn screenshot_dir() -> PathBuf {
+        let dir = std::env::var_os("ODJ_SCREENSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/screenshots")));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dump_screenshot(name: &str, app: &App, cols: u16, rows: u16) {
+        use odj_core::tui::to_ansi;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut t = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        std::fs::write(screenshot_dir().join(format!("{name}.ans")), to_ansi(t.backend().buffer())).unwrap();
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_downloader() {
+        let mut app = app(Vec::new());
+        app.query = "daft punk".into();
+        app.results =
+            vec![result("One More Time"), result("Around the World"), result("Harder, Better, Faster, Stronger")];
+        app.queue = vec![
+            QueueItem { seq: 1, title: "Digital Love".into(), url: "https://example.com/1".into(), status: Status::Done },
+            QueueItem {
+                seq: 2,
+                title: "Robot Rock".into(),
+                url: "https://example.com/2".into(),
+                status: Status::Downloading(42.0),
+            },
+            QueueItem {
+                seq: 3,
+                title: "Too Long".into(),
+                url: "https://example.com/3".into(),
+                status: Status::Failed("network error".into()),
+            },
+        ];
+        app.focus = Focus::Results;
+        app.selected_result = 1;
+        dump_screenshot("downloader", &app, 100, 24);
+    }
 }

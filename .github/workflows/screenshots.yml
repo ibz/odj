@@ -30,7 +30,10 @@ jobs:
             pkg-config libclang-dev librubberband-dev libasound2-dev libpipewire-0.3-dev
 
       - name: Render screens to ANSI
-        run: cargo test -p odj-player --bin odj-player -- --ignored screenshot
+        run: |
+          cargo test -p odj-player --bin odj-player -- --ignored screenshot
+          cargo test -p odj-sampler --bin odj-sampler -- --ignored screenshot
+          cargo test -p odj-downloader --bin odj-downloader -- --ignored screenshot
 
       - name: Install freeze
         run: |

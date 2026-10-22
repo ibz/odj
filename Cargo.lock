@@ -1556,6 +1556,7 @@ name = "odj-downloader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "odj-core",
  "ratatui",
  "youtube_dl",
 ]

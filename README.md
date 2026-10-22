@@ -111,6 +111,8 @@ cues survive renaming, moving and retagging. Settings such as Auto Cue live in
 
 ## odj-sampler
 
+![Sixteen pads loaded with a kit, one playing](https://raw.githubusercontent.com/ibz/odj/screenshots/sampler-pads.png)
+
 Sixteen pads on the keys `1234 / QWER / ASDF / ZXCV`. Press Enter to browse
 samples for the selected pad: the active kit's own samples first, `Up` to
 browse any other kit's (the embedded "Acoustic (Embedded)" kit is always
@@ -130,6 +132,8 @@ cue is put on a pad, it's cut from the original track and saved as its own
 even if you later clear the pad; picking it again (or giving it to another
 kit via the sample browser's `Up`) just reuses that file. The header and
 the memory panel show how much memory the pads take.
+
+![Switching kits, or creating a new one](https://raw.githubusercontent.com/ibz/odj/screenshots/sampler-kit-browser.png)
 
 **Kits.** Everything above belongs to one kit at a time — pad assignments,
 properties, and the samples themselves — each its own self-contained
@@ -155,6 +159,18 @@ device, you're walked through pressing each of the 16 pads in order so its
 notes are learned rather than assumed (controllers don't agree on how they
 number pads); after that it's remembered. The chosen port and each device's
 learned notes are kept in the same shared settings file.
+
+## odj-downloader
+
+![Searching, with a few downloads queued](https://raw.githubusercontent.com/ibz/odj/screenshots/downloader.png)
+
+Searches YouTube via `yt-dlp` and downloads whatever you queue, one at a
+time, into `~/Downloads` — handy for getting a track straight into a
+folder odj-player already watches. `Tab` moves focus between the search
+box, results and queue; `Enter` runs a search (or, on a result, queues
+it); `↑`/`↓` navigate the focused list; `x`/`Delete` removes a queued
+item; `Esc` clears the query or cancels a search in progress; `Ctrl+C`
+quits.
 
 ## Keys
 

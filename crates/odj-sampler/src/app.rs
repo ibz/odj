@@ -2024,4 +2024,61 @@ mod tests {
         let snapshot = a.sampler().snapshot();
         t.draw(|f| crate::ui::draw(f, &a, &snapshot)).unwrap();
     }
+
+    /// Writes an ANSI dump of `app`'s current screen under
+    /// `target/screenshots/`, for a CI step to rasterize into the
+    /// README/website images — same shared directory and convention as
+    /// odj-player's own `screenshot_dir`/`dump_screenshot` (see
+    /// `odj_player::app`), so both apps' CI steps can glob the same place.
+    fn screenshot_dir() -> PathBuf {
+        let dir = std::env::var_os("ODJ_SCREENSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/screenshots")));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dump_screenshot(name: &str, app: &App, cols: u16, rows: u16) {
+        use odj_core::tui::to_ansi;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let snapshot = app.sampler().snapshot();
+        let mut t = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+        std::fs::write(screenshot_dir().join(format!("{name}.ans")), to_ansi(t.backend().buffer())).unwrap();
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_pads() {
+        let mut a = app("screenshot-pads");
+        a.kit_name = "Trap Essentials".into();
+        a.slots[0].kit.source = Some(PadSource { title: "Kick 808".into(), cue: "hot A".into(), ..source() });
+        a.set_sample(0, Some(Sample::new(vec![0.1; 96_000], 48_000)));
+        a.slots[1].kit.source = Some(PadSource { title: "Snare Crisp".into(), cue: "hot B".into(), ..source() });
+        a.slots[2].kit.source = Some(PadSource { title: "Hi-Hat Closed".into(), cue: "hot A".into(), ..source() });
+        a.slots[2].kit.props.looped = true;
+        a.slots[5].kit.source = Some(PadSource { title: "Vocal Chop FX".into(), cue: "memory 1".into(), ..source() });
+        a.sampler().press(0);
+        a.tick();
+        dump_screenshot("sampler-pads", &a, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_kit_browser() {
+        let mut a = app("screenshot-kits");
+        a.screen = Screen::KitBrowser(KitBrowserState {
+            rows: vec![
+                kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/trap"), "Trap Essentials".into()),
+                kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/latin"), "Latin Percussion".into()),
+                kit_browser::KitRow::Embedded,
+                kit_browser::KitRow::CreateNew,
+            ],
+            selected: 0,
+            mode: KitBrowserMode::List,
+        });
+        dump_screenshot("sampler-kit-browser", &a, 120, 40);
+    }
 }

@@ -490,6 +490,14 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     spans.push(Span::raw("    "));
     spans.push(Span::styled("MEM ", Style::new().fg(DIM)));
     spans.push(Span::styled(s.memories.len().to_string(), Style::new().fg(MEMORY_COLOR)));
+    if let Some((a, b)) = s.draft_loop {
+        spans.push(Span::raw("    "));
+        spans.push(Span::styled("DRAFT ", Style::new().fg(DIM)));
+        spans.push(Span::styled(
+            format!("{} → {}", short_time(a / sr), short_time(b / sr)),
+            Style::new().fg(MEMORY_COLOR).add_modifier(Modifier::ITALIC),
+        ));
+    }
     spans.push(Span::raw("    "));
     spans.push(Span::styled("CUE ", Style::new().fg(DIM)));
     spans.push(Span::styled(short_time(s.cue / sr), Style::new().fg(CUE_COLOR)));
@@ -757,11 +765,12 @@ pub const HELP: &[Page] = &[
     Page::Keys(
         "Loops",
         &[
-            ("I / O / P", "Loop in / Loop out / Reloop-Exit"),
+            ("I / O / P", "Loop in / Loop out / Reloop-Exit (back into whatever loop you're at or just left)"),
             ("O while looping", "Loop out adjust: , / . move the out point (Shift: ×10), O to finish"),
             ("R while looping", "Play the loop backwards, R again for forwards"),
             ("L", "Beat loop of the loop size / exit the loop"),
-            ("Shift+L", "Promote the last loop (set by I/O/L, in or out of it) to a memory"),
+            ("Shift+P", "Jump to the draft loop (last one set by I/O/L), even after visiting another memory"),
+            ("Shift+L", "Promote the draft loop to a real memory"),
             ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
             ("Shift+[ / ]", "Same, but from the in point: extends or shrinks the loop to the left"),
             ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),

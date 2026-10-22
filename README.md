@@ -205,11 +205,12 @@ along their bottom edge, as does the output picker at start.
 
 | Key | Does |
 | --- | --- |
-| `I / O / P` | Loop in / Loop out / Reloop-Exit |
+| `I / O / P` | Loop in / Loop out / Reloop-Exit (back into whatever loop you're at or just left) |
 | `O while looping` | Loop out adjust: , / . move the out point (Shift: ×10), O to finish |
 | `R while looping` | Play the loop backwards, R again for forwards |
 | `L` | Beat loop of the loop size / exit the loop |
-| `Shift+L` | Promote the last loop (set by I/O/L, in or out of it) to a memory |
+| `Shift+P` | Jump to the draft loop (last one set by I/O/L), even after visiting another memory |
+| `Shift+L` | Promote the draft loop to a real memory |
 | `[ / ]` | Halve / double the roll or loop, else the next beat loop's size |
 | `Shift+[ / ]` | Same, but from the in point: extends or shrinks the loop to the left |
 | `; (hold)` | Loop roll of the loop size, [ / ] change it; back to where the track would be |

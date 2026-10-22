@@ -194,6 +194,8 @@ pub struct Snapshot {
     pub loop_out: Option<f64>,
     pub looping: bool,
     pub loop_adjust: bool,
+    /// The draft loop, if any — see `Deck::draft_loop`.
+    pub draft_loop: Option<(f64, f64)>,
     pub start_time: f64,
     pub brake_time: f64,
     pub bpm: Option<f64>,
@@ -269,6 +271,15 @@ pub struct Deck {
     looping: bool,
     /// Loop Out pressed while looping: the jog moves the out point.
     loop_adjust: bool,
+    /// A single draft slot for the last loop created by hand (`O`'s
+    /// close or `L`'s beatloop) — unlike `loop_in`/`loop_out` (reused by
+    /// Reloop-Exit for whatever loop you're currently at or just left,
+    /// memory or not), this is untouched by jumping to a memory in
+    /// between, so `reloop_draft` (Shift+P) can always get back to it,
+    /// and `promote_draft_loop` (Shift+L) can turn it into a real
+    /// memory. Overwritten by the next loop you create; not saved with
+    /// the track — an unsaved draft loop is exactly what this is for.
+    draft_loop: Option<(f64, f64)>,
     pub start_time: f64,
     pub brake_time: f64,
     /// The user's grid, overriding detection.
@@ -342,6 +353,7 @@ impl Deck {
             loop_out: None,
             looping: false,
             loop_adjust: false,
+            draft_loop: None,
             start_time: 0.0,
             brake_time: 0.25,
             grid_override: None,
@@ -398,6 +410,7 @@ impl Deck {
             loop_out: self.loop_out,
             looping: self.looping,
             loop_adjust: self.is_adjusting_loop(),
+            draft_loop: self.draft_loop,
             start_time: self.start_time,
             brake_time: self.brake_time,
             bpm: self.bpm(),
@@ -444,6 +457,7 @@ impl Deck {
         self.memories = mem.memories.clone();
         self.loop_in = mem.loop_in;
         self.loop_out = mem.loop_out;
+        self.draft_loop = None;
         self.grid_override = mem.grid(&track);
         self.quantize_override = mem.quantize;
         self.grid_adjust = false;
@@ -864,14 +878,16 @@ impl Deck {
         self.push_memory(entry)
     }
 
-    /// Promotes the last loop set (by `I`/`O`/`L`), in or out of it, to a
-    /// memory point — unlike `store_memory`, this works even once you've
-    /// left it, since `loop_in`/`loop_out` (what Reloop-Exit reuses) hold
-    /// only the one most recent loop.
-    pub fn store_last_loop(&mut self) -> Option<usize> {
-        self.track.as_ref()?;
-        let (pos, out) = (self.loop_in?, self.loop_out?);
-        self.push_memory(Cue { pos, loop_out: Some(out) })
+    /// Promotes the draft loop (see `draft_loop`) to a real memory
+    /// point, clearing the slot — unlike `store_memory`, this works even
+    /// once you've left it, and even after visiting another memory or
+    /// loop in between, since it doesn't go through `loop_in`/`loop_out`
+    /// (what Reloop-Exit reuses, and which a memory jump overwrites).
+    pub fn promote_draft_loop(&mut self) -> Option<usize> {
+        let (pos, out) = self.draft_loop?;
+        let i = self.push_memory(Cue { pos, loop_out: Some(out) })?;
+        self.draft_loop = None;
+        Some(i)
     }
 
     fn push_memory(&mut self, entry: Cue) -> Option<usize> {
@@ -924,17 +940,33 @@ impl Deck {
     /// not `cue`: calling a memory while playing jumps `pos` there without
     /// moving `cue` (see `call_memory`), so using `cue` here would make
     /// deleting a loop you just jumped to silently fail while playing.
+    /// Also finds the draft loop, if `pos` is on it and no stored memory
+    /// already covers it — so `X`/`delete_memory` can discard a draft
+    /// loop you don't want, the same way as any other loop memory.
     pub fn memory_at_pos(&self) -> Option<Cue> {
         let pos = self.pos;
-        self.memories.iter().copied().find(|m| memory_covers(m, pos))
+        self.memories.iter().copied().find(|m| memory_covers(m, pos)).or_else(|| {
+            let (start, end) = self.draft_loop?;
+            let cue = Cue { pos: start, loop_out: Some(end) };
+            memory_covers(&cue, pos).then_some(cue)
+        })
     }
 
-    /// Deletes the memory point at the current position.
+    /// Deletes the memory point at the current position — a stored one,
+    /// or the draft loop if that's what's here instead (see
+    /// `memory_at_pos`).
     pub fn delete_memory(&mut self) -> bool {
-        let before = self.memories.len();
         let pos = self.pos;
+        let before = self.memories.len();
         self.memories.retain(|m| !memory_covers(m, pos));
-        self.memories.len() != before
+        if self.memories.len() != before {
+            return true;
+        }
+        if self.draft_loop.is_some_and(|(start, end)| memory_covers(&Cue { pos: start, loop_out: Some(end) }, pos)) {
+            self.draft_loop = None;
+            return true;
+        }
+        false
     }
 
     // --- Loops ---------------------------------------------------------------
@@ -968,14 +1000,17 @@ impl Deck {
                 let end = self.snap(self.pos).max(start + beat);
                 self.loop_out = Some(end);
                 self.set_looping(true, false);
+                self.draft_loop = Some((start, end));
                 // Past the out point already: carry on from as far into the loop.
                 if self.pos >= end {
                     self.jump(start + (self.pos - end));
                 }
             }
             None if self.pos > start + self.sample_rate() * 0.01 => {
-                self.loop_out = Some(self.pos);
+                let end = self.pos;
+                self.loop_out = Some(end);
                 self.set_looping(true, false);
+                self.draft_loop = Some((start, end));
                 self.jump(start);
             }
             None => {}
@@ -997,6 +1032,21 @@ impl Deck {
         }
     }
 
+    /// Jumps back into the draft loop (see `draft_loop`), even if a
+    /// memory or another loop has been visited since, which
+    /// `reloop_exit`/`P` can't do (it only reuses whichever loop
+    /// `loop_in`/`loop_out` currently hold). `false` if there's no draft
+    /// loop since the track loaded.
+    pub fn reloop_draft(&mut self) -> bool {
+        let Some((start, end)) = self.draft_loop else { return false };
+        if self.playing {
+            self.jump_in_phase(start, Some(end), None);
+        } else {
+            self.enter(start, Some(end), 0.0);
+        }
+        true
+    }
+
     /// A loop of `beats` from the playhead, or quantized, from the nearest
     /// beat, or for loops under a beat, the nearest step of their size.
     pub fn auto_loop(&mut self, beats: f64) -> bool {
@@ -1012,6 +1062,7 @@ impl Deck {
         self.loop_in = Some(start);
         self.loop_out = Some(end);
         self.set_looping(true, false);
+        self.draft_loop = Some((start, end));
         self.cue = start;
         true
     }
@@ -2717,30 +2768,86 @@ mod tests {
     }
 
     #[test]
-    fn store_last_loop_promotes_a_dormant_loop() {
+    fn x_discards_the_draft_loop_the_same_way_as_a_real_one() {
+        let mut d = deck();
+        d.play_pause();
+        d.loop_in(); // 0 s
+        run(&mut d, 24_000);
+        d.loop_out(); // 0.5 s — the draft loop, not a stored memory
+        d.reloop_exit(); // leaves it right at the out point
+        assert!(d.memories.is_empty(), "nothing promoted it");
+
+        let found = d.memory_at_pos().expect("right at the draft loop's out point");
+        assert_eq!((found.pos, found.loop_out), (0.0, Some(24_000.0)));
+
+        assert!(d.delete_memory());
+        assert!(d.memory_at_pos().is_none());
+        assert!(!d.reloop_draft(), "it's gone, not just left");
+    }
+
+    #[test]
+    fn promote_draft_loop_works_even_after_leaving_it() {
         let mut d = deck();
         assert_eq!(d.store_memory(), Some(1)); // cue at 0
         d.play_pause();
         run(&mut d, SR as usize);
-        d.loop_in(); // 1 s — also moves the cue here, unlike store_last_loop
+        d.loop_in(); // 1 s — also moves the cue here, unlike promote_draft_loop
         run(&mut d, 24_000);
-        d.loop_out(); // 1.5 s
-        d.reloop_exit(); // leave the loop — loop_in/out stay as "the last loop"
+        d.loop_out(); // 1.5 s — this is now the draft loop
+        d.reloop_exit(); // leave it — the draft loop stays regardless
         assert!(!d.looping);
 
-        // store_last_loop grabs the dormant loop even though we're not in it.
-        assert_eq!(d.store_last_loop(), Some(2));
+        // promote_draft_loop grabs it even though we're not in it.
+        assert_eq!(d.promote_draft_loop(), Some(2));
         assert_eq!(d.memories[1].pos, SR as f64);
         assert_eq!(d.memories[1].loop_out, Some(1.5 * SR as f64));
 
-        // Promoting the same loop again is a duplicate.
-        assert!(d.store_last_loop().is_none());
+        // Promoting again finds nothing — it was cleared on promotion.
+        assert!(d.promote_draft_loop().is_none());
     }
 
     #[test]
-    fn store_last_loop_is_none_without_a_loop() {
+    fn promote_draft_loop_is_none_without_one() {
         let mut d = deck();
-        assert!(d.store_last_loop().is_none());
+        assert!(d.promote_draft_loop().is_none());
+    }
+
+    #[test]
+    fn promote_draft_loop_survives_visiting_a_memory_in_between() {
+        let mut d = deck();
+        d.play_pause();
+        d.loop_in(); // 0 s
+        run(&mut d, 24_000);
+        d.loop_out(); // 0.5 s — the draft loop
+        d.reloop_exit();
+
+        // A pre-existing loop memory elsewhere, unrelated to the draft loop.
+        d.memories.push(Cue { pos: 96_000.0, loop_out: Some(120_000.0) });
+        d.call_memory(MemoryCall::Right); // visit it — loop_in/loop_out now point there, not the draft loop
+        assert_eq!((d.loop_in, d.loop_out), (Some(96_000.0), Some(120_000.0)));
+
+        // The draft loop survived the detour; reloop_exit's own dormant
+        // loop did not (it now points at the visited memory instead).
+        assert_eq!(d.promote_draft_loop(), Some(1));
+        assert_eq!(d.memories[0].pos, 0.0);
+        assert_eq!(d.memories[0].loop_out, Some(24_000.0));
+    }
+
+    #[test]
+    fn reloop_draft_finds_it_after_visiting_a_memory() {
+        let mut d = deck();
+        d.play_pause();
+        d.loop_in(); // 0 s
+        run(&mut d, 24_000);
+        d.loop_out(); // 0.5 s — the draft loop
+        d.reloop_exit();
+
+        d.memories.push(Cue { pos: 96_000.0, loop_out: Some(120_000.0) });
+        d.call_memory(MemoryCall::Right); // visit it — loop_in/loop_out now point there
+        assert_ne!((d.loop_in, d.loop_out), (Some(0.0), Some(24_000.0)), "reloop_exit's dormant loop moved on");
+
+        assert!(d.reloop_draft());
+        assert_eq!((d.loop_in, d.loop_out), (Some(0.0), Some(24_000.0)), "reloop_draft still finds the original");
     }
 
     #[test]

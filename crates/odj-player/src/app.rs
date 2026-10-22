@@ -927,20 +927,25 @@ impl App {
                     self.set_status("Loop out adjust: , / . move the out point (Shift: ×10), O to finish");
                 }
             }
+            KeyCode::Char('p') if once && shift => {
+                if !self.deck().reloop_draft() {
+                    self.set_status("No draft loop since the last track (I/O or L)");
+                }
+            }
             KeyCode::Char('p') if once => self.deck().reloop_exit(),
             KeyCode::Char('l') if once && shift => {
-                let (stored, had_loop) = {
+                let (stored, had_draft) = {
                     let mut deck = self.deck();
-                    let had_loop = deck.snapshot().loop_in.is_some();
-                    (deck.store_last_loop(), had_loop)
+                    let had_draft = deck.snapshot().draft_loop.is_some();
+                    (deck.promote_draft_loop(), had_draft)
                 };
                 if stored.is_some() {
                     self.remember();
                 }
                 match stored {
                     Some(n) => self.set_status(format!("Memory {n} stored")),
-                    None if had_loop => self.set_status("Already in memory"),
-                    None => self.set_status("No loop to store"),
+                    None if had_draft => self.set_status("Already in memory"),
+                    None => self.set_status("No draft loop to promote"),
                 }
             }
             KeyCode::Char('l') if once => {
@@ -1230,6 +1235,29 @@ mod tests {
     }
 
     #[test]
+    fn shift_p_jumps_back_to_the_draft_loop() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('i'), false);
+        app.deck().step_paused(75.0); // 1 s
+        press(&mut app, KeyCode::Char('o'), false); // the draft loop: 0..1s
+        press(&mut app, KeyCode::Char('p'), false); // leave it
+        app.deck().step_paused(150.0); // wander off elsewhere
+        assert!(!app.deck().snapshot().looping);
+
+        press(&mut app, KeyCode::Char('p'), true); // Shift+P
+        let s = app.deck().snapshot();
+        assert_eq!((s.loop_in, s.loop_out), (Some(0.0), Some(48_000.0)));
+        assert_eq!(app.deck().position(), 0.0);
+    }
+
+    #[test]
+    fn shift_p_without_a_draft_loop_shows_a_status() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('p'), true);
+        assert!(app.status().unwrap().contains("No draft loop"));
+    }
+
+    #[test]
     fn shift_search_is_super_fast() {
         let mut app = app();
         press(&mut app, KeyCode::Right, false);
@@ -1302,7 +1330,7 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), false); // also sets the cue here
         app.deck().step_paused(75.0); // 1 s
         press(&mut app, KeyCode::Char('o'), false);
-        app.deck().store_last_loop();
+        app.deck().promote_draft_loop();
         assert_eq!(app.deck().snapshot().memories.len(), 1);
 
         press(&mut app, KeyCode::Char('x'), false); // first X: arms, doesn't delete
@@ -1319,7 +1347,7 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), false);
         app.deck().step_paused(75.0);
         press(&mut app, KeyCode::Char('o'), false);
-        app.deck().store_last_loop();
+        app.deck().promote_draft_loop();
 
         press(&mut app, KeyCode::Char('x'), false); // arm
         press(&mut app, KeyCode::Char(' '), false); // unrelated key: cancels the arm

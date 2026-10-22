@@ -1,6 +1,6 @@
 pkgbase = odj-git
-	pkgdesc = Keyboard-driven DJ player and sampler for the terminal, inspired by Pioneer CDJ decks
-	pkgver = r1.a9b6d61
+	pkgdesc = Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader and sampler for the terminal
+	pkgver = r17.0915687
 	pkgrel = 1
 	url = https://github.com/ibz/odj
 	arch = x86_64
@@ -14,8 +14,10 @@ pkgbase = odj-git
 	depends = libpipewire
 	depends = gcc-libs
 	depends = glibc
+	depends = yt-dlp
 	provides = odj
 	conflicts = odj
+	options = !lto
 	source = odj::git+https://github.com/ibz/odj.git
 	sha256sums = SKIP
 

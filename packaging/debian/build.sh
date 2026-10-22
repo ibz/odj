@@ -36,7 +36,12 @@ docker run --rm \
     rustup -q toolchain install stable --profile minimal
     command -v cargo-deb >/dev/null || cargo install --locked cargo-deb
     cd /src
-    cargo deb --locked -p odj-player --deb-version "$DEB_VERSION"
+    # cargo-deb only builds the package it is given (odj-player); the
+    # other two binaries its assets list pulls in (odj-sampler,
+    # odj-downloader) need building ourselves first, then --no-build
+    # tells it to just package what is already in target/release.
+    cargo build --locked --release --workspace
+    cargo deb --locked --no-build -p odj-player --deb-version "$DEB_VERSION"
     cp /cache/target/debian/odj_"$DEB_VERSION"_*.deb /out/
     chown "$HOST_IDS" /out/*.deb
   '

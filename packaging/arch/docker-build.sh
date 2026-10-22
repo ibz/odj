@@ -5,7 +5,10 @@
 # checked out (including an open PR's commits).
 set -euo pipefail
 
-pacman -Sy --noconfirm --needed base-devel git rust clang rubberband alsa-lib libpipewire >/dev/null
+# rubberband/alsa-lib/libpipewire/yt-dlp aren't needed to *build* odj, but
+# makepkg checks runtime `depends` are satisfied before packaging, so they
+# still need to be present in this container.
+pacman -Sy --noconfirm --needed base-devel git rust clang rubberband alsa-lib libpipewire yt-dlp >/dev/null
 
 useradd -m builder
 cp -r /src /home/builder/odj-src

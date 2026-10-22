@@ -36,6 +36,12 @@ jobs:
         run: |
           curl -sL "https://github.com/charmbracelet/freeze/releases/download/v${FREEZE_VERSION}/freeze_${FREEZE_VERSION}_Linux_x86_64.tar.gz" \
             | tar xz -C /usr/local/bin --strip-components=1 "freeze_${FREEZE_VERSION}_Linux_x86_64/freeze"
+          # freeze's bundled SVG renderer (resvg-go, via a WASM runtime)
+          # segfaults on Debian-based distros, including this runner — see
+          # https://github.com/charmbracelet/freeze/issues/203. Installing
+          # librsvg2-bin makes it shell out to the system rsvg-convert
+          # instead, which doesn't hit the bug.
+          sudo apt-get install -y -qq --no-install-recommends librsvg2-bin
 
       - name: Rasterize to PNG
         run: |

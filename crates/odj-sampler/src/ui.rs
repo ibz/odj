@@ -303,7 +303,11 @@ fn draw_picker(f: &mut Frame, p: &Picker) {
 }
 
 fn draw_kit_browser(f: &mut Frame, browser: &KitBrowserState) {
-    let area = centered(f.area(), 70, 60);
+    // Wide and tall: a narrower box left jagged fragments of the pad grid's
+    // own row borders peeking out on both sides (they don't share row
+    // boundaries with a centered popup), which reads as broken rather than
+    // as a background showing through a deliberately smaller dialog.
+    let area = centered(f.area(), 92, 90);
     match &browser.mode {
         KitBrowserMode::Naming(name) => {
             let block = Block::bordered().title(" Name the new kit ").border_style(Style::new().fg(AMBER));
@@ -359,7 +363,9 @@ fn draw_delete_warning(f: &mut Frame, area: Rect, kit_name: &str) {
 }
 
 fn draw_sample_browser(f: &mut Frame, browser: &SampleBrowser) {
-    let area = centered(f.area(), 70, 70);
+    // Wide and tall, same reasoning as draw_kit_browser: minimizes the pad
+    // grid fringe left visible around the edges.
+    let area = centered(f.area(), 92, 90);
     let block = Block::bordered()
         .title(format!(" Assign a sample to pad {} ", browser.pad + 1))
         .border_style(Style::new().fg(AMBER));
@@ -372,7 +378,9 @@ fn draw_sample_browser(f: &mut Frame, browser: &SampleBrowser) {
 }
 
 fn draw_naming_kit(f: &mut Frame, name: &str) {
-    let area = centered(f.area(), 60, 20);
+    // Wide (same reasoning as draw_kit_browser), but short — it's only
+    // ever three lines, so a tall box would mostly be empty space.
+    let area = centered(f.area(), 92, 25);
     let block = Block::bordered().title(" Name this kit ").border_style(Style::new().fg(AMBER));
     let hints = ["Enter save", "Esc leave unsaved for now"];
     let inner = hinted_box(f, area, block, &hints);

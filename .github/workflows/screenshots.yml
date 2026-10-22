@@ -44,7 +44,14 @@ jobs:
           # https://github.com/charmbracelet/freeze/issues/203. Installing
           # librsvg2-bin makes it shell out to the system rsvg-convert
           # instead, which doesn't hit the bug.
-          sudo apt-get install -y -qq --no-install-recommends librsvg2-bin
+          #
+          # freeze also defaults to rendering with "JetBrains Mono", which
+          # this runner doesn't have — without it installed, freeze falls
+          # back to some other font whose box-drawing glyphs (┌│└┘─) don't
+          # share JetBrains Mono's metrics, so vertical borders drift out
+          # of alignment the more rows they span (barely visible on a
+          # couple of rows, badly broken on odj-sampler's tall pad grid).
+          sudo apt-get install -y -qq --no-install-recommends librsvg2-bin fonts-jetbrains-mono
 
       - name: Rasterize to PNG
         run: |

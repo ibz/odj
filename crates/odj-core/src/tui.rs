@@ -3,6 +3,7 @@
 
 use std::cell::Cell;
 use std::io::stdout;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{
@@ -45,6 +46,16 @@ pub fn init() -> (DefaultTerminal, bool) {
 
 /// Undoes `init`.
 pub fn restore(key_release: bool) {
+    // A keystroke the app never got around to reading — most likely a
+    // trailing release event right as the very key that's quitting it
+    // (e.g. Ctrl+C) is read — would otherwise sit unread in the
+    // terminal's own input buffer and reach the shell as this
+    // protocol's raw escape codes once this app's gone and the shell
+    // itself (which doesn't speak it) reads it back. Drain it first,
+    // while the terminal's still sending in the mode that produced it.
+    while let Ok(true) = event::poll(Duration::ZERO) {
+        let _ = event::read();
+    }
     if key_release {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
@@ -429,8 +440,13 @@ fn keys_lines(keys: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// `text` in lines of at most `width` columns, broken at spaces where it can.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+/// `text` in lines of at most `width` columns, broken at spaces where it
+/// can. Also used directly (not just via [`hint_lines`]) wherever a box
+/// needs to size itself to however many lines some arbitrary text —
+/// typically an error message of unpredictable length — actually takes
+/// at a known width, rather than assuming a fixed height and clipping
+/// whatever doesn't fit.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split(' ') {
@@ -451,13 +467,6 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     }
     lines.push(line);
     lines
-}
-
-/// The main screen's keys, or only how to get to them all and how to quit
-/// when they don't fit in `width`.
-pub fn key_line(keys: &'static str, width: u16) -> Line<'static> {
-    let keys = if keys.chars().count() <= width as usize { keys } else { " ? help  Ctrl+C quit" };
-    Line::styled(keys, Style::new().fg(DIM))
 }
 
 /// Key hints for a box, as many to a line as fit in `width`; a hint is
@@ -665,13 +674,6 @@ mod tests {
         assert_eq!(text(80), ["type to filter  ↑↓ select  Esc close"]);
         assert_eq!(text(25), ["type to filter  ↑↓ select", "Esc close"]);
         assert_eq!(text(10), ["type to", "filter", "↑↓ select", "Esc close"], "a hint wider than a line wraps");
-    }
-
-    #[test]
-    fn keys_that_dont_fit_leave_only_help() {
-        let keys = " Space play  ? help  Ctrl+C quit";
-        assert_eq!(super::key_line(keys, 40).to_string(), keys);
-        assert_eq!(super::key_line(keys, 20).to_string(), " ? help  Ctrl+C quit");
     }
 
     fn screen(t: &Terminal<TestBackend>) -> String {

@@ -48,8 +48,6 @@ const ZOOM_SPAN: f64 = 8.0;
 /// it's pointless, and the waveform always keeps at least this much room.
 const MIN_VIDEO_COLS: u16 = 24;
 const MIN_WAVE_COLS: u16 = 30;
-/// Wide enough for "High -26.0 dB", the longest row the Mixer strip shows.
-const MIXER_STRIP_COLS: u16 = 14;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     // The status rows wrap inside their box, which grows to fit them.
@@ -75,13 +73,7 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     let overview_inner = overview_block.inner(overview);
     f.render_widget(zoom_block, zoom);
     f.render_widget(overview_block, overview);
-    // A thin strip at the right, always on screen, so the Mixer's current
-    // values (set from the keyboard overlay or MIDI knobs) are visible
-    // without opening it — carved off first, so it's to the right of the
-    // waveform whether or not a video is also showing to its left.
-    let [zoom_main, mixer_strip] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(MIXER_STRIP_COLS)]).areas(zoom_inner);
-    draw_mixer_strip(f, mixer_strip, s);
+    let zoom_main = zoom_inner;
     if let Some(track) = &s.track {
         let now = s.pos / track.sample_rate as f64;
         let wave_inner = match app.video.as_ref().and_then(|v| v.frame.as_ref()) {
@@ -122,8 +114,6 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_browser(f, app);
     } else if app.settings_screen.is_open() {
         draw_settings(f, app);
-    } else if app.mixer.is_open() {
-        draw_mixer(f, app, s);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -512,6 +502,18 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
+/// The live screen's footer — contextual keys left, globals (`` ` ``
+/// settings, `?` help, `Ctrl+C` quit) pinned right in that fixed order,
+/// plain `DIM`, no badge. **This is the reference layout and naming the
+/// other apps' own footers/hint lines are meant to mirror** (odj-mixer,
+/// odj-sampler, odj-downloader — see their own footer-drawing functions,
+/// each with a comment pointing back here): "Settings" not
+/// "Preferences", "quit" not "exit", and the globals always flush right
+/// via a `Layout::horizontal` split (`Fill` in the middle) rather than
+/// just trailing after the contextual text — so they stay in the same
+/// place and never get pushed off a narrow terminal. A status message
+/// takes over the whole line instead, below, since it's more urgent
+/// than any hint.
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     if let Some(msg) = app.status() {
         let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
@@ -687,45 +689,6 @@ fn draw_settings(f: &mut Frame, app: &App) {
 
 /// A gain in dB, signed except right at 0 (flat) — `-6.0` as `"-6.0 dB"`,
 /// `0.0` as plain `"0.0 dB"` rather than `"+0.0 dB"`.
-fn db_label(db: f32) -> String {
-    if db == 0.0 { "0.0 dB".to_string() } else { format!("{db:+.1} dB") }
-}
-
-/// A thin, always-on read-out of the Mixer's current values (High, Mid,
-/// Low, Vol) at the right of the waveform — unlike `draw_mixer`'s overlay,
-/// this needs no key to open, so it's still visible while turning MIDI
-/// knobs or just glancing at where the keyboard overlay left things.
-fn draw_mixer_strip(f: &mut Frame, area: Rect, s: &Snapshot) {
-    let rows = [
-        ("High", db_label(s.high_db)),
-        ("Mid ", db_label(s.mid_db)),
-        ("Low ", db_label(s.low_db)),
-        ("Vol ", format!("{:.0}%", s.volume * 100.0)),
-    ];
-    let lines: Vec<Line> =
-        rows.into_iter().map(|(label, value)| Line::from(vec![Span::styled(format!("{label} "), Style::new().fg(DIM)), Span::raw(value)])).collect();
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-/// The Mixer overlay: volume and the 3-band EQ, live performance controls
-/// (not saved — see `Deck::volume`/`ThreeBandEq`) only adjustable while
-/// this is open, same modal shape as `draw_settings`.
-fn draw_mixer(f: &mut Frame, app: &App, s: &Snapshot) {
-    let area = centered(f.area(), 40, 40);
-    let block = Block::bordered().title(" Mixer ").border_style(Style::new().fg(AMBER));
-    let items = vec![
-        ListItem::new(format!("Volume      {:.0}%", s.volume * 100.0)),
-        ListItem::new(format!("Low         {}", db_label(s.low_db))),
-        ListItem::new(format!("Mid         {}", db_label(s.mid_db))),
-        ListItem::new(format!("High        {}", db_label(s.high_db))),
-    ];
-    let hints = ["↑↓ select", "←/→ adjust (Shift ×4)", "0 reset", "Esc close"];
-    let list_area = hinted_box(f, area, block, &hints);
-    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(app.mixer.row()));
-    f.render_stateful_widget(list, list_area, &mut state);
-}
-
 /// The help's pages: the keys for playing first, the rest by topic.
 pub const HELP: &[Page] = &[
     Page::Keys(
@@ -744,7 +707,6 @@ pub const HELP: &[Page] = &[
             ("Tab", "File browser"),
             ("Ctrl+U in the browser", "Add this folder to your music folders"),
             ("`", "Settings: auto-cue, music folders"),
-            ("M", "Mixer: volume + 3-band EQ (low/mid/high)"),
         ],
     ),
     Page::Keys(

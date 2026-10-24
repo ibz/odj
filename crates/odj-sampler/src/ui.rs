@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_line};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box};
 
 use crate::app::{App, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
 use crate::engine::{Mode, PADS, PadState, Snapshot, TAIL};
@@ -230,9 +230,14 @@ fn draw_memory(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(msg) = app.status() {
+        let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let hints = match &app.screen {
         Screen::Pads => {
-            " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  K kits  ? help  Ctrl+C quit"
+            " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  K kits"
         }
         Screen::Picker(_) => " type to filter  ↑↓ PgUp PgDn Home End select  Enter assign  Esc clear/close",
         Screen::Editor(_) => {
@@ -242,12 +247,21 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Screen::SampleBrowser(_) => " ↑↓ select  Enter choose/open  Esc cancel",
         Screen::NamingKit(_) => " Enter save as this name  Esc leave unsaved for now",
     };
-    let line = match app.status() {
-        Some(msg) => Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER))),
-        None if matches!(app.screen, Screen::Pads) => key_line(hints, area.width),
-        None => Line::from(Span::styled(hints, Style::new().fg(DIM))),
-    };
-    f.render_widget(Paragraph::new(line), area);
+    if !matches!(app.screen, Screen::Pads) {
+        f.render_widget(Paragraph::new(Line::styled(hints, Style::new().fg(DIM))), area);
+        return;
+    }
+    // Contextual keys left, globals pinned right — mirrors odj-player's
+    // `draw_footer`, the formatting every app's footer is meant to
+    // follow; see its own doc comment for the convention itself. No
+    // Settings screen here, so the global group is just help/quit.
+    let left = Line::styled(hints, Style::new().fg(DIM));
+    let right = Line::styled("? help  Ctrl+C quit ", Style::new().fg(DIM));
+    let rw = right.width() as u16;
+    let [left_area, _, right_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
 }
 
 fn draw_picker(f: &mut Frame, p: &Picker) {

@@ -1,6 +1,6 @@
 [package]
 name = "odj-mixer"
-description = "Mixes sound-card inputs into an output live, with a volume per input"
+description = "Mixes sound-card inputs and remote-controlled odj-player decks into an output, live, with a MIDI knob per channel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,5 +11,7 @@ publish = false
 [dependencies]
 odj-core.workspace = true
 anyhow.workspace = true
+cpal.workspace = true
+midir.workspace = true
 ratatui.workspace = true
 ringbuf.workspace = true

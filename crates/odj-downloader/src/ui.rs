@@ -133,18 +133,31 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// Contextual keys left, globals pinned right — mirrors odj-player's own
+/// `draw_footer`, the formatting (and naming: "quit", not "exit") every
+/// app's footer is meant to follow; see its own doc comment for the
+/// convention itself. This binary deliberately doesn't depend on
+/// odj-core (see `main.rs`'s own doc comment), so it keeps its own
+/// small copies of `AMBER`/`DIM`/`key_hint` above rather than reusing
+/// odj-core's — same convention, independent implementation. No `` ` ``
+/// settings or `?` help here: this tool has neither.
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = match app.focus {
+    if let Some(status) = &app.status {
+        let line = Line::styled(status.clone(), Style::new().fg(AMBER));
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let left = Line::from(match app.focus {
         Focus::Search if app.searching => key_hint("Esc", "cancel search").spans,
         Focus::Search => key_hint("Enter", "search").spans,
         Focus::Results => key_hint("Enter", "add to queue").spans,
         Focus::Queue => key_hint("x/Del", "remove queued").spans,
-    };
+    });
     let esc_hint = if app.searching { "cancel" } else { "clear" };
-    spans.push(Span::styled(format!("  Tab focus  ↑↓ navigate  Esc {esc_hint}  Ctrl+C quit"), Style::new().fg(DIM)));
-    if let Some(status) = &app.status {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(status.clone(), Style::new().fg(AMBER)));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let right = Line::styled(format!("Tab focus  ↑↓ navigate  Esc {esc_hint}  Ctrl+C quit "), Style::new().fg(DIM));
+    let rw = right.width() as u16;
+    let [left_area, _, right_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
 }

@@ -66,6 +66,16 @@ fn init() -> (DefaultTerminal, bool) {
 
 /// Undoes `init`.
 fn restore(enhanced: bool) {
+    // A keystroke this app never got around to reading — most likely a
+    // trailing release event right as the very key that's quitting it
+    // (e.g. Ctrl+C) is read — would otherwise sit unread in the
+    // terminal's own input buffer and reach the shell as this
+    // protocol's raw escape codes once this app's gone and the shell
+    // itself (which doesn't speak it) reads it back. Drain it first,
+    // while the terminal's still sending in the mode that produced it.
+    while let Ok(true) = event::poll(Duration::ZERO) {
+        let _ = event::read();
+    }
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }

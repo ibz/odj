@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 odj-core.workspace = true
 anyhow.workspace = true
+cpal.workspace = true
 midir.workspace = true
 ratatui.workspace = true
 serde.workspace = true

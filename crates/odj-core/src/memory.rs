@@ -8,7 +8,7 @@
 //! `$XDG_CONFIG_HOME/odj/settings.json`, shared by odj-player and
 //! odj-sampler — see [`Settings`], [`load_settings`], [`save_settings`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -124,11 +124,11 @@ pub struct LibraryTrack {
     pub memory: TrackMemory,
 }
 
-/// Settings shared by both odj-player and odj-sampler, one file between
-/// them — each app only ever touches the field(s) it owns, always through
-/// a full read-modify-write of this whole struct (see [`load_settings`]/
-/// [`save_settings`]), so neither app's save ever clobbers the other's
-/// fields.
+/// Settings shared by odj-player, odj-sampler and odj-mixer, one file
+/// between them — each app only ever touches the field(s) it owns,
+/// always through a full read-modify-write of this whole struct (see
+/// [`load_settings`]/[`save_settings`]), so one app's save never
+/// clobbers another's fields.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -143,25 +143,34 @@ pub struct Settings {
     pub music_dirs: Vec<PathBuf>,
     /// The active kit's directory name under `kits/`. odj-sampler.
     pub kit: Option<String>,
-    /// The MIDI input port last used, if any. odj-sampler.
-    pub midi_port_id: Option<String>,
-    /// Each pad's learned MIDI note, per device: `midi_devices[name][slot][i]`
-    /// for pad `i` — see `odj_sampler::midi` for how device/slot keys are
-    /// chosen. The array is sized to odj-sampler's pad count (16) directly
-    /// rather than via its constant, since odj-core doesn't depend on
+    /// The MIDI input port odj-sampler last used, if any.
+    #[serde(alias = "midi_port_id")]
+    pub sampler_midi_port_id: Option<String>,
+    /// Each pad's learned MIDI note, per device:
+    /// `sampler_midi_pads[name][slot][i]` for pad `i` — see
+    /// `odj_sampler::midi` for how device/slot keys are chosen. The
+    /// array is sized to odj-sampler's pad count (16) directly rather
+    /// than via its constant, since odj-core doesn't depend on
     /// odj-sampler. odj-sampler.
+    #[serde(default, alias = "midi_devices")]
+    pub sampler_midi_pads: HashMap<String, Vec<[u8; 16]>>,
+    /// The MIDI input port odj-mixer last used, if any — kept separate
+    /// from `sampler_midi_port_id`. odj-mixer.
+    pub mixer_midi_port_id: Option<String>,
+    /// Each learned knob's CC, keyed by a stable target string (an
+    /// input's name, or `"player:<deck name>:<param>"` for a discovered
+    /// player's Mixer parameter) — a flat map, since odj-mixer's set of
+    /// targets is open-ended and keyed by name rather than by fixed
+    /// position. odj-mixer.
     #[serde(default)]
-    pub midi_devices: HashMap<String, Vec<[u8; 16]>>,
-    /// Each Mixer knob's learned MIDI CC, per device, slot, and deck — `0`
-    /// for `--deck 1`, `1` for `--deck 2` (odj-player runs one process per
-    /// deck; this has nothing to do with `link::Decks`' own, unrelated
-    /// deck numbering): `midi_knobs[name][slot][deck]` is `[cc; 4]` in the
-    /// Mixer's own row order (Volume, Low, Mid, High), `None` until that
-    /// deck's half is actually learned — a bare all-zero array would be
-    /// ambiguous with "not learned yet", since the `Vec` grows one slot at
-    /// a time for both deck halves together. odj-player.
+    pub mixer_midi_knobs: HashMap<String, u8>,
+    /// Hardware inputs added to the mix, by their stable device key (see
+    /// `odj_mixer::devices::device_key_string` — not a display label,
+    /// which can change) — restored at startup so a previous session's
+    /// channel selection survives a restart. A deck is never in this
+    /// set: it's always auto-connected, never user-togglable. odj-mixer.
     #[serde(default)]
-    pub midi_knobs: HashMap<String, Vec<[Option<[u8; 4]>; 2]>>,
+    pub mixer_active_inputs: HashSet<String>,
 }
 
 impl Default for Settings {
@@ -172,22 +181,13 @@ impl Default for Settings {
             loop_beats: 4.0,
             music_dirs: Vec::new(),
             kit: None,
-            midi_port_id: None,
-            midi_devices: HashMap::new(),
-            midi_knobs: HashMap::new(),
+            sampler_midi_port_id: None,
+            sampler_midi_pads: HashMap::new(),
+            mixer_midi_port_id: None,
+            mixer_midi_knobs: HashMap::new(),
+            mixer_active_inputs: HashSet::new(),
         }
     }
-}
-
-/// `settings.json`'s old shape, back when odj-sampler kept MIDI config in
-/// its own file — read once by [`load_settings`] as a fallback so an
-/// existing `midi.json` isn't silently dropped by the merge into
-/// [`Settings`].
-#[derive(Deserialize)]
-struct LegacyMidiConfig {
-    port_id: Option<String>,
-    #[serde(default)]
-    devices: HashMap<String, Vec<[u8; 16]>>,
 }
 
 /// Where the shared settings file lives, `$XDG_CONFIG_HOME/odj/settings.json`.
@@ -197,19 +197,9 @@ pub fn settings_file() -> PathBuf {
 
 /// The saved settings, or the default when there are none yet (or they
 /// can't be read) — checks [`settings_file`] first, then the old
-/// `$XDG_DATA_HOME/odj/settings.json` location. If neither has MIDI config
-/// yet, falls back once more to the even older `$XDG_DATA_HOME/odj/midi.json`.
+/// `$XDG_DATA_HOME/odj/settings.json` location.
 pub fn load_settings() -> Settings {
-    let mut settings: Settings =
-        read_json(&settings_file()).or_else(|| read_json(&data_dir().join("settings.json"))).unwrap_or_default();
-    if settings.midi_port_id.is_none()
-        && settings.midi_devices.is_empty()
-        && let Some(legacy) = read_json::<LegacyMidiConfig>(&data_dir().join("midi.json"))
-    {
-        settings.midi_port_id = legacy.port_id;
-        settings.midi_devices = legacy.devices;
-    }
-    settings
+    read_json(&settings_file()).or_else(|| read_json(&data_dir().join("settings.json"))).unwrap_or_default()
 }
 
 /// Saves the whole shared struct to [`settings_file`]. Callers that only

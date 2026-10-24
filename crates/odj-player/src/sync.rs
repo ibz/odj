@@ -35,7 +35,8 @@ impl SyncLink {
         Ok(Self { deck: number, stop, thread: Some(thread) })
     }
 
-    /// This deck's claimed number (1..=`link::MAX_DECKS`).
+    /// This deck's claimed number (1..=`link::MAX_DECKS`) — used to label
+    /// this deck for odj-mixer's discovery (`"Deck n"`), among other things.
     pub fn deck(&self) -> u8 {
         self.deck
     }

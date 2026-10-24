@@ -4,7 +4,10 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,7 +34,7 @@ pub trait Source: Send + 'static {
 const BUFFER_FRAMES: u32 = 512;
 
 /// Which output channels (0-based) of a card the deck plays on.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
     Stereo(u16, u16),
     /// Both sides of the track summed into one channel.
@@ -52,6 +55,16 @@ pub struct Card {
     rate: u32,
     /// Why the card can't be used right now (ALSA only; PipeWire shares cards).
     pub unavailable: Option<&'static str>,
+}
+
+impl Card {
+    /// This card's stable handle — see the field's own doc comment.
+    /// [`odj-mixer`](../../odj-mixer/index.html) keys its continuous
+    /// device scan on this (plus a [`Choice`]'s `route`), since a plain
+    /// index into a snapshot doesn't survive the next scan.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// One entry of the output/input picker.
@@ -93,6 +106,12 @@ fn route_label(name: &str, channels: u16, route: Route, word: &str) -> String {
 }
 
 /// PipeWire when it is running, plain ALSA otherwise. Keep it alive while streams play.
+///
+/// Caches its own device enumeration (confirmed empirically: creating a
+/// node after the first `output_cards`/`input_cards` call on a given
+/// `Host` and listing again on that *same* `Host` doesn't see it) — call
+/// this again for a listing that needs to reflect changes since an
+/// earlier one, rather than reusing the same `Host`.
 pub fn host() -> Host {
     cpal::default_host()
 }
@@ -154,14 +173,17 @@ fn pipewire_cards(host: &Host, direction: Direction) -> Vec<Card> {
     };
     // A sink is listed as duplex (its monitor can be recorded) and a source
     // as input-only; either way, a *stream* (another app's already-open
-    // playback/recording) reports the single matching direction instead,
-    // which is how `Direction::Output` below excludes them same as before.
-    // For `Direction::Input` this can't tell a real source apart from
-    // another app's input stream by direction alone — confirmed against
-    // cpal's PipeWire backend source, not (yet) against a live session
-    // with another app actually recording; if that turns out to let
-    // spurious entries through, it needs a name-based exclusion too, the
-    // way the output side already excludes `alsa_output.hw_*`.
+    // playback/recording — including, once it's running, one of
+    // odj-mixer's own capture streams) reports the single matching
+    // direction instead, which is how `Direction::Output` below excludes
+    // them same as before. For `Direction::Input` direction alone can't
+    // tell a real source apart from a stream, both reporting plain
+    // `Input` — confirmed by reading cpal's PipeWire backend source: a
+    // stream node almost never has `node.name`/`node.description` set
+    // (nothing beyond cpal's own client name, which it doesn't set
+    // either), and cpal's own fallback for either missing property is the
+    // literal string `"unknown"`, which a real device's PipeWire/ALSA
+    // metadata would never legitimately produce — so that's excluded too.
     let wanted = match direction {
         Direction::Output => DeviceDirection::Duplex,
         Direction::Input => DeviceDirection::Input,
@@ -170,11 +192,24 @@ fn pipewire_cards(host: &Host, direction: Direction) -> Vec<Card> {
     for device in devices {
         let node = device.id().map(|id| id.id().to_string()).unwrap_or_default();
         let Ok(desc) = device.description() else { continue };
-        if desc.direction() != wanted || node.ends_with("_default") {
+        if desc.direction() != wanted || node.ends_with("_default") || node == "unknown" || desc.name() == "unknown" {
             continue;
         }
-        // The whole-card node that split sinks (e.g. "Line A", "Line B") are carved out of.
-        if direction == Direction::Output && node.starts_with("alsa_output.hw_") {
+        // The raw whole-card node a UCM profile's own named sub-devices
+        // (e.g. output "Line A"/"Line B", input "Input 1".."Input 4") are
+        // carved out of — WirePlumber names it `<direction>.hw_*`
+        // specifically (and only) when it sits alongside such a profile,
+        // so this never removes a simple card's only node. Confirmed via
+        // a real UMC404HD's `pw-cli ls Node`: `alsa_input.hw_U192k_0`
+        // (4 channels) coexists with 4 separate single-channel
+        // `alsa_input...HiFi__MicN__source` nodes for the same 4 physical
+        // inputs — same shape as the output side's "Line A"/"Line B",
+        // just not hit until a card with an input-side UCM profile did.
+        let hw_prefix = match direction {
+            Direction::Output => "alsa_output.hw_",
+            Direction::Input => "alsa_input.hw_",
+        };
+        if node.starts_with(hw_prefix) {
             continue;
         }
         let name = desc.name().to_string();
@@ -504,13 +539,19 @@ impl Input {
     /// Opens `choice` on one of `cards` — mirrors [`Output::open`]'s
     /// re-resolve-before-connecting exactly, for the same reason (a stale
     /// `Device` from an earlier listing can silently reconnect to the
-    /// wrong node by the time it's actually used).
+    /// wrong node by the time it's actually used). Also checks
+    /// `output_cards` for a match, not just `input_cards`: a real input
+    /// (mic, line-in) only ever shows up in the latter, but a plain
+    /// `Audio/Sink` node — e.g. a deck's virtual sink, captured here as
+    /// odj-mixer's input, see [`NullSink`] — is classified `Duplex` and
+    /// so only ever shows up in the former.
     pub fn open(host: &Host, cards: &[Card], choice: &Choice) -> Result<Self> {
         let wanted = &cards[choice.card];
         if let Some(why) = wanted.unavailable {
             bail!("{} is unavailable: {why}", wanted.name);
         }
-        let fresh = self::input_cards(host)?;
+        let mut fresh = self::input_cards(host)?;
+        fresh.extend(self::output_cards(host)?);
         let card = fresh
             .iter()
             .find(|c| c.id == wanted.id)
@@ -665,6 +706,148 @@ pub fn verify_input_route(host: &Host, input: &Input) -> Result<()> {
         ),
         PeerCheck::Unconfirmed => Ok(()),
     }
+}
+
+/// The PipeWire node name odj-player gives deck `n`'s virtual sink when
+/// routing through odj-mixer instead of a real output — see
+/// [`NullSink::create`]. odj-mixer's own device scan recognizes this
+/// exact prefix to offer the sink as a routable input, labeled "Deck n".
+pub fn deck_sink_name(n: u8) -> String {
+    format!("odj-deck-{n}")
+}
+
+/// The inverse of [`deck_sink_name`] — `None` if `name` doesn't match.
+pub fn deck_number(name: &str) -> Option<u8> {
+    name.strip_prefix("odj-deck-")?.parse().ok()
+}
+
+/// The PipeWire node name odj-sampler gives its own virtual sink when
+/// routing through odj-mixer instead of a real output — same idea as
+/// [`deck_sink_name`], but fixed rather than numbered: only one
+/// odj-sampler instance is ever expected at a time, unlike a deck.
+/// odj-mixer's own device scan recognizes this exact name too, offering
+/// it as a routable input alongside every deck's, labeled "Sampler".
+pub fn sampler_sink_name() -> &'static str {
+    "odj-sampler"
+}
+
+/// A virtual PipeWire sink with no hardware behind it: played into like
+/// any other output, but also capturable like an input — cpal's own
+/// PipeWire backend already treats a plain `Audio/Sink` node as
+/// "Duplex" and knows to set `STREAM_CAPTURE_SINK` when something opens
+/// an *input* stream on one, capturing whatever's being played into it
+/// (confirmed by reading cpal's PipeWire backend source), so no
+/// special capture-side code is needed beyond [`Input::open`] being
+/// willing to find it there (see its own doc comment for that half).
+/// Lets a deck — or odj-sampler — route its output through odj-mixer
+/// instead of a real device, for odj-mixer to apply its own filters to.
+pub struct NullSink {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl NullSink {
+    /// Creates `name` (see [`deck_sink_name`]/[`sampler_sink_name`]) with
+    /// the friendly `description` ("Deck n"/"Sampler"), and keeps it
+    /// alive for as long as this is held — dropping it destroys the
+    /// sink on the server. No
+    /// `object.linger`: if this process is killed outright rather than
+    /// dropped cleanly, PipeWire cleans the sink up on its own too,
+    /// same as any other client-owned object.
+    pub fn create(name: &str, description: &str) -> Result<Self> {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let name = name.to_string();
+        let description = description.to_string();
+        let thread = thread::Builder::new()
+            .name("odj-null-sink".into())
+            .spawn(move || run_null_sink(&name, &description, ready_tx, &stopping))
+            .context("spawning the virtual-sink thread")?;
+        ready_rx.recv().context("PipeWire never confirmed the virtual sink")??;
+        Ok(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for NullSink {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Creates the sink, reports success or failure back through `ready`
+/// (so [`NullSink::create`] can return a real `Result` rather than just
+/// trusting the thread started), then holds the connection open —
+/// checking `stop` periodically rather than blocking in `mainloop.run()`
+/// forever — until told to stop, at which point it destroys the sink
+/// and gives the server a moment to process that before this thread (and
+/// the connection with it) goes away.
+fn run_null_sink(name: &str, description: &str, ready: mpsc::Sender<Result<()>>, stop: &AtomicBool) {
+    pw::init();
+    let setup = (|| -> Result<(pw::main_loop::MainLoopRc, pw::core::CoreRc, pw::node::Node)> {
+        let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| anyhow!("PipeWire mainloop: {e}"))?;
+        let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| anyhow!("PipeWire context: {e}"))?;
+        let core = context.connect_rc(None).map_err(|e| anyhow!("PipeWire connect: {e}"))?;
+        let node = core
+            .create_object::<pw::node::Node>(
+                "adapter",
+                &pw::properties::properties! {
+                    "factory.name" => "support.null-audio-sink",
+                    "node.name" => name,
+                    "node.description" => description,
+                    "media.class" => "Audio/Sink",
+                },
+            )
+            .map_err(|e| anyhow!("creating the virtual sink: {e}"))?;
+        // One round trip so the sink actually exists on the server
+        // before reporting success — same technique as this module's
+        // own `pipewire_peer_of_own_stream`.
+        let done = Rc::new(Cell::new(false));
+        let done_for_cb = done.clone();
+        let loop_for_cb = mainloop.clone();
+        let pending = core.sync(0).map_err(|e| anyhow!("PipeWire sync: {e}"))?;
+        let _listener = core
+            .add_listener_local()
+            .done(move |id, seq| {
+                if id == pw::core::PW_ID_CORE && seq == pending {
+                    done_for_cb.set(true);
+                    loop_for_cb.quit();
+                }
+            })
+            .register();
+        mainloop.run();
+        if !done.get() {
+            bail!("PipeWire never confirmed the virtual sink");
+        }
+        Ok((mainloop, core, node))
+    })();
+
+    let (mainloop, core, node) = match setup {
+        Ok(ok) => {
+            let _ = ready.send(Ok(()));
+            ok
+        }
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        let loop_for_timer = mainloop.clone();
+        let timer = mainloop.loop_().add_timer(move |_| loop_for_timer.quit());
+        let _ = timer.update_timer(Some(Duration::from_millis(200)), None);
+        mainloop.run();
+    }
+
+    let _ = core.destroy_object(node);
+    let loop_for_final = mainloop.clone();
+    let final_timer = mainloop.loop_().add_timer(move |_| loop_for_final.quit());
+    let _ = final_timer.update_timer(Some(Duration::from_millis(300)), None);
+    mainloop.run();
 }
 
 #[derive(Debug)]
@@ -886,5 +1069,28 @@ mod tests {
         for c in choices(&cards) {
             println!("  {}", c.label(&cards, "In"));
         }
+    }
+
+    #[test]
+    #[ignore = "needs a real PipeWire session"]
+    fn null_sink_is_visible_as_both_an_output_and_an_input() {
+        let name = format!("odj-test-sink-{}", std::process::id());
+        let sink = NullSink::create(&name, "odj test sink").expect("creates the virtual sink");
+
+        let host = host();
+        let outputs = output_cards(&host).unwrap();
+        assert!(outputs.iter().any(|c| c.id() == name), "shows up as an output (it's a plain Audio/Sink node)");
+
+        // `Input::open` must find it via `output_cards` since it won't be
+        // in `input_cards` at all — that's the whole point of the fix.
+        let out_choice = *choices(&outputs).iter().find(|c| outputs[c.card].id() == name).expect("a choice for it");
+        let input = Input::open(&host, &outputs, &out_choice).expect("opens the sink as a capture source");
+        assert!(input.name.contains("odj test sink"), "{}", input.name);
+
+        drop(sink);
+        std::thread::sleep(Duration::from_millis(1000));
+        let fresh_host = super::host(); // in case the old one caches its own enumeration
+        let outputs = output_cards(&fresh_host).unwrap();
+        assert!(!outputs.iter().any(|c| c.id() == name), "dropping the sink removes it from PipeWire");
     }
 }

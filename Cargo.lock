@@ -1573,6 +1573,8 @@ name = "odj-mixer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
+ "midir",
  "odj-core",
  "ratatui",
  "ringbuf",
@@ -1583,7 +1585,7 @@ name = "odj-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "midir",
+ "cpal",
  "odj-core",
  "ratatui",
  "tui-big-text",
@@ -1594,6 +1596,7 @@ name = "odj-sampler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cpal",
  "midir",
  "odj-core",
  "ratatui",

@@ -1,16 +1,16 @@
 mod app;
 mod engine;
-mod midi;
 mod stretch;
 mod sync;
 mod ui;
 mod video;
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 
@@ -21,6 +21,20 @@ use odj_core::{audio, tui};
 use app::App;
 use engine::Deck;
 use sync::SyncLink;
+
+/// What `--deck`'s picker/the virtual-sink path has going by the time
+/// everything else in `start` can proceed the same way regardless of
+/// which one actually ran.
+struct Setup {
+    deck: Arc<Mutex<Deck>>,
+    name: String,
+    link: io::Result<SyncLink>,
+    errors: audio::Errors,
+    _stream: cpal::Stream,
+    /// Only `Some` on the through-odj-mixer path — kept alive for as
+    /// long as this deck runs; dropping it tears the virtual sink down.
+    _sink: Option<audio::NullSink>,
+}
 
 fn main() -> Result<()> {
     let mut deck_number: Option<u8> = None;
@@ -35,11 +49,12 @@ fn main() -> Result<()> {
                      Which deck this is (shown as \"DECK n\") defaults to whichever number\n\
                      sync claims — 1 if nothing else is running — so --deck is usually only\n\
                      needed to force a specific number, e.g. running a second deck before\n\
-                     the first. It also tells this process which half of a shared MIDI\n\
-                     controller's Mixer-knob mapping (Volume, Low, Mid, High) is its own,\n\
-                     picked at startup; the port and each device's learned CCs are kept in\n\
-                     the settings file shared with odj-sampler, {}.",
-                    odj_core::memory::settings_file().display()
+                     the first.\n\n\
+                     No Mixer here any more (no Volume/EQ, filters live in odj-mixer now):\n\
+                     if odj-mixer is running when this starts, this deck routes its output\n\
+                     through it instead of a real device, and odj-mixer applies Volume/EQ\n\
+                     live to that — pick it there, as \"Deck n\". Otherwise this plays\n\
+                     straight to a real output, same as always, with no filters available."
                 );
                 return Ok(());
             }
@@ -95,37 +110,6 @@ fn default_music_dir(memory: &Memory) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Offers a MIDI input for the Mixer's knobs (Volume, Low, Mid, High),
-/// disambiguated by `deck_number` (1 or 2, from `--deck`) — see `midi.rs`'s
-/// module doc comment for why that's needed. Mirrors odj-sampler's own
-/// pick-port → (load-or-learn) → save → connect sequence in its
-/// `main.rs::start`, but for CC knobs instead of note pads.
-fn setup_knob_midi(
-    terminal: &mut DefaultTerminal,
-    deck: &Arc<Mutex<Deck>>,
-    deck_number: u8,
-) -> Result<Option<midir::MidiInputConnection<()>>> {
-    let mut knobs = midi::KnobConfig::load();
-    let midi_port = odj_core::midi::pick_midi_input(terminal, knobs.port_id.as_deref())?;
-    let deck_index = (deck_number - 1) as usize;
-    let Some((name, slot)) = midi_port.as_deref().and_then(odj_core::midi::device_slot) else { return Ok(None) };
-    let id = midi_port.unwrap();
-    knobs.port_id = Some(id.clone());
-    // A device/slot we haven't seen before (for this deck): walk the user
-    // through turning each knob so we learn its CC, rather than assuming a
-    // layout. Unrecognized device, same `None` either way: the port's
-    // gone, or the user cancelled partway through.
-    let ccs = match knobs.knobs_for(&name, slot, deck_index) {
-        Some(ccs) => Some(ccs),
-        None => midi::learn_knobs(terminal, &id)?,
-    };
-    Ok(ccs.and_then(|ccs| {
-        knobs.set_knobs_for(name, slot, deck_index, ccs);
-        let _ = knobs.save();
-        midi::connect(&id, deck.clone(), ccs)
-    }))
-}
-
 fn start(
     terminal: &mut DefaultTerminal,
     browser: Browser,
@@ -135,39 +119,23 @@ fn start(
     pick_music_dir: bool,
     deck_number: Option<u8>,
 ) -> Result<()> {
-    let host = audio::host();
-    let Some(output) = tui::pick_output(terminal, &host)? else {
+    // If odj-mixer is running right now, route through a virtual sink for
+    // it to capture and apply its own filters to instead of going
+    // straight to a real device — see `setup_through_mixer`'s own doc
+    // comment. A one-time check at startup, not re-checked afterward (if
+    // odj-mixer quits or starts later mid-session, this deck doesn't
+    // switch sides on its own).
+    let Some(setup) = (if odj_core::control::any_running("mixer") {
+        setup_through_mixer(deck_number).map(Some)
+    } else {
+        setup_direct(terminal, deck_number)
+    })?
+    else {
         return Ok(());
     };
-    let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
-    let stream = output.start(deck.clone())?;
-    if let Err(e) = audio::verify_route(&host, &output) {
-        drop(stream); // tear down rather than play on from the wrong device
-        return Err(e);
-    }
 
-    // `deck_number` picks which deck this is, for both sync (shown in the
-    // header as "DECK n") and the Mixer's MIDI knobs: explicit `--deck`
-    // wins outright; otherwise default to whichever number sync claims
-    // (the first one free, 1 if nothing else is running) — the common
-    // case, needing no flag at all once only one process wants MIDI knobs.
-    let link = SyncLink::start(deck.clone(), deck_number);
-    let deck_number = deck_number.or_else(|| link.as_ref().ok().map(SyncLink::deck));
-
-    // Kept alive for the rest of `start`, closing automatically when it
-    // returns. Only offered for deck 1 or 2 — the Mixer's knob mapping only
-    // has two halves (see `midi.rs`'s module doc comment) — so a 3rd/4th
-    // synced deck simply has no MIDI knobs unless given its own `--deck
-    // 1`/`--deck 2` explicitly (sharing a slot with another deck's knobs).
-    let midi_conn = match deck_number {
-        Some(n @ (1 | 2)) => setup_knob_midi(terminal, &deck, n)?,
-        _ => None,
-    };
-
-    let name =
-        format!("{} · {} Hz{}", output.name, output.sample_rate(), if midi_conn.is_some() { " · MIDI" } else { "" });
-    let mut app = App::new(deck, browser, key_release, name, memory);
-    if let Err(e) = &link {
+    let mut app = App::new(setup.deck, browser, key_release, setup.name, memory);
+    if let Err(e) = &setup.link {
         app.set_status(format!("Sync unavailable: {e}"));
     }
     match file {
@@ -183,9 +151,62 @@ fn start(
         _ if pick_music_dir => app.settings_screen.open_to_switch(0),
         _ => app.browser.open = true,
     }
-    let result = run(terminal, &mut app, &output.errors);
+    let result = run(terminal, &mut app, &setup.errors);
     app.remember();
     result
+}
+
+/// The usual path: pick a real output and play straight to it, same as
+/// always. `Ok(None)` if the user backs out of the output picker.
+fn setup_direct(terminal: &mut DefaultTerminal, deck_number: Option<u8>) -> Result<Option<Setup>> {
+    let host = audio::host();
+    let Some(output) = tui::pick_output(terminal, &host)? else { return Ok(None) };
+    let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
+    let stream = output.start(deck.clone())?;
+    if let Err(e) = audio::verify_route(&host, &output) {
+        drop(stream); // tear down rather than play on from the wrong device
+        return Err(e);
+    }
+    // `deck_number` picks which deck this is, shown in the header as
+    // "DECK n": explicit `--deck` wins outright; otherwise default to
+    // whichever number sync claims (the first one free, 1 if nothing else
+    // is running).
+    let link = SyncLink::start(deck.clone(), deck_number);
+    let name = format!("{} · {} Hz", output.name, output.sample_rate());
+    Ok(Some(Setup { deck, name, link, errors: output.errors, _stream: stream, _sink: None }))
+}
+
+/// Instead of asking for a real output, creates a virtual sink (see
+/// `audio::NullSink`) named for whichever deck number sync claims (no
+/// picker — nothing to ask, there's exactly one sensible target) and
+/// plays into that; odj-mixer discovers it the same way it discovers any
+/// other input, labeled "Deck n", and applies Volume/EQ to what it
+/// captures from it. The sample rate doesn't matter here the way it does
+/// for a real device — PipeWire resamples everything to its own shared
+/// clock regardless (the same property that lets odj-mixer route between
+/// physically different cards at all).
+fn setup_through_mixer(deck_number: Option<u8>) -> Result<Setup> {
+    const RATE: u32 = 48_000;
+    let deck = Arc::new(Mutex::new(Deck::new(RATE)));
+    let link = SyncLink::start(deck.clone(), deck_number);
+    let n = deck_number.or_else(|| link.as_ref().ok().map(SyncLink::deck)).unwrap_or(1);
+
+    let sink_name = audio::deck_sink_name(n);
+    let sink = audio::NullSink::create(&sink_name, &format!("Deck {n}"))?;
+
+    let host = audio::host(); // fresh: `host()` caches its own enumeration, so this must postdate creating the sink
+    let outputs = audio::output_cards(&host)?;
+    let choice = audio::choices(&outputs)
+        .into_iter()
+        .find(|c| outputs[c.card].id() == sink_name)
+        .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
+    let output = audio::Output::open(&host, &outputs, &choice)?;
+    let stream = output.start(deck.clone())?;
+    if let Err(e) = audio::verify_route(&host, &output) {
+        drop(stream);
+        return Err(e);
+    }
+    Ok(Setup { deck, name: format!("Deck {n}"), link, errors: output.errors, _stream: stream, _sink: Some(sink) })
 }
 
 #[cfg(test)]

@@ -1,11 +1,10 @@
 //! Optional MIDI input: Note On/Off trigger pads exactly like a key press,
 //! so an external sequencer (hardware or software) can drive odj-sampler
-//! instead of — or alongside — the keyboard. Config lives in the settings
-//! file odj-sampler shares with odj-player (see
-//! `odj_core::memory::Settings`'s `midi_port_id`/`midi_devices`). Port
-//! listing/picking and the stable device identity used to key
-//! [`MidiConfig::devices`] live in `odj_core::midi`, shared with
-//! odj-player's own MIDI knobs.
+//! instead of — or alongside — the keyboard. Config lives in the shared
+//! settings file (see `odj_core::memory::Settings`'s
+//! `sampler_midi_port_id`/`sampler_midi_pads`). Port listing/picking
+//! and the stable device identity used to key [`MidiConfig::devices`]
+//! live in `odj_core::midi`, shared with odj-mixer's own MIDI knobs.
 //!
 //! Controllers don't agree on how they number their pads (confirmed on real
 //! hardware: some send a straight ascending range, others group and jump
@@ -47,16 +46,16 @@ impl MidiConfig {
     /// port, no devices learned) when there is none yet.
     pub fn load() -> Self {
         let settings = load_settings();
-        Self { port_id: settings.midi_port_id, devices: settings.midi_devices }
+        Self { port_id: settings.sampler_midi_port_id, devices: settings.sampler_midi_pads }
     }
 
     /// Saves this app's fields back into the shared settings file, leaving
-    /// odj-player's and odj-sampler's own other fields (`auto_cue`, `kit`,
-    /// …) exactly as they were.
+    /// every other app's own fields (`auto_cue`, `jump_beats`, …) exactly
+    /// as they were.
     pub fn save(&self) -> std::io::Result<()> {
         let mut settings = load_settings();
-        settings.midi_port_id = self.port_id.clone();
-        settings.midi_devices = self.devices.clone();
+        settings.sampler_midi_port_id = self.port_id.clone();
+        settings.sampler_midi_pads = self.devices.clone();
         save_settings(&settings)
     }
 
@@ -143,10 +142,15 @@ fn listen_notes(port_id: &str) -> Option<(midir::MidiInputConnection<()>, mpsc::
 
 /// Walks the user through pressing each of the 16 pads in order, recording
 /// whichever note each press sends — so a newly-picked device works
-/// regardless of how it numbers its pads. `Ok(None)` if the port can't be
-/// opened, or the user cancels with Esc/Ctrl+C (nothing is saved either
-/// way; the caller decides what to do, same as
-/// `odj_core::midi::pick_midi_input` skipping).
+/// regardless of how it numbers its pads. `Esc` stops early rather than
+/// requiring all 16: whatever's already been pressed is kept (unpressed
+/// pads stay at the `0` "unlearned" sentinel — the lowest-numbered one
+/// among them is the only one [`note_to_pad`] could ever mistake for a
+/// real note 0, vanishingly unlikely on real pad hardware), returning
+/// `Ok(None)` only if nothing was learned yet either. `Ctrl+C` always
+/// discards the lot instead, same as `Ok(None)` for a port that can't be
+/// opened — the caller treats either the same way `odj_core::midi::
+/// pick_midi_input` skipping is treated.
 pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<Option<[u8; PADS]>> {
     let Some((_conn, rx)) = listen_notes(port_id) else { return Ok(None) };
     let mut notes = [0u8; PADS];
@@ -156,10 +160,13 @@ pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?
             && key.kind != KeyEventKind::Release
-            && (key.code == KeyCode::Esc
-                || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
         {
-            return Ok(None);
+            if key.code == KeyCode::Esc {
+                return Ok((pad > 0).then_some(notes));
+            }
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                return Ok(None);
+            }
         }
         match rx.recv_timeout(Duration::from_millis(30)) {
             Ok(note) => {
@@ -211,7 +218,7 @@ fn draw_learn_screen(f: &mut Frame, pad: usize) {
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" Configure pads ")
-        .title_bottom(" Esc cancel ")
+        .title_bottom(if pad > 0 { " Esc finish here  Ctrl+C discard all " } else { " Esc/Ctrl+C cancel " })
         .border_style(Style::new().fg(AMBER));
     let mut text = big_number(pad + 1).join("\n");
     text.push_str(&format!("\n\npress pad {} of {}", pad + 1, PADS));
@@ -304,7 +311,7 @@ mod tests {
             config.save().unwrap();
 
             let after = load_settings();
-            assert_eq!(after.midi_port_id, Some("24:0".into()), "odj-sampler's own field changed");
+            assert_eq!(after.sampler_midi_port_id, Some("24:0".into()), "odj-sampler's own field changed");
             assert!(!after.auto_cue, "odj-player's fields survived the save");
             assert_eq!(after.music_dirs, vec![std::path::PathBuf::from("/music")]);
         });

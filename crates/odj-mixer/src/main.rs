@@ -1,38 +1,60 @@
-//! odj-mixer: mixes sound-card inputs into one chosen output, live, with a
-//! volume per input.
+//! odj-mixer: picks one main output at startup, then continuously
+//! discovers remote-controlled odj-player decks and a running
+//! odj-sampler, connecting every one of them to it automatically, live
+//! — a hardware sound-card input instead waits until it's added from
+//! Settings — and lets you control each channel's Volume and 3-band EQ
+//! by hand or by MIDI knob (mapped from Settings too).
 
+mod devices;
+mod midi;
+mod routing;
 mod ui;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use ratatui::DefaultTerminal;
 
-use odj_core::audio::{self, Input, Source};
+use odj_core::audio;
+use odj_core::filter::{MAX_DB, MIN_DB};
 use odj_core::tui;
-use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Split};
 
-/// Ring buffer capacity per input, in stereo samples — generous slack
-/// (~43 ms at 48 kHz) for scheduling jitter between the input and output
-/// callback threads; see the module doc comment on why no real sample-rate
-/// conversion is needed on top of that, just this much give.
-const RING_STEREO_SAMPLES: usize = 4096;
+use devices::{Devices, Kind};
+use midi::{Learning, Targets};
+use routing::{Param, Routing};
 
 fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
         println!(
             "usage: odj-mixer\n\n\
-             Lists sound-card inputs, lets you toggle any number of them on, and mixes \
-             whichever are enabled into one chosen output, live, each with its own volume \
-             (adjustable while it runs). Needs PipeWire: routing between two cards needs its \
-             shared graph clock, which plain ALSA doesn't have."
+             Asks for one main output at startup (mandatory — nothing would have anywhere to\n\
+             play without it). From then on, continuously detects running odj-player decks\n\
+             (as \"Deck n\") and a running odj-sampler (as \"Sampler\"), connecting every one\n\
+             of them to that output automatically, showing a channel strip — High, Mid, Low,\n\
+             Volume — for each. ←/→ picks the\n\
+             channel and ↑/↓ picks its control — neither changes a value, just navigates;\n\
+             +/- adjusts the selected one instead (Shift: ×4).\n\
+             ` opens Settings: one row per detected input, deck and the sampler. Space adds\n\
+             the selected input to the mix or removes it (a no-op on a deck's or the\n\
+             sampler's row — always connected automatically); an added input is remembered\n\
+             and reconnected automatically on the next run, same as those are. Enter drills\n\
+             into any row's own settings — for now just its 4 MIDI mappings, Volume/Low/Mid/\n\
+             High, where Enter maps a knob to the selected one and X clears it, Esc backs\n\
+             out. Esc/` closes Settings.\n\
+             Nothing on the live screen itself changes a mapping; that's Settings-only.\n\
+             Picks a MIDI controller at startup too (optional, skip with Esc/N) and, if you\n\
+             did, walks you through mapping a knob to each deck's (and the sampler's, if\n\
+             it's running) Volume/Low/Mid/High that isn't mapped yet. Press ? for the full\n\
+             list of keys.\n\
+             Needs PipeWire: routing between two cards needs its shared graph clock, which\n\
+             plain ALSA doesn't have."
         );
         return Ok(());
     }
-    let (mut terminal, _key_release) = tui::init();
+    let (mut terminal, key_release) = tui::init();
     let result = start(&mut terminal);
-    tui::restore(false);
+    tui::restore(key_release);
     result
 }
 
@@ -45,152 +67,93 @@ fn start(terminal: &mut DefaultTerminal) -> Result<()> {
              between two independent hardware clocks."
         );
     }
+    drop(host); // only needed for this check — everything else opens its own
 
-    let Some(output) = tui::pick_output(terminal, &host)? else { return Ok(()) };
-    let Some((input_cards, picked)) = ui::pick_inputs(terminal, &host)? else { return Ok(()) };
-    if picked.is_empty() {
-        return Ok(());
+    let devices_in = Devices::start(Kind::Input);
+    let devices_deck = Devices::start(Kind::Deck);
+    let devices_out = Devices::start(Kind::Output);
+
+    let Some(main_output) = ui::pick_main_output(terminal, &devices_out)? else { return Ok(()) };
+    let routing: Arc<Mutex<Routing>> = Arc::new(Mutex::new(Routing::default()));
+    routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(main_output));
+
+    // Marks this process as "a mixer is running" for any odj-player deck
+    // or odj-sampler that checks — see `odj_core::control`'s own module
+    // doc comment. Kept alive for the rest of `start`; dropping it (process exit)
+    // removes the marker. No protocol, nothing to hold onto beyond this.
+    let _presence = odj_core::control::Control::open("mixer").ok();
+
+    let mut settings = odj_core::memory::load_settings();
+    let midi_port = odj_core::midi::pick_midi_input(terminal, settings.mixer_midi_port_id.as_deref())?;
+    // Only remembered when one's actually picked — skipping (Esc/N) leaves
+    // whatever was saved before alone, same convention odj-player's old
+    // MIDI setup used.
+    if midi_port.is_some() {
+        settings.mixer_midi_port_id = midi_port.clone();
+        let _ = odj_core::memory::save_settings(&settings);
+    }
+    let targets =
+        Arc::new(Targets::new(settings.mixer_midi_knobs.iter().map(|(target, &cc)| (cc, target.clone())).collect()));
+
+    let learning: Arc<Learning> = Arc::new(Mutex::new(None));
+    let midi_conn = midi_port.as_deref().and_then(|id| {
+        let routing = routing.clone();
+        midi::connect(id, targets.clone(), learning.clone(), move |target, t| {
+            dispatch(target, t, &routing);
+        })
+    });
+
+    let midi_connected = midi_conn.is_some();
+    if midi_connected {
+        // Already-running decks need a moment to be scanned before
+        // deciding what's left unmapped — the common case is starting
+        // odj-mixer with decks already up, wanting to map them right
+        // away rather than discovering `L` on their own.
+        ui::wait_for_decks(terminal, Duration::from_millis(300))?;
+        ui::learn_unmapped(terminal, &devices_deck, &settings.mixer_midi_knobs, &targets, &learning)?;
     }
 
-    // Kept alive for the rest of `start`: dropping either an input or the
-    // output stream tears it down.
-    let mut input_streams = Vec::new();
-    let mut inputs = Vec::new();
-    for choice in &picked {
-        let input = Input::open(&host, &input_cards, choice)?;
-        let (prod, cons) = HeapRb::<f32>::new(RING_STEREO_SAMPLES).split();
-        let stream = input.start(prod)?;
-        if let Err(e) = audio::verify_input_route(&host, &input) {
-            drop(stream); // tear down rather than capture from the wrong device
-            return Err(e);
-        }
-        inputs.push(MixedInput { name: input.name.clone(), cons, volume: 1.0 });
-        input_streams.push(stream);
-    }
-
-    let mixed = Arc::new(Mutex::new(MixedSource::new(inputs)));
-    let out_stream = output.start(mixed.clone())?;
-    if let Err(e) = audio::verify_route(&host, &output) {
-        drop(out_stream);
-        drop(input_streams);
-        return Err(e);
-    }
-
-    let result = ui::run(terminal, &output.name, &mixed, &output.errors);
-    drop(out_stream);
-    drop(input_streams);
+    let result = ui::run(
+        terminal,
+        &devices_in,
+        &devices_deck,
+        &devices_out,
+        &routing,
+        &targets,
+        &learning,
+        midi_connected,
+        settings.mixer_active_inputs,
+    );
+    drop(midi_conn);
     result
 }
 
-/// One routed input: its name (for the live screen), the consumer end of
-/// its capture ring buffer, and its own volume (0.0..=1.0, default 1.0,
-/// adjustable live — see `ui::run`).
-struct MixedInput {
-    name: String,
-    cons: ringbuf::HeapCons<f32>,
-    volume: f32,
-}
-
-/// Sums every enabled input's captured audio, each scaled by its own
-/// volume, into the output — the hook point for "effects later": a
-/// per-input `odj_core::filter::ThreeBandEq` (already built for
-/// odj-player's Mixer) would sit between that input's `pop_slice` and the
-/// volume scaling below, one instance per input. Not wired up yet.
-pub(crate) struct MixedSource {
-    inputs: Vec<MixedInput>,
-    scratch: Vec<f32>,
-}
-
-impl MixedSource {
-    fn new(inputs: Vec<MixedInput>) -> Self {
-        Self { inputs, scratch: Vec::new() }
-    }
-
-    pub(crate) fn names(&self) -> Vec<String> {
-        self.inputs.iter().map(|i| i.name.clone()).collect()
-    }
-
-    pub(crate) fn volume(&self, i: usize) -> f32 {
-        self.inputs[i].volume
-    }
-
-    pub(crate) fn set_volume(&mut self, i: usize, v: f32) {
-        self.inputs[i].volume = v.clamp(0.0, 1.0);
-    }
-}
-
-impl Source for MixedSource {
-    fn render(&mut self, out: &mut [f32], _heard_at: f64) {
-        out.fill(0.0);
-        if self.scratch.len() < out.len() {
-            self.scratch.resize(out.len(), 0.0);
-        }
-        let scratch = &mut self.scratch[..out.len()];
-        for input in &mut self.inputs {
-            let got = input.cons.pop_slice(scratch);
-            scratch[got..].fill(0.0); // underrun: silence rather than stale samples
-            for (o, s) in out.iter_mut().zip(scratch.iter()) {
-                *o += *s * input.volume;
-            }
-        }
-    }
+/// Applies one MIDI knob's absolute position (`t`, `0.0..=1.0`) to
+/// whichever input/parameter `target` names (scaled into
+/// `MIN_DB..=MAX_DB` for EQ, same convention odj-player's old knob wiring
+/// used) — a no-op if that input isn't routed to anything right now.
+fn dispatch(target: &str, t: f32, routing: &Mutex<Routing>) {
+    let Some(target) = midi::parse_target(target) else { return };
+    let value = if target.param == Param::Volume { t } else { MIN_DB + t * (MAX_DB - MIN_DB) };
+    routing.lock().unwrap_or_else(|e| e.into_inner()).set_param(&target.input, target.param, value);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ringbuf::traits::Producer;
+    use odj_core::audio::Route;
 
-    fn input(name: &str, cap: usize) -> (ringbuf::HeapProd<f32>, MixedInput) {
-        let (prod, cons) = HeapRb::<f32>::new(cap).split();
-        (prod, MixedInput { name: name.into(), cons, volume: 1.0 })
+    #[test]
+    fn dispatch_ignores_a_target_thats_not_routed_anywhere() {
+        let routing = Mutex::new(Routing::default());
+        // No panic, no route created out of thin air.
+        dispatch("input:card#s0-1:volume", 0.3, &routing);
+        assert!(routing.lock().unwrap().output_of(&("card".into(), Route::Stereo(0, 1))).is_none());
     }
 
     #[test]
-    fn mixed_source_sums_every_input_at_unity_volume() {
-        let (mut p1, i1) = input("A", 8);
-        let (mut p2, i2) = input("B", 8);
-        p1.push_slice(&[0.2, 0.3]);
-        p2.push_slice(&[0.1, -0.1]);
-        let mut mixed = MixedSource::new(vec![i1, i2]);
-        let mut out = [0.0f32; 2];
-        mixed.render(&mut out, 0.0);
-        assert!((out[0] - 0.3).abs() < 1e-6);
-        assert!((out[1] - 0.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn mixed_source_scales_by_each_inputs_own_volume() {
-        let (mut p1, mut i1) = input("A", 8);
-        let (mut p2, mut i2) = input("B", 8);
-        i1.volume = 0.5;
-        i2.volume = 0.0; // muted
-        p1.push_slice(&[1.0, 1.0]);
-        p2.push_slice(&[1.0, 1.0]);
-        let mut mixed = MixedSource::new(vec![i1, i2]);
-        let mut out = [0.0f32; 2];
-        mixed.render(&mut out, 0.0);
-        assert_eq!(out, [0.5, 0.5]);
-    }
-
-    #[test]
-    fn mixed_source_silences_an_empty_or_underrun_consumer() {
-        let (mut p1, i1) = input("A", 8);
-        let (_p2, i2) = input("B", 8); // never fed: stays empty
-        p1.push_slice(&[0.5]); // only one frame's worth of L — R underruns
-        let mut mixed = MixedSource::new(vec![i1, i2]);
-        let mut out = [1.0f32; 2]; // non-zero, so a bug wouldn't hide as a false pass
-        mixed.render(&mut out, 0.0);
-        assert_eq!(out, [0.5, 0.0]);
-    }
-
-    #[test]
-    fn set_volume_clamps_to_0_1() {
-        let (_p, i1) = input("A", 8);
-        let mut mixed = MixedSource::new(vec![i1]);
-        mixed.set_volume(0, 1.5);
-        assert_eq!(mixed.volume(0), 1.0);
-        mixed.set_volume(0, -0.5);
-        assert_eq!(mixed.volume(0), 0.0);
+    fn dispatch_ignores_garbage() {
+        let routing = Mutex::new(Routing::default());
+        dispatch("nonsense", 0.3, &routing); // doesn't panic
     }
 }

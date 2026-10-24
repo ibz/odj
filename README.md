@@ -23,8 +23,9 @@ Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
 needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF.
 
 If there is more than one stereo output (say, a USB audio interface next to
-the built-in card), odj-player and odj-sampler ask at start which one to play on: a stereo
-output, or one side of it in mono. HDMI outputs are not listed. Audio goes
+the built-in card), odj-player and odj-sampler ask at start which one to play
+on (unless a mixer is running — see below): a stereo output, or one side of
+it in mono. HDMI outputs are not listed. Audio goes
 through PipeWire, so you can run one odj-player per output, e.g. two decks on
 the two line outs of an interface. Without PipeWire, odj-player opens the card
 directly and holds it while it runs.
@@ -32,14 +33,20 @@ directly and holds it while it runs.
 Each running odj-player claims a deck number — shown as "DECK n" in the
 header — defaulting to the first one free (1, unless another instance is
 already running); pass `--deck 1`/`--deck 2` to force a specific one, e.g.
-to start deck 2 before deck 1. That number is also what disambiguates the
-Mixer's MIDI knobs (`M`: volume + 3-band EQ) — 4 per deck (Volume, Low,
-Mid, High) — when a MIDI input is available: at startup you're asked which
-one to use (or none), then, the first time, walked through turning each of
-the 4 knobs in order so their CCs are learned rather than assumed. One
-controller's 8 knobs can serve both decks, since each learns and remembers
-only its own half — kept, along with the chosen port, in the settings file
-shared with odj-sampler (`~/.config/odj/settings.json`).
+to start deck 2 before deck 1.
+
+odj-player runs either standalone, playing straight to a real output with
+no Volume or EQ control of its own, or routed through **odj-mixer**: if
+one is already running when a deck starts, that deck routes its output
+through it instead of a real device, and odj-mixer discovers it live, as
+"Deck n", to apply Volume/EQ to (by hand or by MIDI knob) the same way it
+does for any sound-card input — see below. Which one happens is checked
+once, at startup, not re-checked if odj-mixer starts or quits mid-session.
+
+odj-sampler works the same way: standalone with a real output, or, if
+odj-mixer is already running when it starts, routed through it instead
+(no output picker in that case), discovered live as "Sampler" and given
+the same Volume/EQ treatment.
 
 Use a terminal with the kitty keyboard protocol (Ghostty, kitty, foot,
 Alacritty, WezTerm) and run it outside tmux. Hold-to-preview cue, jog nudges
@@ -174,18 +181,74 @@ quits.
 
 ## odj-mixer
 
-Mixes sound-card inputs — a turntable's line-in, a mixer channel, a mic —
-into one output, live, each with its own volume, so they come out
-alongside whatever else is playing. Needs PipeWire running (it refuses to
-start without it): routing between two different cards relies on
-PipeWire's shared graph clock to keep them in sync, which plain ALSA has
-no way to do. At startup you pick the output the same way odj-player does,
-then a checklist of every detected input; `Space` toggles any number of
-them on, `Enter` starts mixing whichever are checked. While running,
-`↑`/`↓` selects an input and `←`/`→` adjusts its volume (`Shift`: ×4
-steps), `0` resets it to 100%; `q`/`Esc`/`Ctrl+C` stops it. No per-input EQ
-yet — that's planned, reusing the same filters behind odj-player's own
-Mixer (`M`).
+Asks which output to use at startup — mandatory, since nothing would
+have anywhere to play without it, and fixed for the session once
+picked. From then on, continuously detects running odj-player decks and
+a running odj-sampler, and connects every one of them to that output
+automatically, live — each is already part of the session, so it just
+plays, no extra step needed (none of them send their audio anywhere
+special for this: each plays into its own virtual sink instead of a
+real device, and odj-mixer captures it from there). A sound-card input
+(a turntable's line-in, a mixer channel, a mic) is different: there's
+usually several, not all of them meant to be mixed in, so each one
+instead waits until it's added from Settings (`` ` ``, see below) —
+once added, every Volume/EQ control works identically whether a strip
+is a turntable, a deck or the sampler. Needs PipeWire running (it
+refuses to start without it): both the virtual sinks and routing
+between two different real cards rely on PipeWire's shared graph
+clock, which plain ALSA has no way to provide.
+
+The live screen looks like a real mixer: one channel strip per running
+deck (or the sampler) plus every input that's been added, side by side, each with High,
+Mid and Low and a vertical Volume fader. A hardware input's title is
+cut down to whatever's actually different about it compared to every
+other one currently shown — just "2" among several inputs on the same
+interface, "UMC404HD 192k" if what's different is which interface, and
+so on — so two inputs never read the same just because a long shared
+name pushed the part that differs off the edge. `←`/`→` picks the
+channel and `↑`/`↓` picks which control is active (High, Mid, Low,
+Volume, wrapping top to bottom and back) — that's all either does,
+never changing a value, so they're always safe to tap. `+`/`-` adjusts
+the selected control instead (`Shift`: ×4 steps, a no-op until the
+channel's actually connected). Nothing on the live screen changes a
+MIDI mapping any more — that only happens from Settings. As on
+odj-player's own live screen, the footer's contextual keys sit on the
+left and the globals (`` ` `` settings, `?` help, `Ctrl+C` quit) stay
+pinned to the right.
+
+After the mandatory output pick and an optional MIDI controller pick
+(`Esc`/`N` skips the latter), it briefly looks for decks (and the
+sampler) already running, then walks you through turning a knob for
+each one's Volume, Low, Mid and High that isn't mapped yet (so 8 knobs
+total for two decks, 12 with the sampler too) — `Esc` at any point
+stops the walkthrough, leaving the rest for later. Inputs are left out
+of this walkthrough (most already have a physical knob on their own
+hardware); map one on demand from Settings instead. Any knob mapped
+this way, for an input, a deck or the sampler, is remembered in the
+settings file shared with the other apps.
+
+`` ` `` ("settings", on the right of the live screen's hint line)
+opens one list, one row per detected input, deck and the sampler, with
+a right-aligned indicator for whether it's currently mixed in: `●`/`○`
+for an input (`Space` toggles it — adding one connects it to the main
+output right away, removing one disconnects it; this is also
+remembered in the shared settings file, so an added input is still
+there, reconnected automatically, next time odj-mixer runs — same as
+a deck or the sampler already is), or `◆`/`◇` for a deck or the
+sampler — a different shape, not just a different state, since either
+is always connected automatically and `Space` can't change that.
+`↑`/`↓` picks a row; `Enter`, on either kind, drills into its own
+settings — for now just its Volume, Low, Mid and High, each showing
+whatever CC it's bound to, or "—" if none. `↑`/`↓` picks one there,
+`Enter` maps (or remaps) a knob to it, `X`/`Delete` clears it, `Esc`
+goes back to the channel list. `Esc`/`` ` `` from there closes
+Settings back to the live screen.
+
+`?`/`/` opens the full key list from the live screen (Settings has
+no help of its own — every key's already spelled out in its own hint
+line), taking over until `Esc`/`?`/`/` closes it again. `Ctrl+C` quits
+(at the top level) — `q`/`Esc` don't; `Esc` is reserved for backing out
+of whatever's open instead.
 
 ## Keys
 
@@ -215,7 +278,6 @@ along their bottom edge, as does the output picker at start.
 | `Tab` | File browser |
 | `Ctrl+U in the browser` | Add this folder to your music folders |
 | `` ` `` | Settings: auto-cue, music folders |
-| `M` | Mixer: volume + 3-band EQ (low/mid/high) |
 
 #### Cues
 

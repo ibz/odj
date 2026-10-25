@@ -31,8 +31,17 @@ pub fn list_ports() -> Vec<(String, String)> {
 /// keep same-named devices visually distinct in a list), so a straight
 /// `strip_suffix` recovers the name as the device itself reports it, with
 /// nothing connection-order-dependent left in it.
-fn stable_name(id: &str, name: &str) -> String {
+pub fn stable_name(id: &str, name: &str) -> String {
     name.strip_suffix(&format!(" {id}")).unwrap_or(name).to_string()
+}
+
+/// The current port id of the first currently-connected port named
+/// `name` (its own stable name, ignoring any connection-order suffix)
+/// — the inverse of [`stable_name`], for restoring a remembered
+/// device by name rather than its own (replug-unstable) id. `None` if
+/// nothing currently connected has that name.
+pub fn port_id_for(name: &str) -> Option<String> {
+    list_ports().into_iter().find(|(id, n)| stable_name(id, n) == name).map(|(id, _)| id)
 }
 
 /// `port_id`'s stable name, and its slot: how many *other* currently
@@ -127,5 +136,17 @@ mod tests {
         let (name_b, slot_b) = device_slot(id_b).expect("a connected port resolves");
         assert_eq!(name_a, name_b, "both report the same name");
         assert_ne!(slot_a, slot_b, "but each gets its own slot under that name");
+    }
+
+    #[test]
+    #[ignore = "needs a real ALSA sequencer; exercises list_ports against a virtual port"]
+    fn port_id_for_finds_a_connected_ports_id_by_its_stable_name() {
+        use midir::os::unix::VirtualOutput;
+
+        let _p = midir::MidiOutput::new("odj-core-test-single").unwrap().create_virtual("odj-core-test-single").unwrap();
+        let (id, name) = list_ports().into_iter().find(|(_, n)| n.contains("odj-core-test-single")).expect("virtual port visible");
+        let stable = stable_name(&id, &name);
+        assert_eq!(port_id_for(&stable), Some(id));
+        assert_eq!(port_id_for("not a real controller"), None);
     }
 }

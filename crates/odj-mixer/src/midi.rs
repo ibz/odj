@@ -98,6 +98,17 @@ impl Targets {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, t| t != target);
     }
 
+    /// Wholesale replaces every binding — for switching to a different
+    /// MIDI controller mid-session (Settings' own MIDI tab), where
+    /// everything the old one had mapped is simply wrong for the new
+    /// one. The live MIDI connection itself is a separate thing the
+    /// caller tears down and reopens on the new port; this just means
+    /// the same `Targets` (and so the same dispatch closure) can be
+    /// reused across that swap rather than rebuilding it too.
+    pub fn replace(&self, map: HashMap<u8, String>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = map;
+    }
+
     /// Every distinct device at least one currently-bound knob targets
     /// — for Settings to still list a channel whose device isn't
     /// currently detected, as long as it has a mapping worth seeing
@@ -224,6 +235,15 @@ mod tests {
         assert_eq!(targets.get(10), None, "the old knob no longer does anything");
         assert_eq!(targets.get(12), Some("input:Mic".into()));
         assert_eq!(targets.get(11), Some("input:Turntable".into()), "unrelated bindings survive");
+    }
+
+    #[test]
+    fn replace_discards_every_old_binding_in_favor_of_the_new_map() {
+        let targets = Targets::default();
+        targets.bind(10, "input:Mic".into());
+        targets.replace(HashMap::from([(5, "input:Other".to_string())]));
+        assert_eq!(targets.get(10), None, "the old controller's bindings are gone");
+        assert_eq!(targets.get(5), Some("input:Other".into()));
     }
 
     #[test]

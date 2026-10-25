@@ -214,21 +214,38 @@ odj-player's own live screen, the footer's contextual keys sit on the
 left and the globals (`` ` `` settings, `?` help, `Ctrl+C` quit) stay
 pinned to the right.
 
-After an optional MIDI controller pick at startup
-(`Esc`/`N` skips it), it briefly looks for decks (and the
+Picking a MIDI controller at startup needs no picker either, the same
+way the main output doesn't: every controller odj-mixer's ever learned
+knob mappings for is remembered (`Settings.mixer_midi_controllers`, by
+its own stable name — not its connection-order port id, which can
+change across a replug), so if exactly one known one is plugged in, it's
+used automatically; if more than one is, the last-used one is
+(`Settings.mixer_midi_last`), or whichever sorts first by name if that
+one isn't among them. Only when every currently plugged-in controller
+is unknown does it fall back to asking (`Esc`/`N` skips it) — picking
+one there makes it known from then on, with an empty map to start.
+Either way, it then briefly looks for decks (and the
 sampler) already running, then walks you through turning a knob for
-each one's Volume, Low, Mid and High that isn't mapped yet (so 8 knobs
-total for two decks, 12 with the sampler too) — `Esc` at any point
-stops the walkthrough, leaving the rest for later. Inputs are left out
-of this walkthrough (most already have a physical knob on their own
-hardware); map one on demand from Settings instead. Any knob mapped
-this way, for an input, a deck or the sampler, is remembered in the
-settings file shared with the other apps.
+each one's Volume, Low, Mid and High that isn't mapped yet on *that*
+controller (so 8 knobs total for two decks, 12 with the sampler too) —
+`Esc` at any point stops the walkthrough, leaving the rest for later.
+Inputs are left out of this walkthrough (most already have a physical
+knob on their own hardware); map one on demand from Settings instead.
+Any knob mapped this way, for an input, a deck or the sampler, is
+remembered under that controller's own entry in the settings file
+shared with the other apps — switching controllers (see **MIDI**
+below) never mixes up what's mapped on one with another.
 
 `` ` `` ("settings", on the right of the live screen's hint line) opens
-Settings, 2 tabs — `Tab`/`Shift+Tab` switches between them either way,
+Settings, 3 tabs — `Tab`/`Shift+Tab` cycles through them either way,
 the current one highlighted the same way the help overlay's own tabs
-are (black on amber).
+are (black on amber). Its own border bottom matches the help
+overlay's too, exactly: `Esc` ("Back" while drilled into a row's own
+settings, "Close" otherwise) on the left in amber, `Tab` ("Next tab")
+on the right in the help overlay's own distinct light blue, both in
+the same highlighted-badge style — with whatever's specific to the
+current tab in plain text between them — `Tab` is left off entirely
+while drilled in, since it doesn't do anything there.
 
 **Inputs** (the tab it opens to) is one list, one row per detected
 input, deck and the sampler —
@@ -267,7 +284,25 @@ rather than something plugged in) rather than nothing at all — and can
 be changed again any time from here — switching tears down every
 channel's route and lets the same auto-connect that handles a newly
 detected one put them all back on the new output. `Esc`/`` ` `` closes
-Settings back to the live
+Settings back to the live screen here too.
+
+**MIDI** is one list, one row per controller odj-mixer has at least
+one saved knob mapping for, plus one more for each currently plugged
+in that has none yet — so a controller with mappings still shows up
+even unplugged, and a brand new one can be picked the moment it's
+seen, not only once it's been used before. Each row names how many
+mappings it has, right-aligned ahead of the marker (0 for one that's
+merely plugged in), right there instead of drilling in to check. The
+marker is the same 3-icon convention Inputs uses for its own
+not-currently-detected rows: `✕` for a controller that's unplugged
+(known only from its saved mappings — not something `Enter` can do
+anything with), `●` for whichever one is actually connected, `○` for
+any other one that's plugged in but not the active one. `↑`/`↓`
+picks a row, `Enter` switches to it live if it's plugged in (tearing
+down whatever was connected before and loading that controller's own
+saved mappings, or an empty one if it has none), `X`/`Delete` forgets
+its mappings instead — a no-op if it has none to forget, same as
+`Enter` is on one that isn't plugged in. `Esc`/`` ` `` closes Settings back to the live
 screen here too.
 
 `?`/`/` opens the full key list from the live screen (Settings has

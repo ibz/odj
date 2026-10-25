@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use midir::MidiInputConnection;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,7 +31,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
 use odj_core::audio;
 use odj_core::filter::{MAX_DB, MIN_DB};
-use odj_core::tui::{AMBER, DIM, Help, Page, centered, draw_help, tab_span, wrap};
+use odj_core::tui::{AMBER, DIM, Help, PAGE_HINT, Page, centered, draw_help, key_hint, tab_span, wrap};
 
 use crate::devices::{DeviceKey, Devices, Entry, device_key_string};
 use crate::midi::{self, Learning, Target, Targets};
@@ -68,17 +69,18 @@ pub const HELP: &[Page] = &[
             ("← / →", "Move between channels"),
             ("↑ / ↓", "Move between its controls: High, Mid, Low, Volume"),
             ("+ / -", "Adjust the selected control (Shift: ×4)"),
-            ("`", "Settings: pick channels, manage MIDI mappings, pick/change the main output"),
+            ("`", "Settings: pick channels, manage MIDI mappings, pick/change the output or controller"),
             ("Ctrl+C", "Quit"),
         ],
     ),
     Page::Keys(
         "Settings",
         &[
-            ("Tab / BackTab", "Switch between the Inputs and Outputs tabs"),
-            ("↑ / ↓", "Move between rows — every detected input and deck (Inputs), or every detected output (Outputs)"),
+            ("Tab / BackTab", "Cycle the Inputs/Outputs/MIDI tabs"),
+            ("↑ / ↓", "Move between rows — every detected input and deck (Inputs), output (Outputs), or mapped/present controller (MIDI)"),
             ("Space", "Inputs: add the selected input to the mix, or remove it (a no-op on a deck's row — always connected — or on one that's mapped but not currently detected)"),
-            ("Enter", "Inputs: open the selected row's own settings — for now just its 4 MIDI mappings · Outputs: make the selected one the main output"),
+            ("Enter", "Inputs: open the selected row's own settings — for now just its 4 MIDI mappings · Outputs: make the selected one the main output · MIDI: switch to the selected controller (if it's present)"),
+            ("X / Delete", "MIDI: forget the selected controller's mappings (if it has any)"),
             ("↑ / ↓ (drilled in)", "Move between its 4 params"),
             ("Enter (drilled in)", "Map a knob to the selected param"),
             ("X / Delete (drilled in)", "Clear whatever's mapped to the selected param"),
@@ -146,17 +148,36 @@ enum Group {
     Deck,
 }
 
-/// Settings' 2 tabs — `Tab`/`BackTab` (Shift+Tab) switches between
-/// them, either direction, since there's nowhere else for 2 tabs to
-/// switch to. Inputs is everything [`draw_settings`] already showed
-/// before this split; Outputs is new: picking the main output used to
-/// be a mandatory screen before the live screen could even start (see
-/// `main.rs`'s own doc comment) — now it's just another Settings tab,
-/// so it can be changed mid-session too, not only chosen once upfront.
+/// Settings' 3 tabs — `Tab`/`BackTab` (Shift+Tab) cycles through them,
+/// forward or back. Inputs is everything [`draw_settings`] showed
+/// before this was split into tabs at all; Outputs and MIDI both used
+/// to be a mandatory screen before the live screen could even start
+/// (see `main.rs`'s own doc comment) — now each is just another
+/// Settings tab, so either can be changed mid-session too, not only
+/// chosen once upfront.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
     Inputs,
     Outputs,
+    Midi,
+}
+
+impl SettingsTab {
+    fn next(self) -> Self {
+        match self {
+            SettingsTab::Inputs => SettingsTab::Outputs,
+            SettingsTab::Outputs => SettingsTab::Midi,
+            SettingsTab::Midi => SettingsTab::Inputs,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            SettingsTab::Inputs => SettingsTab::Midi,
+            SettingsTab::Outputs => SettingsTab::Inputs,
+            SettingsTab::Midi => SettingsTab::Outputs,
+        }
+    }
 }
 
 /// One channel strip: a continuously-detected input or deck.
@@ -228,23 +249,36 @@ fn auto_connect(
     }
 }
 
-/// Binds `cc` to `target` both live (`targets`) and in the shared settings
-/// file, so the mapping survives a restart — same replace-the-old-knob
-/// semantics as `Targets::bind` on both sides.
-fn bind_knob(targets: &Targets, cc: u8, target: String) {
+/// Binds `cc` to `target` both live (`targets`) and in `controller`'s
+/// own entry of the shared settings file, so the mapping survives a
+/// restart — same replace-the-old-knob semantics as `Targets::bind` on
+/// both sides. `controller` is whichever one's actually connected
+/// right now (see [`run`]'s own `controller` state) — each keeps its
+/// own map, so mapping a knob on one never touches another's.
+fn bind_knob(targets: &Targets, controller: &str, cc: u8, target: String) {
     targets.bind(cc, target.clone());
     let mut settings = odj_core::memory::load_settings();
-    settings.mixer_midi_knobs.retain(|_, c| *c != cc);
-    settings.mixer_midi_knobs.insert(target, cc);
+    let knobs = settings.mixer_midi_controllers.entry(controller.to_string()).or_default();
+    knobs.retain(|_, c| *c != cc);
+    knobs.insert(target, cc);
     let _ = odj_core::memory::save_settings(&settings);
 }
 
-/// Clears whatever knob is bound to `target`, both live and in the
-/// shared settings file — the inverse of [`bind_knob`].
-fn unbind_knob(targets: &Targets, target: &str) {
+/// Clears whatever knob is bound to `target` on `controller`'s own
+/// map, both live and in the shared settings file — the inverse of
+/// [`bind_knob`]. Drops `controller`'s entire entry once its map goes
+/// empty, same as [`forget_controller`] does outright — an entry with
+/// nothing in it isn't a controller worth remembering, and would
+/// otherwise show up with nothing to forget (see [`ControllerRow`]).
+fn unbind_knob(targets: &Targets, controller: &str, target: &str) {
     targets.unbind(target);
     let mut settings = odj_core::memory::load_settings();
-    settings.mixer_midi_knobs.remove(target);
+    if let Some(knobs) = settings.mixer_midi_controllers.get_mut(controller) {
+        knobs.remove(target);
+        if knobs.is_empty() {
+            settings.mixer_midi_controllers.remove(controller);
+        }
+    }
     let _ = odj_core::memory::save_settings(&settings);
 }
 
@@ -279,6 +313,42 @@ fn set_output(key: &DeviceKey) {
     let _ = odj_core::memory::save_settings(&settings);
 }
 
+/// Saves `name` as the last-used MIDI controller — mirrors
+/// [`set_output`]'s pattern, just for `Settings.mixer_midi_last`
+/// instead. Deliberately *doesn't* register `name` among
+/// `Settings.mixer_midi_controllers` itself if it isn't there
+/// already: an entry with nothing mapped in it isn't a controller
+/// worth remembering (see [`ControllerRow`]) — [`bind_knob`] is what
+/// actually creates one, the first time something's mapped on it.
+/// Returns whatever `name` already has mapped (or an empty map if
+/// it's never been used before), for the caller to seed a fresh
+/// `Targets` with when switching to it live (see [`run`]'s MIDI tab).
+fn set_controller(name: &str) -> HashMap<String, u8> {
+    let mut settings = odj_core::memory::load_settings();
+    let knobs = settings.mixer_midi_controllers.get(name).cloned().unwrap_or_default();
+    settings.mixer_midi_last = Some(name.to_string());
+    let _ = odj_core::memory::save_settings(&settings);
+    knobs
+}
+
+/// Removes `name` from the known MIDI controllers, and its own
+/// mappings with it — the inverse of ever having been learned, not
+/// just of being currently plugged in (see [`ControllerRow`]). A
+/// no-op if `name` has nothing mapped already — there's nothing to
+/// forget there, same as `run`'s own `X`/`Delete` handler only calls
+/// this when `ControllerRow::mappings` is actually nonzero. Doesn't
+/// touch anything live even if `name` happens to be the one
+/// connected right now — only the next time it'd otherwise be
+/// auto-picked, or shown with mappings, that this takes effect.
+fn forget_controller(name: &str) {
+    let mut settings = odj_core::memory::load_settings();
+    settings.mixer_midi_controllers.remove(name);
+    if settings.mixer_midi_last.as_deref() == Some(name) {
+        settings.mixer_midi_last = None;
+    }
+    let _ = odj_core::memory::save_settings(&settings);
+}
+
 /// Every discovered deck's (or odj-sampler's) 4 Mixer parameters
 /// (`(label, target key)`) that isn't already in `already` — hardware
 /// inputs are deliberately left out of this: they're not the point of
@@ -301,7 +371,8 @@ fn unmapped_targets(deck_entries: &[Entry], already: &HashMap<String, u8>) -> Ve
 
 /// Walks the user through mapping a MIDI knob to each deck's (or
 /// odj-sampler's) Volume/Low/Mid/High that isn't bound to one yet
-/// (`already`, from `Settings.mixer_midi_knobs`), for every one already
+/// (`already`, `controller`'s own entry of
+/// `Settings.mixer_midi_controllers`), for every one already
 /// discovered by the time this is called — the same "turn this knob"
 /// walkthrough odj-player's own old MIDI setup used, just over however
 /// many decks (and the sampler) show up instead of one fixed deck.
@@ -312,6 +383,7 @@ fn unmapped_targets(deck_entries: &[Entry], already: &HashMap<String, u8>) -> Ve
 pub fn learn_unmapped(
     terminal: &mut DefaultTerminal,
     devices_deck: &Devices,
+    controller: &str,
     already: &HashMap<String, u8>,
     targets: &Arc<Targets>,
     learning: &Arc<Learning>,
@@ -333,7 +405,7 @@ pub fn learn_unmapped(
         };
         let Some(cc) = cc else { break };
         used.insert(cc);
-        bind_knob(targets, cc, target.clone());
+        bind_knob(targets, controller, cc, target.clone());
     }
     Ok(())
 }
@@ -484,7 +556,7 @@ struct ChannelRow {
 /// a mapping to a deck that's quit, or an input that's been unplugged,
 /// would become invisible (and so uncheckable, and unclearable) the
 /// moment it's gone, even though the mapping itself quietly lives on
-/// in `Settings.mixer_midi_knobs` either way. Such a row has no live
+/// in `Settings.mixer_midi_controllers` either way. Such a row has no live
 /// label or availability to show, so [`phantom_channel`] derives
 /// what it can from the device key alone.
 fn build_channel_rows(channels: &[Channel], routing: &Routing, targets: &Targets) -> Vec<ChannelRow> {
@@ -534,6 +606,41 @@ fn phantom_channel(key: &DeviceKey) -> (Group, String) {
     (Group::Input, format!("{} · {route}", key.0))
 }
 
+/// One row of Settings' MIDI tab: the union of every controller
+/// `Settings.mixer_midi_controllers` has at least one saved mapping
+/// for (whether or not it's plugged in right now) and every one
+/// currently plugged in that has none yet — so a controller with
+/// mappings still shows up even unplugged, with the option to forget
+/// them, while a brand new one can still be picked the moment it's
+/// seen, not just once it's been used before. `mappings` is 0 for the
+/// latter — there's nothing to forget on one of those, same as
+/// there's nothing to switch to on one that `!present`.
+struct ControllerRow {
+    name: String,
+    present: bool,
+    mappings: usize,
+}
+
+fn build_controller_rows(known: &HashMap<String, HashMap<String, u8>>) -> Vec<ControllerRow> {
+    let ports = odj_core::midi::list_ports();
+    let mut names: Vec<String> = known.keys().cloned().collect();
+    for (id, label) in &ports {
+        let name = odj_core::midi::stable_name(id, label);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let present = ports.iter().any(|(id, label)| odj_core::midi::stable_name(id, label) == name);
+            let mappings = known.get(&name).map_or(0, HashMap::len);
+            ControllerRow { name, present, mappings }
+        })
+        .collect()
+}
+
 /// One row of a [`ChannelRow`]'s own drill-in: one of its 4 params,
 /// with whatever CC is currently bound to it, if any — `Enter` maps
 /// (or remaps) one, `X`/`Delete` clears it.
@@ -571,8 +678,8 @@ fn build_param_rows(key: &DeviceKey, targets: &Targets) -> Vec<ParamRow> {
 /// value, so they're always safe to tap. `+`/`-` adjusts the selected
 /// control instead (`Shift`: ×4, a no-op until the channel's actually
 /// connected). `` ` `` (one of the globals pinned to the right of the
-/// hint line, see [`draw_mixer`]) opens Settings, 2 tabs
-/// ([`SettingsTab`], switched either direction with `Tab`/`BackTab`).
+/// hint line, see [`draw_mixer`]) opens Settings, 3 tabs
+/// ([`SettingsTab`], cycled either direction with `Tab`/`BackTab`).
 /// Inputs is one list of every detected input and deck, plus (see
 /// [`build_channel_rows`]) a row for any device that's no longer
 /// detected but still has a MIDI mapping. `↑`/`↓` picks a row, `Space`
@@ -593,15 +700,32 @@ fn build_param_rows(key: &DeviceKey, targets: &Targets) -> Vec<ParamRow> {
 /// switching tears down and reconnects every channel fresh (see
 /// `Routing::set_main_output`), the same auto-connect that puts a
 /// freshly detected one back doing the same for all of them here.
-/// `Esc`/`` ` `` from either tab's own list returns to the live screen.
-/// Nothing on the live screen itself changes a mapping or the output
-/// any more; that only happens from here. `Ctrl+C` quits — `q`/`Esc` don't, here or
+/// MIDI ([`build_controller_rows`]) is every controller with at least
+/// one saved mapping, plus every one currently present that has none
+/// yet (each row names how many it has — 0 for the latter); `↑`/`↓`
+/// picks one, `Enter` switches to it live if it's present (tearing
+/// down whatever MIDI connection there was, if any, and seeding
+/// `targets` — see `Targets::replace` — from that controller's own
+/// saved knobs, or an empty map if it has none), `X`/`Delete` forgets
+/// one's mappings instead — a no-op if it has none to forget, same as
+/// `Enter` is on one that isn't present. `controller` (this run's
+/// starting one, if any) and `midi_conn` (its live connection, ditto)
+/// are both `None`
+/// together or `Some` together — see `main.rs`'s own doc comment for
+/// how the initial one's chosen. `Esc`/`` ` `` from any tab's own list
+/// returns to the live screen. Nothing on the live screen itself
+/// changes a mapping, the output or the controller any more; that
+/// only happens from here. `Ctrl+C` quits — `q`/`Esc` don't, here or
 /// anywhere else in odj-mixer; `Esc` is reserved for backing out of
 /// whatever's open instead (Settings, help, a drill-in). `?`/`/` opens
 /// [`HELP`] from the live screen, taking over the keys until
 /// `Esc`/`?`/`/` closes it again — Settings has no help of its own,
 /// since every key there is already spelled out in its own hint line.
-#[allow(clippy::too_many_arguments)]
+// `midi_conn`'s whole purpose is outliving its own scope with the
+// right lifetime (dropping it tears down that connection) — it's
+// never actually read, so the compiler's own unused-assignment check
+// doesn't apply here the way it would to a value meant to be used.
+#[allow(clippy::too_many_arguments, unused_assignments)]
 pub fn run(
     terminal: &mut DefaultTerminal,
     devices_in: &Devices,
@@ -610,7 +734,8 @@ pub fn run(
     routing: &Arc<Mutex<Routing>>,
     targets: &Arc<Targets>,
     learning: &Arc<Learning>,
-    midi_connected: bool,
+    #[allow(unused_variables)] mut midi_conn: Option<MidiInputConnection<()>>,
+    mut controller: Option<String>,
     mut active_inputs: HashSet<String>,
 ) -> Result<()> {
     let mut selected_channel = 0usize;
@@ -622,6 +747,7 @@ pub fn run(
     let mut mapping_drill: Option<DeviceKey> = None;
     let mut param_selected = 0usize;
     let mut output_selected = 0usize;
+    let mut midi_selected = 0usize;
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
     // Shown via `draw_status_popup` until something replaces it or any
@@ -667,8 +793,11 @@ pub fn run(
                 build_channel_rows(&build_channels(&in_entries, &deck_entries), &r, targets)
             };
             let main_output = routing.lock().unwrap_or_else(|e| e.into_inner()).main_output();
+            let known_controllers = odj_core::memory::load_settings().mixer_midi_controllers;
+            let controller_rows = build_controller_rows(&known_controllers);
             channel_selected = channel_selected.min(channel_rows.len().saturating_sub(1));
             output_selected = output_selected.min(out_entries.len().saturating_sub(1));
+            midi_selected = midi_selected.min(controller_rows.len().saturating_sub(1));
             // The drilled-into channel disappearing (unplugged, deck
             // quit) backs out to the channel list rather than pointing
             // at nothing.
@@ -694,6 +823,9 @@ pub fn run(
                     &out_entries,
                     output_selected,
                     main_output.as_ref(),
+                    &controller_rows,
+                    midi_selected,
+                    controller.as_deref(),
                     status.as_deref(),
                 );
             })?;
@@ -710,29 +842,30 @@ pub fn run(
                         KeyCode::Down => param_selected = (param_selected + 1).min(rows.len().saturating_sub(1)),
                         KeyCode::Enter if !rows.is_empty() => {
                             let row = &rows[param_selected];
-                            if !midi_connected {
-                                status = Some("No MIDI controller connected".into());
-                            } else if let Some(cc) = midi::learn(terminal, learning, &format!("{label} {}", param_label(row.param)))? {
-                                bind_knob(targets, cc, row.target.clone());
+                            match &controller {
+                                None => status = Some("No MIDI controller connected".into()),
+                                Some(name) => {
+                                    if let Some(cc) = midi::learn(terminal, learning, &format!("{label} {}", param_label(row.param)))? {
+                                        bind_knob(targets, name, cc, row.target.clone());
+                                    }
+                                }
                             }
                         }
                         KeyCode::Char('x' | 'X') | KeyCode::Delete if !rows.is_empty() => {
-                            unbind_knob(targets, &rows[param_selected].target);
+                            if let Some(name) = &controller {
+                                unbind_knob(targets, name, &rows[param_selected].target);
+                            }
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                         _ => {}
                     }
                     continue;
                 }
-                // `Tab`/`BackTab` (Shift+Tab) switches tabs either way,
-                // same as there's nowhere else for them to switch
-                // between — not handled per-tab below since it's the
-                // one key both tabs share.
+                // `Tab`/`BackTab` (Shift+Tab) cycles tabs either way —
+                // not handled per-tab below since it's the one key
+                // every tab shares.
                 if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
-                    settings_tab = match settings_tab {
-                        SettingsTab::Inputs => SettingsTab::Outputs,
-                        SettingsTab::Outputs => SettingsTab::Inputs,
-                    };
+                    settings_tab = if k.code == KeyCode::Tab { settings_tab.next() } else { settings_tab.prev() };
                     continue;
                 }
                 match settings_tab {
@@ -769,6 +902,37 @@ pub fn run(
                             let key = out_entries[output_selected].key.clone();
                             routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(key.clone()));
                             set_output(&key);
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        _ => {}
+                    },
+                    SettingsTab::Midi => match k.code {
+                        KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
+                        KeyCode::Up => midi_selected = midi_selected.saturating_sub(1),
+                        KeyCode::Down => midi_selected = (midi_selected + 1).min(controller_rows.len().saturating_sub(1)),
+                        KeyCode::Enter
+                            if controller_rows
+                                .get(midi_selected)
+                                .is_some_and(|r| r.present && Some(r.name.as_str()) != controller.as_deref()) =>
+                        {
+                            let name = controller_rows[midi_selected].name.clone();
+                            if let Some(id) = odj_core::midi::port_id_for(&name) {
+                                // Tear down whatever was connected
+                                // before switching — a `MidiInputConnection`
+                                // is tied to one specific port, so the old
+                                // one can't just be redirected.
+                                midi_conn = None;
+                                let knobs = set_controller(&name);
+                                targets.replace(knobs.iter().map(|(t, &cc)| (cc, t.clone())).collect());
+                                let dispatch_routing = routing.clone();
+                                midi_conn = midi::connect(&id, targets.clone(), learning.clone(), move |target, t| {
+                                    crate::dispatch(target, t, &dispatch_routing);
+                                });
+                                controller = Some(name);
+                            }
+                        }
+                        KeyCode::Char('x' | 'X') | KeyCode::Delete if controller_rows.get(midi_selected).is_some_and(|r| r.mappings > 0) => {
+                            forget_controller(&controller_rows[midi_selected].name);
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                         _ => {}
@@ -941,19 +1105,21 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
 /// Settings (`` ` ``): [`SettingsTab::Inputs`] is one list of every
 /// detected input and deck (`channel_rows`/`channel_selected`), or,
 /// once `Enter` drills into one of its rows, `drilled`'s own 4
-/// [`ParamRow`]s instead — `Tab`/`BackTab` can't reach
-/// [`SettingsTab::Outputs`] while drilled in, same as it can't close
-/// Settings itself from there either, so `tab` doesn't affect this
-/// branch at all. Otherwise `SettingsTab::Outputs` is every detected
-/// output (`out_entries`/`output_selected`), `main_output` marking
-/// which one, if any, is currently picked. Either way, a tab row atop
-/// the list shows which of the 2 is current — styled like the help
-/// overlay's own tabs (see `odj_core::tui::tab_span`), not shown at
-/// all while drilled in. See `run`'s own doc comment for what the keys
-/// do either way. Its own hint line spells out every
-/// key already, so — like odj-player's own Settings screen — there's
-/// no separate help here, and no globals (`?`/`Ctrl+C`) to pin right
-/// either.
+/// [`ParamRow`]s instead — `Tab`/`BackTab` can't reach another tab
+/// while drilled in, same as it can't close Settings itself from
+/// there either, so `tab` doesn't affect this branch at all.
+/// [`SettingsTab::Outputs`] is every detected output
+/// (`out_entries`/`output_selected`), `main_output` marking which one,
+/// if any, is currently picked. [`SettingsTab::Midi`] is every known
+/// or present MIDI controller (`controller_rows`/`midi_selected`),
+/// `controller` marking which one, if any, is currently connected.
+/// Whichever one's showing, a tab row atop the list shows which of
+/// the 3 is current — styled like the help overlay's own tabs (see
+/// `odj_core::tui::tab_span`), not shown at all while drilled in. See
+/// `run`'s own doc comment for what the keys do either way. Its own
+/// hint line spells out every key already, so — like odj-player's own
+/// Settings screen — there's no separate help here, and no globals
+/// (`?`/`Ctrl+C`) to pin right either.
 #[allow(clippy::too_many_arguments)]
 fn draw_settings(
     f: &mut Frame,
@@ -965,20 +1131,43 @@ fn draw_settings(
     out_entries: &[Entry],
     output_selected: usize,
     main_output: Option<&DeviceKey>,
+    controller_rows: &[ControllerRow],
+    midi_selected: usize,
+    controller: Option<&str>,
     status: Option<&str>,
 ) {
     let area = centered(f.area(), 70, 70);
     f.render_widget(Clear, area);
-    let hint = match (tab, &drilled) {
-        (_, Some(_)) => " Enter map  X clear  Esc back ",
-        (SettingsTab::Inputs, None) => " Tab outputs  Space toggle  Enter settings  Esc/` close ",
-        (SettingsTab::Outputs, None) => " Tab inputs  Enter use  Esc/` close ",
+    // Esc left and Tab right, both badge-highlighted, same convention
+    // (and the exact same 2 colors: `AMBER` for Esc, `PAGE_HINT` for
+    // Tab) the help overlay's own bottom border uses — see
+    // `draw_help`'s own `hints`, `Esc`/"Close" left, `Tab`/"Next page"
+    // right. The middle, plain-text hint is everything specific to
+    // the current tab (or to the drill-in), which `draw_help` has no
+    // equivalent of since a help page is read-only.
+    let middle = match (tab, &drilled) {
+        (_, Some(_)) => " Enter map  X clear ",
+        (SettingsTab::Inputs, None) => " Space toggle  Enter settings ",
+        (SettingsTab::Outputs, None) => " Enter use ",
+        (SettingsTab::Midi, None) => " Enter use  X forget mappings ",
     };
+    let esc_action = if drilled.is_some() { "Back" } else { "Close" };
     let title = match &drilled {
         Some((label, _)) => format!(" Settings — Inputs — {label} "),
         None => " Settings ".to_string(),
     };
-    let block = Block::bordered().title(title).title_bottom(hint).border_style(Style::new().fg(AMBER));
+    let mut block = Block::bordered()
+        .title(title)
+        .title_bottom(key_hint("Esc", esc_action, AMBER).left_aligned())
+        .title_bottom(Line::styled(middle, Style::new().fg(DIM)).centered())
+        .border_style(Style::new().fg(AMBER));
+    // `Tab`/`BackTab` can't reach another tab while drilled in (see
+    // `run`'s own doc comment), so this is left off the border
+    // entirely then rather than advertising a key that wouldn't do
+    // anything.
+    if drilled.is_none() {
+        block = block.title_bottom(key_hint("Tab", "Next tab", PAGE_HINT).right_aligned());
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1002,12 +1191,15 @@ fn draw_settings(
         tab_span("Inputs", tab == SettingsTab::Inputs),
         Span::raw(" "),
         tab_span("Outputs", tab == SettingsTab::Outputs),
+        Span::raw(" "),
+        tab_span("MIDI", tab == SettingsTab::Midi),
     ]);
     f.render_widget(Paragraph::new(tabs), tabs_area);
 
     match tab {
         SettingsTab::Inputs => draw_settings_inputs(f, body, channel_rows, channel_selected),
         SettingsTab::Outputs => draw_settings_outputs(f, body, out_entries, output_selected, main_output),
+        SettingsTab::Midi => draw_settings_midi(f, body, controller_rows, midi_selected, controller),
     }
     draw_status_popup(f, status);
 }
@@ -1077,6 +1269,56 @@ fn draw_settings_outputs(f: &mut Frame, inner: Rect, out_entries: &[Entry], outp
     };
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(output_selected));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// 3 icons, same convention [`draw_settings_inputs`] uses for its own
+/// `!present` rows (a distinct shape, not just a color, for "exists
+/// only because of a saved mapping, not currently usable"): `✕` (DIM)
+/// for one that isn't plugged in right now, `●` (AMBER) for the one
+/// that's actually connected, `○` (DIM) for any other one that's
+/// plugged in but not the active one. Each row also names how many
+/// mappings it has, right-aligned ahead of the icon — 0 for one
+/// that's present but's never had anything mapped on it yet — since
+/// that's the one thing about a controller [`draw_settings_outputs`]
+/// has no equivalent of (an output is never "forgettable" the way a
+/// controller's own mappings are).
+fn draw_settings_midi(f: &mut Frame, inner: Rect, rows: &[ControllerRow], selected: usize, controller: Option<&str>) {
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new("(no MIDI controller used yet)").fg(DIM)]
+    } else {
+        let width = inner.width.saturating_sub(2) as usize;
+        rows.iter()
+            .map(|r| {
+                // Same 3-icon convention `draw_settings_inputs` uses
+                // for its own `!present` rows — a distinct shape
+                // (not just a color) for "exists only because of a
+                // saved mapping, not currently usable", separate from
+                // "present but not the active one".
+                let is_current = controller == Some(r.name.as_str());
+                let (icon, icon_color) = match (r.present, is_current) {
+                    (false, _) => ("✕", DIM),
+                    (true, true) => ("●", AMBER),
+                    (true, false) => ("○", DIM),
+                };
+                let mappings = format!("{} mapping{}", r.mappings, if r.mappings == 1 { "" } else { "s" });
+                // Name on the left, the mapping count right-aligned
+                // against the icon — same idea as `draw_settings_inputs`'
+                // icon padding, just with an extra right-aligned field
+                // ahead of it.
+                let pad = width.saturating_sub(r.name.chars().count() + mappings.chars().count() + 2).max(1);
+                ListItem::new(Line::from(vec![
+                    Span::raw(r.name.clone()),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(mappings, Style::new().fg(DIM)),
+                    Span::raw(" "),
+                    Span::styled(icon, Style::new().fg(icon_color)),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, inner, &mut state);
 }
 
@@ -1342,6 +1584,21 @@ mod tests {
     }
 
     #[test]
+    fn build_controller_rows_includes_a_known_controller_even_when_not_present() {
+        // A name nothing on the machine actually running this test could
+        // coincidentally share, so this stays deterministic regardless
+        // of whatever real MIDI ports happen to be connected.
+        let known = HashMap::from([(
+            "definitely-not-a-real-controller-xyz".to_string(),
+            HashMap::from([("input:Mic:volume".to_string(), 5u8)]),
+        )]);
+        let rows = build_controller_rows(&known);
+        let row = rows.iter().find(|r| r.name == "definitely-not-a-real-controller-xyz").expect("the known row is still listed");
+        assert_eq!(row.mappings, 1);
+        assert!(!row.present, "nothing real is named this");
+    }
+
+    #[test]
     fn build_channel_rows_carries_each_rows_own_4_mapped_ccs() {
         let decks = [entry("odj-deck-1", "Deck 1")];
         let channels = build_channels(&[], &decks);
@@ -1408,6 +1665,7 @@ mod tests {
             "Space",
             "Enter",
             "Tab / BackTab",
+            "X / Delete",
             "X / Delete (drilled in)",
             "Esc (drilled in)",
             "Esc / `",

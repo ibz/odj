@@ -521,7 +521,12 @@ pub fn key_hint(key: &str, action: &str, color: Color) -> Line<'static> {
     ])
 }
 
-const PAGE_HINT: Color = Color::Rgb(90, 200, 230);
+/// The color [`draw_help`]'s own `Tab`/"Next page" hint badge uses —
+/// distinct from [`AMBER`]'s `Esc`/"Close" one, so the two corners
+/// read as different actions at a glance. Shared here so another
+/// multi-tab screen's own `Tab` hint (e.g. odj-mixer's own Settings)
+/// can match this exactly, not just copy the layout.
+pub const PAGE_HINT: Color = Color::Rgb(90, 200, 230);
 
 /// The middle `pct_x` × `pct_y` percent of `area`.
 pub fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {

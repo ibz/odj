@@ -154,16 +154,22 @@ pub struct Settings {
     /// odj-sampler. odj-sampler.
     #[serde(default, alias = "midi_devices")]
     pub sampler_midi_pads: HashMap<String, Vec<[u8; 16]>>,
-    /// The MIDI input port odj-mixer last used, if any — kept separate
-    /// from `sampler_midi_port_id`. odj-mixer.
-    pub mixer_midi_port_id: Option<String>,
-    /// Each learned knob's CC, keyed by a stable target string (an
-    /// input's name, or `"player:<deck name>:<param>"` for a discovered
-    /// player's Mixer parameter) — a flat map, since odj-mixer's set of
-    /// targets is open-ended and keyed by name rather than by fixed
-    /// position. odj-mixer.
+    /// Every MIDI controller odj-mixer's ever learned knob mappings
+    /// for, keyed by its stable name (see `odj_core::midi::stable_name`
+    /// — not its connection-order port id, which can change across a
+    /// replug) rather than its connection-order port id. Each
+    /// controller keeps its own target→CC map (same shape the single
+    /// shared one used to be), so switching controllers doesn't mix up
+    /// what's mapped on one with another. odj-mixer.
     #[serde(default)]
-    pub mixer_midi_knobs: HashMap<String, u8>,
+    pub mixer_midi_controllers: HashMap<String, HashMap<String, u8>>,
+    /// The controller odj-mixer used last, by the same stable name
+    /// `mixer_midi_controllers` is keyed by — if it, or any other
+    /// known controller, is still plugged in at startup, it's used
+    /// automatically, no picker needed (the last-used one specifically
+    /// if more than one known controller is present at once); see
+    /// `main.rs`'s own doc comment. odj-mixer.
+    pub mixer_midi_last: Option<String>,
     /// Hardware inputs added to the mix, by their stable device key (see
     /// `odj_mixer::devices::device_key_string` — not a display label,
     /// which can change) — restored at startup so a previous session's
@@ -190,8 +196,8 @@ impl Default for Settings {
             kit: None,
             sampler_midi_port_id: None,
             sampler_midi_pads: HashMap::new(),
-            mixer_midi_port_id: None,
-            mixer_midi_knobs: HashMap::new(),
+            mixer_midi_controllers: HashMap::new(),
+            mixer_midi_last: None,
             mixer_active_inputs: HashSet::new(),
             mixer_output: None,
         }

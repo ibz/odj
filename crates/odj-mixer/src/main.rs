@@ -1,9 +1,12 @@
-//! odj-mixer: picks one main output at startup, then continuously
-//! discovers remote-controlled odj-player decks and a running
-//! odj-sampler, connecting every one of them to it automatically, live
-//! — a hardware sound-card input instead waits until it's added from
-//! Settings — and lets you control each channel's Volume and 3-band EQ
-//! by hand or by MIDI knob (mapped from Settings too).
+//! odj-mixer: continuously discovers remote-controlled odj-player decks
+//! and a running odj-sampler, connecting every one of them to its main
+//! output automatically, live — a hardware sound-card input instead
+//! waits until it's added from Settings, which also holds its own
+//! Outputs tab for picking or changing that main output any time
+//! (restored from the previous session at startup, else the internal
+//! speakers by default — no mandatory picker any more) — and lets you
+//! control each channel's Volume and 3-band EQ by hand or by MIDI knob
+//! (mapped from Settings too).
 
 mod devices;
 mod log;
@@ -29,23 +32,27 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
         println!(
             "usage: odj-mixer\n\n\
-             Asks for one main output at startup (mandatory — nothing would have anywhere to\n\
-             play without it). From then on, continuously detects running odj-player decks\n\
-             (as \"Deck n\") and a running odj-sampler (as \"Sampler\"), connecting every one\n\
-             of them to that output automatically, showing a channel strip — High, Mid, Low,\n\
-             Volume — for each. ←/→ picks the\n\
-             channel and ↑/↓ picks its control — neither changes a value, just navigates;\n\
-             +/- adjusts the selected one instead (Shift: ×4).\n\
-             ` opens Settings: one row per detected input, deck and the sampler, plus one for\n\
-             any device that's no longer detected but still has a MIDI mapping. Space adds\n\
-             the selected input to the mix or removes it (a no-op on a deck's or the\n\
-             sampler's row — always connected automatically — or on an undetected one, since\n\
-             there's nothing there to connect); an added input is remembered and reconnected\n\
-             automatically on the next run, same as those are. Enter drills\n\
-             into any row's own settings — for now just its 4 MIDI mappings, Volume/Low/Mid/\n\
-             High, where Enter maps a knob to the selected one and X clears it, Esc backs\n\
-             out. Esc/` closes Settings.\n\
-             Nothing on the live screen itself changes a mapping; that's Settings-only.\n\
+             Continuously detects running odj-player decks (as \"Deck n\") and a running\n\
+             odj-sampler (as \"Sampler\"), connecting every one of them to the main output\n\
+             automatically, showing a channel strip — High, Mid, Low, Volume — for each.\n\
+             ←/→ picks the channel and ↑/↓ picks its control — neither changes a value, just\n\
+             navigates; +/- adjusts the selected one instead (Shift: ×4).\n\
+             ` opens Settings, 2 tabs (Tab/Shift+Tab switches either way). Inputs: one row\n\
+             per detected input, deck and the sampler, plus one for any device that's no\n\
+             longer detected but still has a MIDI mapping. Space adds the selected input to\n\
+             the mix or removes it (a no-op on a deck's or the sampler's row — always\n\
+             connected automatically — or on an undetected one, since there's nothing there\n\
+             to connect); an added input is remembered and reconnected automatically on the\n\
+             next run, same as those are. Enter drills into any row's own settings — for now\n\
+             just its 4 MIDI mappings, Volume/Low/Mid/High, where Enter maps a knob to the\n\
+             selected one and X clears it, Esc backs out. Outputs: one row per detected\n\
+             output; Enter makes the selected one the main output, remembered the same way —\n\
+             so there's no picker to get through before odj-mixer can even start (it starts\n\
+             on whatever was picked last, or the internal speakers if nothing was yet), and\n\
+             the output can be changed again any time from here, not just chosen once\n\
+             upfront. Esc/` closes Settings either way.\n\
+             Nothing on the live screen itself changes a mapping or the output; that's\n\
+             Settings-only.\n\
              Picks a MIDI controller at startup too (optional, skip with Esc/N) and, if you\n\
              did, walks you through mapping a knob to each deck's (and the sampler's, if\n\
              it's running) Volume/Low/Mid/High that isn't mapped yet. Press ? for the full\n\
@@ -78,9 +85,21 @@ fn start(terminal: &mut DefaultTerminal) -> Result<()> {
     let devices_deck = Devices::start(Kind::Deck);
     let devices_out = Devices::start(Kind::Output);
 
-    let Some(main_output) = ui::pick_main_output(terminal, &devices_out)? else { return Ok(()) };
+    let mut settings = odj_core::memory::load_settings();
     let routing: Arc<Mutex<Routing>> = Arc::new(Mutex::new(Routing::default()));
-    routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(main_output));
+    // Restores the last session's output if one was saved; otherwise
+    // falls back to the internal speakers (see
+    // `devices::builtin_output`) rather than leaving nothing picked —
+    // no more mandatory startup picker. Settings' own Outputs tab
+    // (`ui::draw_settings`) can always override this, any time, which
+    // saves the choice from then on. Left `None` only if nothing saved
+    // parses (a settings file from before this existed) *and* no
+    // onboard output was found either.
+    let initial_output =
+        settings.mixer_output.as_deref().and_then(devices::parse_device_key).or_else(devices::builtin_output);
+    if let Some(key) = initial_output {
+        routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(key));
+    }
 
     // Marks this process as "a mixer is running" for any odj-player deck
     // or odj-sampler that checks — see `odj_core::control`'s own module
@@ -88,7 +107,6 @@ fn start(terminal: &mut DefaultTerminal) -> Result<()> {
     // removes the marker. No protocol, nothing to hold onto beyond this.
     let _presence = odj_core::control::Control::open("mixer").ok();
 
-    let mut settings = odj_core::memory::load_settings();
     let midi_port = odj_core::midi::pick_midi_input(terminal, settings.mixer_midi_port_id.as_deref())?;
     // Only remembered when one's actually picked — skipping (Esc/N) leaves
     // whatever was saved before alone, same convention odj-player's old

@@ -181,10 +181,8 @@ quits.
 
 ## odj-mixer
 
-Asks which output to use at startup — mandatory, since nothing would
-have anywhere to play without it, and fixed for the session once
-picked. From then on, continuously detects running odj-player decks and
-a running odj-sampler, and connects every one of them to that output
+Continuously detects running odj-player decks and a running
+odj-sampler, and connects every one of them to the main output
 automatically, live — each is already part of the session, so it just
 plays, no extra step needed (none of them send their audio anywhere
 special for this: each plays into its own virtual sink instead of a
@@ -216,8 +214,8 @@ odj-player's own live screen, the footer's contextual keys sit on the
 left and the globals (`` ` `` settings, `?` help, `Ctrl+C` quit) stay
 pinned to the right.
 
-After the mandatory output pick and an optional MIDI controller pick
-(`Esc`/`N` skips the latter), it briefly looks for decks (and the
+After an optional MIDI controller pick at startup
+(`Esc`/`N` skips it), it briefly looks for decks (and the
 sampler) already running, then walks you through turning a knob for
 each one's Volume, Low, Mid and High that isn't mapped yet (so 8 knobs
 total for two decks, 12 with the sampler too) — `Esc` at any point
@@ -227,8 +225,13 @@ hardware); map one on demand from Settings instead. Any knob mapped
 this way, for an input, a deck or the sampler, is remembered in the
 settings file shared with the other apps.
 
-`` ` `` ("settings", on the right of the live screen's hint line)
-opens one list, one row per detected input, deck and the sampler —
+`` ` `` ("settings", on the right of the live screen's hint line) opens
+Settings, 2 tabs — `Tab`/`Shift+Tab` switches between them either way,
+the current one highlighted the same way the help overlay's own tabs
+are (black on amber).
+
+**Inputs** (the tab it opens to) is one list, one row per detected
+input, deck and the sampler —
 plus one more for any device that's no longer detected but still has
 a MIDI mapping, so that mapping stays visible (and clearable) instead
 of quietly surviving, unseen, in the settings file — with a
@@ -251,6 +254,21 @@ whatever CC it's bound to, or "—" if none. `↑`/`↓` picks one there,
 `Enter` maps (or remaps) a knob to it, `X`/`Delete` clears it, `Esc`
 goes back to the channel list. `Esc`/`` ` `` from there closes
 Settings back to the live screen.
+
+**Outputs** is one list, one row per detected output, `●`/`○` marking
+which one is currently the main output — `↑`/`↓` picks a row, `Enter`
+makes it the main output instead (a no-op on one that isn't currently
+available, shown in red). This is what used to be a mandatory pick
+before the live screen could even start; now it's remembered the same
+way an added input is (`Settings.mixer_output`), restored
+automatically next run — or, the very first time, defaulted to the
+internal speakers (whichever output looks like fixed, onboard audio
+rather than something plugged in) rather than nothing at all — and can
+be changed again any time from here — switching tears down every
+channel's route and lets the same auto-connect that handles a newly
+detected one put them all back on the new output. `Esc`/`` ` `` closes
+Settings back to the live
+screen here too.
 
 `?`/`/` opens the full key list from the live screen (Settings has
 no help of its own — every key's already spelled out in its own hint

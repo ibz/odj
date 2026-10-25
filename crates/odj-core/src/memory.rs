@@ -171,6 +171,13 @@ pub struct Settings {
     /// set: it's always auto-connected, never user-togglable. odj-mixer.
     #[serde(default)]
     pub mixer_active_inputs: HashSet<String>,
+    /// The main output odj-mixer last used, by its stable device key
+    /// (same encoding as `mixer_active_inputs`) — restored at startup
+    /// so a previous session's choice survives a restart, and odj-mixer
+    /// no longer needs to ask for one before it can even start; `None`
+    /// means it hasn't been picked yet (from Settings' own Outputs
+    /// tab), and nothing plays until it is. odj-mixer.
+    pub mixer_output: Option<String>,
 }
 
 impl Default for Settings {
@@ -186,6 +193,7 @@ impl Default for Settings {
             mixer_midi_port_id: None,
             mixer_midi_knobs: HashMap::new(),
             mixer_active_inputs: HashSet::new(),
+            mixer_output: None,
         }
     }
 }

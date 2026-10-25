@@ -397,14 +397,21 @@ pub fn draw_help(f: &mut Frame, help: &Help, pages: &[Page]) {
     }
 }
 
+/// One tab's own span, styled the way the help overlay's own tabs are
+/// — black on amber, bold, for the one that's showing, else plain
+/// amber — so any other multi-tab screen can look the same rather than
+/// inventing its own "selected" look.
+pub fn tab_span(label: &str, current: bool) -> Span<'static> {
+    let style = if current { Style::new().fg(Color::Black).bg(AMBER).bold() } else { Style::new().fg(AMBER) };
+    Span::styled(format!(" {label} "), style)
+}
+
 /// The pages' titles with the one showing picked out, on as many lines as
 /// they need in `width`.
 fn tab_lines(pages: &[Page], current: usize, width: usize) -> Vec<Line<'static>> {
-    let on = Style::new().fg(Color::Black).bg(AMBER).bold();
-    let off = Style::new().fg(AMBER);
     let mut lines = vec![Line::default()];
     for (i, p) in pages.iter().enumerate() {
-        let tab = Span::styled(format!(" {} ", p.title()), if i == current { on } else { off });
+        let tab = tab_span(p.title(), i == current);
         let line = lines.last_mut().unwrap();
         if line.width() > 0 && line.width() + 1 + tab.width() > width {
             lines.push(Line::from(tab));

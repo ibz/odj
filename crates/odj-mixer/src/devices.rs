@@ -50,6 +50,20 @@ pub fn parse_route_tag(s: &str) -> Option<Route> {
     Some(Route::Mono(s.strip_prefix('m')?.parse().ok()?))
 }
 
+/// A default main output, used when nothing's been explicitly picked
+/// yet (see `main.rs::start`) rather than leaving nothing playing: the
+/// first available output card [`Card::builtin`] marks as fixed,
+/// onboard audio — the closest proxy there is for "the internal
+/// speakers" — stereo. `None` if there's no such card right now (no
+/// onboard audio at all, or the PipeWire scan just hasn't answered
+/// yet); Settings' own Outputs tab can always override this, which
+/// saves the choice from then on.
+pub fn builtin_output() -> Option<DeviceKey> {
+    let cards = audio::output_cards(&audio::host()).ok()?;
+    let card = cards.iter().find(|c| c.unavailable.is_none() && c.builtin)?;
+    Some((card.id().to_string(), Route::Stereo(0, 1)))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Input,

@@ -16,8 +16,8 @@ use crate::link;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::platform::PipeWireHost;
 use cpal::{
-    BufferSize, Error as CpalError, InputCallbackInfo, OutputCallbackInfo, Device, DeviceDirection, ErrorKind,
-    FromSample, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
+    BufferSize, Error as CpalError, InputCallbackInfo, InterfaceType, OutputCallbackInfo, Device, DeviceDirection,
+    ErrorKind, FromSample, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
 };
 use pipewire as pw;
 
@@ -55,6 +55,15 @@ pub struct Card {
     rate: u32,
     /// Why the card can't be used right now (ALSA only; PipeWire shares cards).
     pub unavailable: Option<&'static str>,
+    /// Whether this looks like fixed, onboard audio (PipeWire's
+    /// `device.bus = "pci"`) rather than something plugged in (USB,
+    /// Bluetooth, FireWire, Thunderbolt) — a reasonable proxy for "the
+    /// internal speakers" on a typical laptop or desktop, used to pick
+    /// a sensible default output without asking (see
+    /// `odj_mixer::devices::builtin_output`), though a discrete PCIe
+    /// sound card would also match this. Always `false` over plain
+    /// ALSA, which has no bus information to go on.
+    pub builtin: bool,
 }
 
 impl Card {
@@ -225,6 +234,7 @@ fn pipewire_cards(host: &Host, direction: Direction) -> Vec<Card> {
             channels: config.channels(),
             rate: config.sample_rate(),
             unavailable: None,
+            builtin: desc.interface_type() == InterfaceType::Pci,
         });
     }
     // PipeWire lists nodes in creation order, which can put "Line B" before "Line A".
@@ -271,7 +281,15 @@ fn alsa_cards(host: &Host, direction: Direction) -> Vec<Card> {
                     ErrorKind::PermissionDenied => "no permission (are you in the audio group?)",
                     _ => continue,
                 };
-                cards.push(Card { device: plug.clone(), id: id.clone(), name, channels: 0, rate: 0, unavailable: Some(why) });
+                cards.push(Card {
+                    device: plug.clone(),
+                    id: id.clone(),
+                    name,
+                    channels: 0,
+                    rate: 0,
+                    unavailable: Some(why),
+                    builtin: false,
+                });
                 continue;
             }
         };
@@ -282,7 +300,15 @@ fn alsa_cards(host: &Host, direction: Direction) -> Vec<Card> {
         };
         let channels = best.channels();
         let rate = best.try_with_standard_sample_rate().unwrap_or_else(|| best.with_max_sample_rate());
-        cards.push(Card { device: plug.clone(), id: id.clone(), name, channels, rate: rate.sample_rate(), unavailable: None });
+        cards.push(Card {
+            device: plug.clone(),
+            id: id.clone(),
+            name,
+            channels,
+            rate: rate.sample_rate(),
+            unavailable: None,
+            builtin: false,
+        });
     }
     cards
 }

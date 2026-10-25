@@ -1,8 +1,11 @@
 //! The live screen: a real mixer's worth of channel strips, laid out
 //! side by side — each with a 3-band EQ and a vertical Volume fader,
 //! adjustable by hand or by MIDI knob. There's one main output for
-//! everything (picked at startup via [`pick_main_output`], fixed for
-//! the session after that). A running odj-player deck, or odj-sampler,
+//! everything, picked (and changeable any time) from Settings' own
+//! Outputs tab (`` ` ``, see [`draw_settings`]) rather than asked for
+//! upfront — restored from a previous session if there was one, else
+//! the internal speakers by default (see `main.rs`'s own doc comment).
+//! A running odj-player deck, or odj-sampler,
 //! always gets a strip, connected automatically the instant it's
 //! detected — either one is already part of the session, no separate
 //! step needed. A hardware input instead waits until it's added from
@@ -27,7 +30,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
 use odj_core::audio;
 use odj_core::filter::{MAX_DB, MIN_DB};
-use odj_core::tui::{AMBER, DIM, Help, Page, centered, draw_help, wrap};
+use odj_core::tui::{AMBER, DIM, Help, Page, centered, draw_help, tab_span, wrap};
 
 use crate::devices::{DeviceKey, Devices, Entry, device_key_string};
 use crate::midi::{self, Learning, Target, Targets};
@@ -65,16 +68,17 @@ pub const HELP: &[Page] = &[
             ("← / →", "Move between channels"),
             ("↑ / ↓", "Move between its controls: High, Mid, Low, Volume"),
             ("+ / -", "Adjust the selected control (Shift: ×4)"),
-            ("`", "Settings: pick channels, manage MIDI mappings"),
+            ("`", "Settings: pick channels, manage MIDI mappings, pick/change the main output"),
             ("Ctrl+C", "Quit"),
         ],
     ),
     Page::Keys(
         "Settings",
         &[
-            ("↑ / ↓", "Move between rows — every detected input and deck"),
-            ("Space", "Add the selected input to the mix, or remove it (a no-op on a deck's row — always connected — or on one that's mapped but not currently detected)"),
-            ("Enter", "Open the selected row's own settings — for now just its 4 MIDI mappings"),
+            ("Tab / BackTab", "Switch between the Inputs and Outputs tabs"),
+            ("↑ / ↓", "Move between rows — every detected input and deck (Inputs), or every detected output (Outputs)"),
+            ("Space", "Inputs: add the selected input to the mix, or remove it (a no-op on a deck's row — always connected — or on one that's mapped but not currently detected)"),
+            ("Enter", "Inputs: open the selected row's own settings — for now just its 4 MIDI mappings · Outputs: make the selected one the main output"),
             ("↑ / ↓ (drilled in)", "Move between its 4 params"),
             ("Enter (drilled in)", "Map a knob to the selected param"),
             ("X / Delete (drilled in)", "Clear whatever's mapped to the selected param"),
@@ -140,6 +144,19 @@ enum Group {
     /// label ("Deck n" vs. "Sampler"), which comes straight from the
     /// sink's own description.
     Deck,
+}
+
+/// Settings' 2 tabs — `Tab`/`BackTab` (Shift+Tab) switches between
+/// them, either direction, since there's nowhere else for 2 tabs to
+/// switch to. Inputs is everything [`draw_settings`] already showed
+/// before this split; Outputs is new: picking the main output used to
+/// be a mandatory screen before the live screen could even start (see
+/// `main.rs`'s own doc comment) — now it's just another Settings tab,
+/// so it can be changed mid-session too, not only chosen once upfront.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsTab {
+    Inputs,
+    Outputs,
 }
 
 /// One channel strip: a continuously-detected input or deck.
@@ -251,6 +268,17 @@ fn set_active(active_inputs: &mut HashSet<String>, key: &DeviceKey, active: bool
     let _ = odj_core::memory::save_settings(&settings);
 }
 
+/// Saves `key` as the main output in the shared settings file, so it's
+/// restored next time odj-mixer runs — same load-mutate-save pattern as
+/// [`set_active`], just for `Settings.mixer_output` instead; the live
+/// `Routing` itself is updated by the caller separately (it has no
+/// settings file of its own to go through).
+fn set_output(key: &DeviceKey) {
+    let mut settings = odj_core::memory::load_settings();
+    settings.mixer_output = Some(device_key_string(key));
+    let _ = odj_core::memory::save_settings(&settings);
+}
+
 /// Every discovered deck's (or odj-sampler's) 4 Mixer parameters
 /// (`(label, target key)`) that isn't already in `already` — hardware
 /// inputs are deliberately left out of this: they're not the point of
@@ -324,40 +352,6 @@ pub fn wait_for_decks(terminal: &mut DefaultTerminal, wait: Duration) -> Result<
     Ok(())
 }
 
-/// The mandatory startup pick for the one output every channel will go
-/// through — same idea as `odj_core::tui::pick_output`, which every
-/// other app here uses, but choosing a continuously-resolved
-/// `DeviceKey` via `devices_out` instead of opening one `audio::Output`
-/// immediately: `Routing` opens it lazily itself, the first time
-/// something's actually routed to it. Waits (redrawing live) for
-/// `devices_out` to report at least one entry if it hasn't yet. `None`
-/// means the user quit (`Ctrl+C`) — there's no skip-and-run, since
-/// nothing would have anywhere to play.
-pub fn pick_main_output(terminal: &mut DefaultTerminal, devices_out: &Devices) -> Result<Option<DeviceKey>> {
-    let mut selected = 0usize;
-    loop {
-        let out_entries = devices_out.entries();
-        if !out_entries.is_empty() {
-            selected = selected.min(out_entries.len() - 1);
-        }
-        terminal.draw(|f| draw_pick_main_output(f, &out_entries, selected))?;
-        if event::poll(Duration::from_millis(100))? {
-            let Event::Key(key) = event::read()? else { continue };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            match key.code {
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down => selected = (selected + 1).min(out_entries.len().saturating_sub(1)),
-                KeyCode::Enter if out_entries.get(selected).is_some_and(|o| o.available) => {
-                    return Ok(Some(out_entries[selected].key.clone()));
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
-                _ => {}
-            }
-        }
-    }
-}
 
 /// The channels the live screen shows: every deck (always — see
 /// [`auto_connect`]) plus every hardware input that's been explicitly
@@ -569,26 +563,6 @@ fn build_param_rows(key: &DeviceKey, targets: &Targets) -> Vec<ParamRow> {
         .collect()
 }
 
-fn draw_pick_main_output(f: &mut Frame, out_entries: &[Entry], selected: usize) {
-    let area = centered(f.area(), 70, 70);
-    f.render_widget(Clear, area);
-    if out_entries.is_empty() {
-        let block = Block::bordered().title(" Main output ").border_style(Style::new().fg(AMBER));
-        let p = Paragraph::new("looking for outputs…").alignment(Alignment::Center).style(Style::new().fg(AMBER)).block(block);
-        f.render_widget(p, area);
-        return;
-    }
-    let block = Block::bordered()
-        .title(" Main output ")
-        .title_bottom(" ↑↓ move  Enter use  Ctrl+C quit ")
-        .border_style(Style::new().fg(AMBER));
-    let items: Vec<ListItem> =
-        out_entries.iter().map(|o| if o.available { ListItem::new(o.label.clone()) } else { ListItem::new(o.label.clone()).fg(DIM) }).collect();
-    let list = List::new(items).block(block).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, area, &mut state);
-}
-
 /// The live screen: one channel strip per running deck (connected
 /// automatically, see [`auto_connect`]) plus every hardware input
 /// that's been explicitly added, side by side. `←`/`→` picks the
@@ -597,23 +571,31 @@ fn draw_pick_main_output(f: &mut Frame, out_entries: &[Entry], selected: usize) 
 /// value, so they're always safe to tap. `+`/`-` adjusts the selected
 /// control instead (`Shift`: ×4, a no-op until the channel's actually
 /// connected). `` ` `` (one of the globals pinned to the right of the
-/// hint line, see [`draw_mixer`]) opens Settings: one list of every
-/// detected input and deck, plus (see [`build_channel_rows`]) a row for
-/// any device that's no longer detected but still has a MIDI mapping.
-/// `↑`/`↓` picks a row, `Space` adds the selected input to the mix or
-/// removes it again (a no-op on a deck's row — it's always connected
-/// automatically, not user-togglable — or on one that isn't currently
-/// detected, for the opposite reason: there's nothing there to connect)
-/// — this also persists, so an added input is still there (and
-/// reconnected automatically) next time odj-mixer runs;
-/// `active_inputs` is this run's starting set, loaded from
-/// `Settings.mixer_active_inputs` by the caller. `Enter` drills into
-/// the selected row's own settings — for now just its 4 MIDI mappings,
-/// Volume/Low/Mid/High, where `Enter` maps a knob to the selected one
-/// and `X`/`Delete` clears it, `Esc` backs out to the channel list.
-/// `Esc`/`` ` `` from the channel list returns to the live screen.
-/// Nothing on the live screen itself changes a mapping any more; that
-/// only happens from here. `Ctrl+C` quits — `q`/`Esc` don't, here or
+/// hint line, see [`draw_mixer`]) opens Settings, 2 tabs
+/// ([`SettingsTab`], switched either direction with `Tab`/`BackTab`).
+/// Inputs is one list of every detected input and deck, plus (see
+/// [`build_channel_rows`]) a row for any device that's no longer
+/// detected but still has a MIDI mapping. `↑`/`↓` picks a row, `Space`
+/// adds the selected input to the mix or removes it again (a no-op on
+/// a deck's row — it's always connected automatically, not
+/// user-togglable — or on one that isn't currently detected, for the
+/// opposite reason: there's nothing there to connect) — this also
+/// persists, so an added input is still there (and reconnected
+/// automatically) next time odj-mixer runs; `active_inputs` is this
+/// run's starting set, loaded from `Settings.mixer_active_inputs` by
+/// the caller. `Enter` drills into the selected row's own settings —
+/// for now just its 4 MIDI mappings, Volume/Low/Mid/High, where
+/// `Enter` maps a knob to the selected one and `X`/`Delete` clears it,
+/// `Esc` backs out to the channel list. Outputs is every detected
+/// output; `↑`/`↓` picks one and `Enter` makes it the main output
+/// (also persisted, to `Settings.mixer_output`, restored at startup by
+/// the caller instead of asking — see `main.rs`'s own doc comment) —
+/// switching tears down and reconnects every channel fresh (see
+/// `Routing::set_main_output`), the same auto-connect that puts a
+/// freshly detected one back doing the same for all of them here.
+/// `Esc`/`` ` `` from either tab's own list returns to the live screen.
+/// Nothing on the live screen itself changes a mapping or the output
+/// any more; that only happens from here. `Ctrl+C` quits — `q`/`Esc` don't, here or
 /// anywhere else in odj-mixer; `Esc` is reserved for backing out of
 /// whatever's open instead (Settings, help, a drill-in). `?`/`/` opens
 /// [`HELP`] from the live screen, taking over the keys until
@@ -634,10 +616,12 @@ pub fn run(
     let mut selected_channel = 0usize;
     let mut selected_control = 0usize;
     let mut settings_open = false;
+    let mut settings_tab = SettingsTab::Inputs;
     let mut channel_selected = 0usize;
     // `Some(key)` once `Enter` drills into that channel's own 4 params.
     let mut mapping_drill: Option<DeviceKey> = None;
     let mut param_selected = 0usize;
+    let mut output_selected = 0usize;
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
     // Shown via `draw_status_popup` until something replaces it or any
@@ -677,11 +661,14 @@ pub fn run(
         );
 
         if settings_open {
+            let out_entries = devices_out.entries();
             let channel_rows = {
                 let r = routing.lock().unwrap_or_else(|e| e.into_inner());
                 build_channel_rows(&build_channels(&in_entries, &deck_entries), &r, targets)
             };
+            let main_output = routing.lock().unwrap_or_else(|e| e.into_inner()).main_output();
             channel_selected = channel_selected.min(channel_rows.len().saturating_sub(1));
+            output_selected = output_selected.min(out_entries.len().saturating_sub(1));
             // The drilled-into channel disappearing (unplugged, deck
             // quit) backs out to the channel list rather than pointing
             // at nothing.
@@ -699,10 +686,14 @@ pub fn run(
             terminal.draw(|f| {
                 draw_settings(
                     f,
+                    settings_tab,
                     &channel_rows,
                     channel_selected,
                     drilled.as_ref().map(|(label, rows)| (label.as_str(), rows.as_slice())),
                     param_selected,
+                    &out_entries,
+                    output_selected,
+                    main_output.as_ref(),
                     status.as_deref(),
                 );
             })?;
@@ -733,30 +724,55 @@ pub fn run(
                     }
                     continue;
                 }
-                match k.code {
-                    KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
-                    KeyCode::Up => channel_selected = channel_selected.saturating_sub(1),
-                    KeyCode::Down => channel_selected = (channel_selected + 1).min(channel_rows.len().saturating_sub(1)),
-                    KeyCode::Char(' ') if channel_rows.get(channel_selected).is_some_and(|r| r.group == Group::Input && r.present) => {
-                        let row = &channel_rows[channel_selected];
-                        let mut r = routing.lock().unwrap_or_else(|e| e.into_inner());
-                        let target = if row.added { None } else { r.main_output() };
-                        match r.set_route(devices_in, devices_out, &row.key, target.as_ref()) {
-                            Ok(()) => set_active(&mut active_inputs, &row.key, target.is_some()),
-                            Err(e) => {
-                                let msg = format!("Could not connect {}: {e}", row.label);
-                                crate::log::log(&msg);
-                                status = Some(msg);
+                // `Tab`/`BackTab` (Shift+Tab) switches tabs either way,
+                // same as there's nowhere else for them to switch
+                // between — not handled per-tab below since it's the
+                // one key both tabs share.
+                if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+                    settings_tab = match settings_tab {
+                        SettingsTab::Inputs => SettingsTab::Outputs,
+                        SettingsTab::Outputs => SettingsTab::Inputs,
+                    };
+                    continue;
+                }
+                match settings_tab {
+                    SettingsTab::Inputs => match k.code {
+                        KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
+                        KeyCode::Up => channel_selected = channel_selected.saturating_sub(1),
+                        KeyCode::Down => channel_selected = (channel_selected + 1).min(channel_rows.len().saturating_sub(1)),
+                        KeyCode::Char(' ') if channel_rows.get(channel_selected).is_some_and(|r| r.group == Group::Input && r.present) => {
+                            let row = &channel_rows[channel_selected];
+                            let mut r = routing.lock().unwrap_or_else(|e| e.into_inner());
+                            let target = if row.added { None } else { r.main_output() };
+                            match r.set_route(devices_in, devices_out, &row.key, target.as_ref()) {
+                                Ok(()) => set_active(&mut active_inputs, &row.key, target.is_some()),
+                                Err(e) => {
+                                    let msg = format!("Could not connect {}: {e}", row.label);
+                                    crate::log::log(&msg);
+                                    status = Some(msg);
+                                }
                             }
+                            failed.remove(&row.key);
                         }
-                        failed.remove(&row.key);
-                    }
-                    KeyCode::Enter if !channel_rows.is_empty() => {
-                        mapping_drill = Some(channel_rows[channel_selected].key.clone());
-                        param_selected = 0;
-                    }
-                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
-                    _ => {}
+                        KeyCode::Enter if !channel_rows.is_empty() => {
+                            mapping_drill = Some(channel_rows[channel_selected].key.clone());
+                            param_selected = 0;
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        _ => {}
+                    },
+                    SettingsTab::Outputs => match k.code {
+                        KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
+                        KeyCode::Up => output_selected = output_selected.saturating_sub(1),
+                        KeyCode::Down => output_selected = (output_selected + 1).min(out_entries.len().saturating_sub(1)),
+                        KeyCode::Enter if out_entries.get(output_selected).is_some_and(|o| o.available) => {
+                            let key = out_entries[output_selected].key.clone();
+                            routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(key.clone()));
+                            set_output(&key);
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        _ => {}
+                    },
                 }
             }
             continue;
@@ -922,22 +938,44 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Settings (`` ` ``): one list of every detected input and deck
-/// (`channel_rows`/`channel_selected`), or, once `Enter` drills into
-/// one of its rows, `drilled`'s own 4 [`ParamRow`]s instead; see
-/// `run`'s own doc comment for what the keys do. Its own hint line
-/// spells out every key already, so — like odj-player's own Settings
-/// screen — there's no separate help here, and no globals (`?`/
-/// `Ctrl+C`) to pin right either.
-fn draw_settings(f: &mut Frame, channel_rows: &[ChannelRow], channel_selected: usize, drilled: Option<(&str, &[ParamRow])>, param_selected: usize, status: Option<&str>) {
+/// Settings (`` ` ``): [`SettingsTab::Inputs`] is one list of every
+/// detected input and deck (`channel_rows`/`channel_selected`), or,
+/// once `Enter` drills into one of its rows, `drilled`'s own 4
+/// [`ParamRow`]s instead — `Tab`/`BackTab` can't reach
+/// [`SettingsTab::Outputs`] while drilled in, same as it can't close
+/// Settings itself from there either, so `tab` doesn't affect this
+/// branch at all. Otherwise `SettingsTab::Outputs` is every detected
+/// output (`out_entries`/`output_selected`), `main_output` marking
+/// which one, if any, is currently picked. Either way, a tab row atop
+/// the list shows which of the 2 is current — styled like the help
+/// overlay's own tabs (see `odj_core::tui::tab_span`), not shown at
+/// all while drilled in. See `run`'s own doc comment for what the keys
+/// do either way. Its own hint line spells out every
+/// key already, so — like odj-player's own Settings screen — there's
+/// no separate help here, and no globals (`?`/`Ctrl+C`) to pin right
+/// either.
+#[allow(clippy::too_many_arguments)]
+fn draw_settings(
+    f: &mut Frame,
+    tab: SettingsTab,
+    channel_rows: &[ChannelRow],
+    channel_selected: usize,
+    drilled: Option<(&str, &[ParamRow])>,
+    param_selected: usize,
+    out_entries: &[Entry],
+    output_selected: usize,
+    main_output: Option<&DeviceKey>,
+    status: Option<&str>,
+) {
     let area = centered(f.area(), 70, 70);
     f.render_widget(Clear, area);
-    let hint = match &drilled {
-        Some(_) => " Enter map  X clear  Esc back ",
-        None => " Space toggle  Enter settings  Esc/` close ",
+    let hint = match (tab, &drilled) {
+        (_, Some(_)) => " Enter map  X clear  Esc back ",
+        (SettingsTab::Inputs, None) => " Tab outputs  Space toggle  Enter settings  Esc/` close ",
+        (SettingsTab::Outputs, None) => " Tab inputs  Enter use  Esc/` close ",
     };
     let title = match &drilled {
-        Some((label, _)) => format!(" Settings — {label} "),
+        Some((label, _)) => format!(" Settings — Inputs — {label} "),
         None => " Settings ".to_string(),
     };
     let block = Block::bordered().title(title).title_bottom(hint).border_style(Style::new().fg(AMBER));
@@ -954,6 +992,27 @@ fn draw_settings(f: &mut Frame, channel_rows: &[ChannelRow], channel_selected: u
         return;
     }
 
+    // A tab row, styled like the help overlay's own tabs (see
+    // `tab_span`) — black on amber for whichever's current, plain
+    // amber otherwise — so it's visually the same "which one's
+    // selected" convention everywhere it's used.
+    let [tabs_area, _, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    let tabs = Line::from(vec![
+        tab_span("Inputs", tab == SettingsTab::Inputs),
+        Span::raw(" "),
+        tab_span("Outputs", tab == SettingsTab::Outputs),
+    ]);
+    f.render_widget(Paragraph::new(tabs), tabs_area);
+
+    match tab {
+        SettingsTab::Inputs => draw_settings_inputs(f, body, channel_rows, channel_selected),
+        SettingsTab::Outputs => draw_settings_outputs(f, body, out_entries, output_selected, main_output),
+    }
+    draw_status_popup(f, status);
+}
+
+fn draw_settings_inputs(f: &mut Frame, inner: Rect, channel_rows: &[ChannelRow], channel_selected: usize) {
     let items: Vec<ListItem> = if channel_rows.is_empty() {
         vec![ListItem::new("(no inputs or decks detected yet)").fg(DIM)]
     } else {
@@ -989,7 +1048,36 @@ fn draw_settings(f: &mut Frame, channel_rows: &[ChannelRow], channel_selected: u
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(channel_selected));
     f.render_stateful_widget(list, inner, &mut state);
-    draw_status_popup(f, status);
+}
+
+/// `main_output`'s own row gets `●` (AMBER); every other one gets `○`
+/// (DIM, or red if `!available` — same as a hardware input row's name
+/// turns red on the live screen for the same reason: it's currently
+/// unusable). 1 line per row: unlike an input or deck, an output has
+/// no MIDI mapping of its own to show a 2nd line for.
+fn draw_settings_outputs(f: &mut Frame, inner: Rect, out_entries: &[Entry], output_selected: usize, main_output: Option<&DeviceKey>) {
+    let items: Vec<ListItem> = if out_entries.is_empty() {
+        vec![ListItem::new("(no outputs detected yet)").fg(DIM)]
+    } else {
+        let width = inner.width.saturating_sub(2) as usize;
+        out_entries
+            .iter()
+            .map(|o| {
+                let is_main = main_output == Some(&o.key);
+                let (icon, icon_color) = if is_main { ("●", AMBER) } else { ("○", DIM) };
+                let label_color = if !o.available { Color::Red } else if is_main { AMBER } else { DIM };
+                let pad = width.saturating_sub(o.label.chars().count() + 1).max(1);
+                ListItem::new(Line::from(vec![
+                    Span::styled(o.label.clone(), Style::new().fg(label_color)),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(icon, Style::new().fg(icon_color)),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(output_selected));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 /// `centered(f.area(), 80, 20)`'s own width, but tall enough to fit
@@ -1319,6 +1407,7 @@ mod tests {
             "Ctrl+C",
             "Space",
             "Enter",
+            "Tab / BackTab",
             "X / Delete (drilled in)",
             "Esc (drilled in)",
             "Esc / `",

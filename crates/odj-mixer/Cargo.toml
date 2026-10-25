@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 odj-core.workspace = true
 anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 cpal.workspace = true
 midir.workspace = true
 ratatui.workspace = true

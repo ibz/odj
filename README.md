@@ -250,6 +250,11 @@ line), taking over until `Esc`/`?`/`/` closes it again. `Ctrl+C` quits
 (at the top level) — `q`/`Esc` don't; `Esc` is reserved for backing out
 of whatever's open instead.
 
+Every error odj-mixer shows on screen (as a red "Status" popup) is also
+appended, with when it happened, to `~/.local/share/odj/mixer.log` — the
+popup itself clears on the next keypress, so this is the place to look
+for one that's already gone.
+
 ## Keys
 
 Press `?` in either app for these keys, on the same pages as here: `Tab` and

@@ -6,6 +6,7 @@
 //! by hand or by MIDI knob (mapped from Settings too).
 
 mod devices;
+mod log;
 mod midi;
 mod routing;
 mod ui;
@@ -48,7 +49,9 @@ fn main() -> Result<()> {
              it's running) Volume/Low/Mid/High that isn't mapped yet. Press ? for the full\n\
              list of keys.\n\
              Needs PipeWire: routing between two cards needs its shared graph clock, which\n\
-             plain ALSA doesn't have."
+             plain ALSA doesn't have.\n\
+             Every error shown on screen is also logged, with when it happened, to {}.",
+            log::log_file().display()
         );
         return Ok(());
     }

@@ -189,7 +189,9 @@ fn auto_connect(
         }
         let devices = if ch.group == Group::Deck { devices_deck } else { devices_in };
         if let Err(e) = r.set_route(devices, devices_out, &ch.key, Some(&main)) {
-            *status = Some(format!("Could not connect {}: {e}", ch.label));
+            let msg = format!("Could not connect {}: {e}", ch.label);
+            crate::log::log(&msg);
+            *status = Some(msg);
             failed.insert(ch.key.clone());
         }
     }
@@ -545,7 +547,10 @@ pub fn run(
     let mut failed: HashSet<DeviceKey> = HashSet::new();
     // Shown via `draw_status_popup` until something replaces it or any
     // key dismisses it (see the two event-handling blocks below) —
-    // otherwise an error would sit on screen forever once hit.
+    // otherwise an error would sit on screen forever once hit. Every
+    // assignment below also calls `log::log`, so a message that's come
+    // and gone before it could be read (or copied) is still in
+    // `log::log_file()` afterward.
     let mut status: Option<String> = None;
 
     loop {
@@ -559,6 +564,7 @@ pub fn run(
             }
             failed.retain(|k| known.contains(k));
             for e in r.take_errors() {
+                crate::log::log(&e);
                 status = Some(e);
             }
         }
@@ -641,7 +647,11 @@ pub fn run(
                         let target = if row.added { None } else { r.main_output() };
                         match r.set_route(devices_in, devices_out, &row.key, target.as_ref()) {
                             Ok(()) => set_active(&mut active_inputs, &row.key, target.is_some()),
-                            Err(e) => status = Some(format!("Could not connect {}: {e}", row.label)),
+                            Err(e) => {
+                                let msg = format!("Could not connect {}: {e}", row.label);
+                                crate::log::log(&msg);
+                                status = Some(msg);
+                            }
                         }
                         failed.remove(&row.key);
                     }

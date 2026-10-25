@@ -36,10 +36,12 @@ fn main() -> Result<()> {
              Volume — for each. ←/→ picks the\n\
              channel and ↑/↓ picks its control — neither changes a value, just navigates;\n\
              +/- adjusts the selected one instead (Shift: ×4).\n\
-             ` opens Settings: one row per detected input, deck and the sampler. Space adds\n\
+             ` opens Settings: one row per detected input, deck and the sampler, plus one for\n\
+             any device that's no longer detected but still has a MIDI mapping. Space adds\n\
              the selected input to the mix or removes it (a no-op on a deck's or the\n\
-             sampler's row — always connected automatically); an added input is remembered\n\
-             and reconnected automatically on the next run, same as those are. Enter drills\n\
+             sampler's row — always connected automatically — or on an undetected one, since\n\
+             there's nothing there to connect); an added input is remembered and reconnected\n\
+             automatically on the next run, same as those are. Enter drills\n\
              into any row's own settings — for now just its 4 MIDI mappings, Volume/Low/Mid/\n\
              High, where Enter maps a knob to the selected one and X clears it, Esc backs\n\
              out. Esc/` closes Settings.\n\

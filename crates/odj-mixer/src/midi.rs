@@ -5,7 +5,7 @@
 //! rather than a fixed set learned once at startup, since odj-mixer's
 //! set of targets grows and shrinks as inputs and decks come and go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -96,6 +96,20 @@ impl Targets {
     /// Clears whatever knob is bound to `target`, if any.
     pub fn unbind(&self, target: &str) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, t| t != target);
+    }
+
+    /// Every distinct device at least one currently-bound knob targets
+    /// — for Settings to still list a channel whose device isn't
+    /// currently detected, as long as it has a mapping worth seeing
+    /// (and clearing) there.
+    pub fn mapped_inputs(&self) -> HashSet<DeviceKey> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(|t| parse_target(t))
+            .map(|t| t.input)
+            .collect()
     }
 }
 

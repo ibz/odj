@@ -25,6 +25,7 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
+use odj_core::audio;
 use odj_core::filter::{MAX_DB, MIN_DB};
 use odj_core::tui::{AMBER, DIM, Help, Page, centered, draw_help, wrap};
 
@@ -72,7 +73,7 @@ pub const HELP: &[Page] = &[
         "Settings",
         &[
             ("↑ / ↓", "Move between rows — every detected input and deck"),
-            ("Space", "Add the selected input to the mix, or remove it (a no-op on a deck's row — always connected)"),
+            ("Space", "Add the selected input to the mix, or remove it (a no-op on a deck's row — always connected — or on one that's mapped but not currently detected)"),
             ("Enter", "Open the selected row's own settings — for now just its 4 MIDI mappings"),
             ("↑ / ↓ (drilled in)", "Move between its 4 params"),
             ("Enter (drilled in)", "Map a knob to the selected param"),
@@ -460,28 +461,83 @@ fn shorten_labels(channels: Vec<Channel>) -> Vec<Channel> {
 /// `Space` is a no-op on one — [`draw_settings`] shows it with a
 /// visibly different, non-interactive indicator rather than the
 /// on/off one an input gets. `Enter` on either kind of row drills into
-/// its own 4 [`ParamRow`]s.
+/// its own 4 [`ParamRow`]s — this works even for a row that's `!present`
+/// (see below), so a mapping to a device that's since disappeared can
+/// still be seen and cleared, not just one that's currently detected.
 struct ChannelRow {
     key: DeviceKey,
     group: Group,
     label: String,
     added: bool,
+    /// Whether this row's device is actually among the currently
+    /// detected ones — `false` for a row that exists here only because
+    /// it still has a MIDI mapping (see [`build_channel_rows`]). Always
+    /// implies `!added` (an absent device obviously isn't routed to
+    /// anything); `Space` is a no-op on one of these too, same as on a
+    /// deck's row, and [`draw_settings`] marks it with its own
+    /// distinct, non-interactive indicator.
+    present: bool,
     /// This row's own 4 mapped CCs, High/Mid/Low/Volume (same order
     /// [`control_param`] uses) — shown on the row's own 2nd line, so a
     /// mapping can be seen without drilling in to check one at a time.
     midi: [Option<u8>; 4],
 }
 
+/// Every currently detected [`Channel`], plus one more row for any
+/// device that's since disappeared but still has at least one MIDI
+/// knob mapped to it (`targets.mapped_inputs()`, checked against
+/// `channels` so a still-detected device isn't duplicated) — otherwise
+/// a mapping to a deck that's quit, or an input that's been unplugged,
+/// would become invisible (and so uncheckable, and unclearable) the
+/// moment it's gone, even though the mapping itself quietly lives on
+/// in `Settings.mixer_midi_knobs` either way. Such a row has no live
+/// label or availability to show, so [`phantom_channel`] derives
+/// what it can from the device key alone.
 fn build_channel_rows(channels: &[Channel], routing: &Routing, targets: &Targets) -> Vec<ChannelRow> {
-    channels
+    let midi_for = |key: &DeviceKey| -> [Option<u8>; 4] {
+        std::array::from_fn(|i| targets.cc_for(&midi::target_key(&Target { input: key.clone(), param: control_param(i) })))
+    };
+    let mut rows: Vec<ChannelRow> = channels
         .iter()
-        .map(|ch| {
-            let midi: [Option<u8>; 4] = std::array::from_fn(|i| {
-                targets.cc_for(&midi::target_key(&Target { input: ch.key.clone(), param: control_param(i) }))
-            });
-            ChannelRow { key: ch.key.clone(), group: ch.group, label: ch.label.clone(), added: routing.output_of(&ch.key).is_some(), midi }
+        .map(|ch| ChannelRow {
+            key: ch.key.clone(),
+            group: ch.group,
+            label: ch.label.clone(),
+            added: routing.output_of(&ch.key).is_some(),
+            present: true,
+            midi: midi_for(&ch.key),
         })
-        .collect()
+        .collect();
+    let known: HashSet<&DeviceKey> = channels.iter().map(|c| &c.key).collect();
+    for key in targets.mapped_inputs() {
+        if known.contains(&key) {
+            continue;
+        }
+        let (group, label) = phantom_channel(&key);
+        let midi = midi_for(&key);
+        rows.push(ChannelRow { key, group, label, added: false, present: false, midi });
+    }
+    rows
+}
+
+/// A best-effort `(group, label)` for a device that has a MIDI mapping
+/// but isn't currently detected — there's no live [`Entry`] to read a
+/// proper label from, so this falls back to recognizing a deck's or
+/// odj-sampler's own virtual-sink naming (see `audio::deck_number`/
+/// `audio::sampler_sink_name`) for those, and the raw device id plus
+/// its route for anything else (a hardware input, unplugged).
+fn phantom_channel(key: &DeviceKey) -> (Group, String) {
+    if let Some(n) = audio::deck_number(&key.0) {
+        return (Group::Deck, format!("Deck {n}"));
+    }
+    if key.0 == audio::sampler_sink_name() {
+        return (Group::Deck, "Sampler".to_string());
+    }
+    let route = match key.1 {
+        audio::Route::Stereo(l, r) => format!("{}-{}", l + 1, r + 1),
+        audio::Route::Mono(c) => format!("{}", c + 1),
+    };
+    (Group::Input, format!("{} · {route}", key.0))
 }
 
 /// One row of a [`ChannelRow`]'s own drill-in: one of its 4 params,
@@ -542,10 +598,13 @@ fn draw_pick_main_output(f: &mut Frame, out_entries: &[Entry], selected: usize) 
 /// control instead (`Shift`: ×4, a no-op until the channel's actually
 /// connected). `` ` `` (one of the globals pinned to the right of the
 /// hint line, see [`draw_mixer`]) opens Settings: one list of every
-/// detected input and deck. `↑`/`↓` picks a row, `Space` adds the
-/// selected input to the mix or removes it again (a no-op on a deck's
-/// row — it's always connected automatically, not user-togglable) —
-/// this also persists, so an added input is still there (and
+/// detected input and deck, plus (see [`build_channel_rows`]) a row for
+/// any device that's no longer detected but still has a MIDI mapping.
+/// `↑`/`↓` picks a row, `Space` adds the selected input to the mix or
+/// removes it again (a no-op on a deck's row — it's always connected
+/// automatically, not user-togglable — or on one that isn't currently
+/// detected, for the opposite reason: there's nothing there to connect)
+/// — this also persists, so an added input is still there (and
 /// reconnected automatically) next time odj-mixer runs;
 /// `active_inputs` is this run's starting set, loaded from
 /// `Settings.mixer_active_inputs` by the caller. `Enter` drills into
@@ -678,7 +737,7 @@ pub fn run(
                     KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
                     KeyCode::Up => channel_selected = channel_selected.saturating_sub(1),
                     KeyCode::Down => channel_selected = (channel_selected + 1).min(channel_rows.len().saturating_sub(1)),
-                    KeyCode::Char(' ') if channel_rows.get(channel_selected).is_some_and(|r| r.group == Group::Input) => {
+                    KeyCode::Char(' ') if channel_rows.get(channel_selected).is_some_and(|r| r.group == Group::Input && r.present) => {
                         let row = &channel_rows[channel_selected];
                         let mut r = routing.lock().unwrap_or_else(|e| e.into_inner());
                         let target = if row.added { None } else { r.main_output() };
@@ -907,13 +966,19 @@ fn draw_settings(f: &mut Frame, channel_rows: &[ChannelRow], channel_selected: u
             .map(|r| {
                 // A deck's indicator is a different shape, not just a
                 // different color, since — unlike an input's — it's
-                // not something `Space` can actually change here.
-                let (icon, style) = match (r.group, r.added) {
-                    (Group::Input, true) => ("●", Style::new().fg(AMBER)),
-                    (Group::Input, false) => ("○", Style::new().fg(DIM)),
-                    (Group::Deck, true) => ("◆", Style::new().fg(AMBER)),
-                    (Group::Deck, false) => ("◇", Style::new().fg(DIM)),
+                // not something `Space` can actually change here; a
+                // row that's `!present` gets its own 3rd indicator for
+                // the same reason — it's just as uninteractive, but
+                // for not currently existing rather than for being a
+                // deck, so it shouldn't look like either of those.
+                let (icon, style) = match (r.present, r.group, r.added) {
+                    (false, ..) => ("✕", DIM),
+                    (true, Group::Input, true) => ("●", AMBER),
+                    (true, Group::Input, false) => ("○", DIM),
+                    (true, Group::Deck, true) => ("◆", AMBER),
+                    (true, Group::Deck, false) => ("◇", DIM),
                 };
+                let style = Style::new().fg(style);
                 let pad = width.saturating_sub(r.label.chars().count() + 1).max(1);
                 let line1 = Line::from(vec![Span::raw(r.label.clone()), Span::raw(" ".repeat(pad)), Span::styled(icon, style)]);
                 let line2 = Line::styled(format!("  {}", midi_summary(&r.midi)), Style::new().fg(DIM));
@@ -1133,9 +1198,59 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "Deck 1");
         assert_eq!(rows[0].group, Group::Deck);
+        assert!(rows[0].present);
         assert_eq!(rows[1].label, "Mic");
         assert_eq!(rows[1].group, Group::Input);
         assert!(!rows[1].added, "never explicitly added");
+        assert!(rows[1].present);
+    }
+
+    #[test]
+    fn build_channel_rows_adds_a_row_for_a_mapped_device_thats_no_longer_detected() {
+        let routing = Routing::default();
+        let targets = Targets::default();
+        let gone = ("missing-deck".to_string(), Route::Stereo(0, 1));
+        targets.bind(5, midi::target_key(&Target { input: gone.clone(), param: Param::Volume }));
+
+        // Not in `channels` at all — nothing currently detects it. Its
+        // id doesn't match a deck's or odj-sampler's own naming, so
+        // it's treated as a (now-unplugged) hardware input — see the
+        // dedicated `phantom_channel` tests for that labeling itself.
+        let rows = build_channel_rows(&[], &routing, &targets);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, gone);
+        assert_eq!(rows[0].group, Group::Input);
+        assert!(!rows[0].present);
+        assert!(!rows[0].added, "an absent device is never routed to anything");
+    }
+
+    #[test]
+    fn build_channel_rows_doesnt_duplicate_a_still_detected_mapped_device() {
+        let decks = [entry("odj-deck-1", "Deck 1")];
+        let channels = build_channels(&[], &decks);
+        let routing = Routing::default();
+        let targets = Targets::default();
+        targets.bind(5, midi::target_key(&Target { input: channels[0].key.clone(), param: Param::Volume }));
+
+        let rows = build_channel_rows(&channels, &routing, &targets);
+        assert_eq!(rows.len(), 1, "the live row covers it already, no separate phantom row");
+        assert!(rows[0].present);
+    }
+
+    #[test]
+    fn phantom_channel_recognizes_a_decks_or_odj_samplers_own_sink_name() {
+        assert_eq!(phantom_channel(&("odj-deck-2".to_string(), Route::Stereo(0, 1))), (Group::Deck, "Deck 2".to_string()));
+        assert_eq!(
+            phantom_channel(&(audio::sampler_sink_name().to_string(), Route::Stereo(0, 1))),
+            (Group::Deck, "Sampler".to_string())
+        );
+    }
+
+    #[test]
+    fn phantom_channel_falls_back_to_the_raw_id_and_route_for_a_hardware_input() {
+        let (group, label) = phantom_channel(&("hw:CARD=Built-in".to_string(), Route::Mono(2)));
+        assert_eq!(group, Group::Input);
+        assert_eq!(label, "hw:CARD=Built-in · 3");
     }
 
     #[test]

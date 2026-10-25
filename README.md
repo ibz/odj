@@ -228,20 +228,25 @@ this way, for an input, a deck or the sampler, is remembered in the
 settings file shared with the other apps.
 
 `` ` `` ("settings", on the right of the live screen's hint line)
-opens one list, one row per detected input, deck and the sampler, with
-a right-aligned indicator for whether it's currently mixed in: `●`/`○`
+opens one list, one row per detected input, deck and the sampler —
+plus one more for any device that's no longer detected but still has
+a MIDI mapping, so that mapping stays visible (and clearable) instead
+of quietly surviving, unseen, in the settings file — with a
+right-aligned indicator for whether it's currently mixed in: `●`/`○`
 for an input (`Space` toggles it — adding one connects it to the main
 output right away, removing one disconnects it; this is also
 remembered in the shared settings file, so an added input is still
 there, reconnected automatically, next time odj-mixer runs — same as
-a deck or the sampler already is), or `◆`/`◇` for a deck or the
-sampler — a different shape, not just a different state, since either
-is always connected automatically and `Space` can't change that. Each
-row is 2 lines tall, the 2nd showing its own MIDI mapping summary —
-`MIDI  H:n  M:n  L:n  V:n`, "—" for whichever of the 4 isn't mapped —
-so a mapping can be seen without drilling in to check one at a time.
-`↑`/`↓` picks a row; `Enter`, on either kind, drills into its own
-settings — for now just its Volume, Low, Mid and High, each showing
+a deck or the sampler already is), `◆`/`◇` for a deck or the sampler
+— a different shape, not just a different state, since either is
+always connected automatically and `Space` can't change that — or
+`✕` for one of those mapped-but-undetected rows, just as
+non-interactive as a deck's for the opposite reason: there's nothing
+there to connect. Each row is 2 lines tall, the 2nd showing its own
+MIDI mapping summary — `MIDI  H:n  M:n  L:n  V:n`, "—" for whichever
+of the 4 isn't mapped — so a mapping can be seen without drilling in
+to check one at a time. `↑`/`↓` picks a row; `Enter`, on any of the
+3 kinds, drills into its own settings — for now just its Volume, Low, Mid and High, each showing
 whatever CC it's bound to, or "—" if none. `↑`/`↓` picks one there,
 `Enter` maps (or remaps) a knob to it, `X`/`Delete` clears it, `Esc`
 goes back to the channel list. `Esc`/`` ` `` from there closes

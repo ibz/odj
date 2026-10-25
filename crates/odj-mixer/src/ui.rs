@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -43,6 +43,15 @@ const STRIP_WIDTH: u16 = 14;
 /// The 4 controls a strip's cursor moves between: High, Mid, Low,
 /// Volume (top to bottom, same order a real channel strip reads).
 const CONTROLS: usize = 4;
+/// How long [`auto_connect`] leaves a failed device alone before trying
+/// it again — long enough that a genuinely gone device doesn't spam
+/// retries (or the log) every single frame, short enough that one
+/// that was just slow to finish registering with PipeWire (a deck's or
+/// odj-sampler's virtual sink can take a moment after it's first
+/// detected to become actually capturable) gets picked up again within
+/// a few seconds rather than staying silently unconnected for the rest
+/// of the session.
+const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(3);
 
 /// The help's pages (`?` or `/`, from the live screen only — Settings
 /// has no help of its own) — the live screen's own keys, then
@@ -165,11 +174,14 @@ fn build_channels(in_entries: &[Entry], deck_entries: &[Entry]) -> Vec<Channel> 
 /// — see [`run`]'s Space handler, which keeps that set up to date as
 /// inputs are added/removed) — everything else waits for an explicit
 /// `Space` instead, since there's usually several inputs, not all of
-/// them meant to be mixed in. Skips anything already in `failed` so a
-/// device that can't be opened isn't retried every single frame; `run`
-/// clears an entry from `failed` once its device disappears (so a
-/// reconnect gets a fresh try). A no-op, loudly or quietly, if there's
-/// no main output picked yet.
+/// them meant to be mixed in. Skips anything in `failed` less than
+/// `retry_after` ago, so a device that can't be opened isn't retried
+/// every single frame (or spam the log every single frame either) —
+/// `run` passes [`AUTO_CONNECT_RETRY`] and clears an entry from
+/// `failed` outright once its device disappears (so a reconnect gets
+/// an immediate fresh try rather than waiting out the rest of that
+/// window). A no-op, loudly or quietly, if there's no main output
+/// picked yet.
 #[allow(clippy::too_many_arguments)]
 fn auto_connect(
     channels: &[Channel],
@@ -178,13 +190,14 @@ fn auto_connect(
     devices_deck: &Devices,
     devices_out: &Devices,
     active_inputs: &HashSet<String>,
-    failed: &mut HashSet<DeviceKey>,
+    failed: &mut HashMap<DeviceKey, Instant>,
+    retry_after: Duration,
     status: &mut Option<String>,
 ) {
     let mut r = routing.lock().unwrap_or_else(|e| e.into_inner());
     let Some(main) = r.main_output() else { return };
     for ch in channels.iter().filter(|c| c.group == Group::Deck || active_inputs.contains(&device_key_string(&c.key))) {
-        if failed.contains(&ch.key) || r.output_of(&ch.key).is_some() {
+        if failed.get(&ch.key).is_some_and(|t| t.elapsed() < retry_after) || r.output_of(&ch.key).is_some() {
             continue;
         }
         let devices = if ch.group == Group::Deck { devices_deck } else { devices_in };
@@ -192,7 +205,7 @@ fn auto_connect(
             let msg = format!("Could not connect {}: {e}", ch.label);
             crate::log::log(&msg);
             *status = Some(msg);
-            failed.insert(ch.key.clone());
+            failed.insert(ch.key.clone(), Instant::now());
         }
     }
 }
@@ -544,7 +557,7 @@ pub fn run(
     let mut mapping_drill: Option<DeviceKey> = None;
     let mut param_selected = 0usize;
     let mut help = Help::default();
-    let mut failed: HashSet<DeviceKey> = HashSet::new();
+    let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
     // Shown via `draw_status_popup` until something replaces it or any
     // key dismisses it (see the two event-handling blocks below) —
     // otherwise an error would sit on screen forever once hit. Every
@@ -562,7 +575,7 @@ pub fn run(
             for gone in r.routed_inputs().into_iter().filter(|k| !known.contains(k)).collect::<Vec<_>>() {
                 r.forget_input(&gone);
             }
-            failed.retain(|k| known.contains(k));
+            failed.retain(|k, _| known.contains(k));
             for e in r.take_errors() {
                 crate::log::log(&e);
                 status = Some(e);
@@ -577,6 +590,7 @@ pub fn run(
             devices_out,
             &active_inputs,
             &mut failed,
+            AUTO_CONNECT_RETRY,
             &mut status,
         );
 
@@ -1160,9 +1174,9 @@ mod tests {
         let routing = Mutex::new(Routing::default());
         routing.lock().unwrap().set_main_output(Some(entry("missing-out", "Out").key));
         let channels = [Channel { key: entry("mic", "Mic").key, group: Group::Input, label: "Mic".into(), available: true }];
-        let mut failed = HashSet::new();
+        let mut failed = HashMap::new();
         let mut status = None;
-        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, &mut status);
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, AUTO_CONNECT_RETRY, &mut status);
         assert!(routing.lock().unwrap().output_of(&channels[0].key).is_none());
         assert!(failed.is_empty(), "never attempted, so never failed either");
     }
@@ -1176,13 +1190,13 @@ mod tests {
         routing.lock().unwrap().set_main_output(Some(entry("missing-out", "Out").key));
         let channels = [Channel { key: entry("missing-mic", "Mic").key, group: Group::Input, label: "Mic".into(), available: true }];
         let active = HashSet::from([device_key_string(&channels[0].key)]);
-        let mut failed = HashSet::new();
+        let mut failed = HashMap::new();
         let mut status = None;
         // Neither device actually exists, so this can't succeed — the
         // point is that a previously-active input is attempted at all
         // (unlike one that was never added), the same as a deck is.
-        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &active, &mut failed, &mut status);
-        assert!(failed.contains(&channels[0].key));
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &active, &mut failed, AUTO_CONNECT_RETRY, &mut status);
+        assert!(failed.contains_key(&channels[0].key));
     }
 
     #[test]
@@ -1192,9 +1206,9 @@ mod tests {
         let devices_out = Devices::start(crate::devices::Kind::Output);
         let routing = Mutex::new(Routing::default());
         let channels = [Channel { key: entry("odj-deck-1", "Deck 1").key, group: Group::Deck, label: "Deck 1".into(), available: true }];
-        let mut failed = HashSet::new();
+        let mut failed = HashMap::new();
         let mut status = None;
-        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, &mut status);
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, AUTO_CONNECT_RETRY, &mut status);
         assert!(routing.lock().unwrap().output_of(&channels[0].key).is_none());
         assert!(failed.is_empty());
     }
@@ -1207,15 +1221,37 @@ mod tests {
         let routing = Mutex::new(Routing::default());
         routing.lock().unwrap().set_main_output(Some(entry("missing-out", "Out").key));
         let channels = [Channel { key: entry("missing-deck", "Deck 1").key, group: Group::Deck, label: "Deck 1".into(), available: true }];
-        let mut failed = HashSet::new();
+        let mut failed = HashMap::new();
         let mut status = None;
         // Neither device actually exists, so this can't succeed — the
         // point is that it's remembered as failed rather than erroring
-        // again next call.
-        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, &mut status);
-        assert!(failed.contains(&channels[0].key));
+        // again next call, as long as it's retried within `retry_after`.
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, AUTO_CONNECT_RETRY, &mut status);
+        assert!(failed.contains_key(&channels[0].key));
         status = None;
-        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, &mut status);
-        assert!(status.is_none(), "already-failed devices aren't retried (and don't re-report an error) every frame");
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, AUTO_CONNECT_RETRY, &mut status);
+        assert!(status.is_none(), "an already-failed device isn't retried (and doesn't re-report an error) within retry_after");
+    }
+
+    #[test]
+    fn auto_connect_retries_a_previously_failed_device_once_retry_after_has_passed() {
+        let devices_in = Devices::start(crate::devices::Kind::Input);
+        let devices_deck = Devices::start(crate::devices::Kind::Deck);
+        let devices_out = Devices::start(crate::devices::Kind::Output);
+        let routing = Mutex::new(Routing::default());
+        routing.lock().unwrap().set_main_output(Some(entry("missing-out", "Out").key));
+        let channels = [Channel { key: entry("missing-deck", "Deck 1").key, group: Group::Deck, label: "Deck 1".into(), available: true }];
+        let mut failed = HashMap::new();
+        let mut status = None;
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, AUTO_CONNECT_RETRY, &mut status);
+        assert!(failed.contains_key(&channels[0].key));
+        std::thread::sleep(Duration::from_millis(5));
+        status = None;
+        // A tiny `retry_after`, not the real `AUTO_CONNECT_RETRY` — the
+        // point here is only that a device the elapsed time clears gets
+        // a fresh attempt (and so a fresh, re-reported error), not that
+        // it literally takes 3 real seconds in a test.
+        auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, Duration::from_millis(1), &mut status);
+        assert!(status.is_some(), "retry_after elapsed, so this device gets attempted (and fails, and reports) again");
     }
 }

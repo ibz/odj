@@ -198,10 +198,24 @@ impl Routing {
     /// finished settling yet (confirmed empirically: opening a stream
     /// right after another one on the same node just closed can
     /// transiently fail here, even though the exact same device opens
-    /// fine moments later). A genuinely unavailable device still just
-    /// fails, a little slower.
-    const ROUTE_RETRIES: u32 = 2;
-    const ROUTE_RETRY_DELAY: Duration = Duration::from_millis(150);
+    /// fine moments later). Also covers a longer-running version of the
+    /// same kind of race, specific to a deck's or odj-sampler's
+    /// *freshly created* virtual sink: `cpal`'s own PipeWire backend
+    /// pins a capture stream to its target via `PW_KEY_TARGET_OBJECT`,
+    /// set from that node's `object.serial` — reading cpal's source
+    /// (`host/pipewire/device.rs`) shows that serial is only known once
+    /// the node's own `info` event arrives, a separate round trip from
+    /// the registry's initial "this node exists" one, so a node
+    /// enumerated right after it's created can still report a
+    /// stale/default serial if that second round trip hasn't landed
+    /// yet — pinning the stream to the wrong (or no) target, which
+    /// PipeWire then silently falls back from to its default source
+    /// instead (see `verify_input_route`'s own doc comment for that
+    /// half). Not observed to resolve within the old, much tighter
+    /// budget here. A genuinely unavailable device still just fails, a
+    /// little slower.
+    const ROUTE_RETRIES: u32 = 10;
+    const ROUTE_RETRY_DELAY: Duration = Duration::from_millis(300);
 
     /// Routes `input` (resolved via `input_devices` — `devices::Kind::
     /// Input` for a hardware source, `Kind::Deck` for an odj-player

@@ -682,7 +682,8 @@ pub fn verify_route(host: &Host, output: &Output) -> Result<()> {
         PeerCheck::Linked(got) if got == want => Ok(()),
         PeerCheck::Linked(got) => bail!(
             "expected to play on {} but PipeWire linked the stream to {got} instead \
-             (the device likely disappeared and PipeWire fell back to its default)",
+             (fell back to its default — either the device disappeared, or, for one just \
+             created, hasn't finished registering with PipeWire yet)",
             output.name
         ),
         PeerCheck::Unconfirmed => Ok(()),
@@ -701,7 +702,8 @@ pub fn verify_input_route(host: &Host, input: &Input) -> Result<()> {
         PeerCheck::Linked(got) if got == want => Ok(()),
         PeerCheck::Linked(got) => bail!(
             "expected to capture from {} but PipeWire linked the stream to {got} instead \
-             (the device likely disappeared and PipeWire fell back to its default)",
+             (fell back to its default — either the device disappeared, or, for one just \
+             created, hasn't finished registering with PipeWire yet)",
             input.name
         ),
         PeerCheck::Unconfirmed => Ok(()),

@@ -451,9 +451,11 @@ fn shorten_labels(channels: Vec<Channel>) -> Vec<Channel> {
         .collect()
 }
 
-/// One row of Settings' single channel list: one per detected input
-/// or deck, with whether it's currently mixed into the main output.
-/// `Space` toggles this for an input; a deck is always connected
+/// One row of Settings' single channel list — 2 lines tall, since
+/// there's room for more than just a label and an indicator here: the
+/// label and whether it's currently mixed into the main output on the
+/// first, its own [`midi_summary`] on the second. `Space` toggles the
+/// mixed-in state for an input; a deck is always connected
 /// automatically (see [`auto_connect`]) and isn't user-togglable, so
 /// `Space` is a no-op on one — [`draw_settings`] shows it with a
 /// visibly different, non-interactive indicator rather than the
@@ -464,10 +466,22 @@ struct ChannelRow {
     group: Group,
     label: String,
     added: bool,
+    /// This row's own 4 mapped CCs, High/Mid/Low/Volume (same order
+    /// [`control_param`] uses) — shown on the row's own 2nd line, so a
+    /// mapping can be seen without drilling in to check one at a time.
+    midi: [Option<u8>; 4],
 }
 
-fn build_channel_rows(channels: &[Channel], routing: &Routing) -> Vec<ChannelRow> {
-    channels.iter().map(|ch| ChannelRow { key: ch.key.clone(), group: ch.group, label: ch.label.clone(), added: routing.output_of(&ch.key).is_some() }).collect()
+fn build_channel_rows(channels: &[Channel], routing: &Routing, targets: &Targets) -> Vec<ChannelRow> {
+    channels
+        .iter()
+        .map(|ch| {
+            let midi: [Option<u8>; 4] = std::array::from_fn(|i| {
+                targets.cc_for(&midi::target_key(&Target { input: ch.key.clone(), param: control_param(i) }))
+            });
+            ChannelRow { key: ch.key.clone(), group: ch.group, label: ch.label.clone(), added: routing.output_of(&ch.key).is_some(), midi }
+        })
+        .collect()
 }
 
 /// One row of a [`ChannelRow`]'s own drill-in: one of its 4 params,
@@ -477,6 +491,15 @@ struct ParamRow {
     target: String,
     param: Param,
     cc: Option<u8>,
+}
+
+/// A [`ChannelRow`]'s own 2nd line: its MIDI mapping summary,
+/// High/Mid/Low/Volume in that order (same as the channel strip itself
+/// reads, top to bottom, and the same order [`ChannelRow::midi`] is
+/// built in) — "—" for whichever of the 4 isn't mapped.
+fn midi_summary(midi: &[Option<u8>; 4]) -> String {
+    let cc = |cc: Option<u8>| cc.map_or("—".to_string(), |c| c.to_string());
+    format!("MIDI  H:{}  M:{}  L:{}  V:{}", cc(midi[0]), cc(midi[1]), cc(midi[2]), cc(midi[3]))
 }
 
 fn build_param_rows(key: &DeviceKey, targets: &Targets) -> Vec<ParamRow> {
@@ -597,7 +620,7 @@ pub fn run(
         if settings_open {
             let channel_rows = {
                 let r = routing.lock().unwrap_or_else(|e| e.into_inner());
-                build_channel_rows(&build_channels(&in_entries, &deck_entries), &r)
+                build_channel_rows(&build_channels(&in_entries, &deck_entries), &r, targets)
             };
             channel_selected = channel_selected.min(channel_rows.len().saturating_sub(1));
             // The drilled-into channel disappearing (unplugged, deck
@@ -892,7 +915,9 @@ fn draw_settings(f: &mut Frame, channel_rows: &[ChannelRow], channel_selected: u
                     (Group::Deck, false) => ("◇", Style::new().fg(DIM)),
                 };
                 let pad = width.saturating_sub(r.label.chars().count() + 1).max(1);
-                ListItem::new(Line::from(vec![Span::raw(r.label.clone()), Span::raw(" ".repeat(pad)), Span::styled(icon, style)]))
+                let line1 = Line::from(vec![Span::raw(r.label.clone()), Span::raw(" ".repeat(pad)), Span::styled(icon, style)]);
+                let line2 = Line::styled(format!("  {}", midi_summary(&r.midi)), Style::new().fg(DIM));
+                ListItem::new(vec![line1, line2])
             })
             .collect()
     };
@@ -1104,13 +1129,34 @@ mod tests {
         let mut routing = Routing::default();
         routing.set_main_output(Some(entry("out", "Out").key));
 
-        let rows = build_channel_rows(&channels, &routing);
+        let rows = build_channel_rows(&channels, &routing, &Targets::default());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].label, "Deck 1");
         assert_eq!(rows[0].group, Group::Deck);
         assert_eq!(rows[1].label, "Mic");
         assert_eq!(rows[1].group, Group::Input);
         assert!(!rows[1].added, "never explicitly added");
+    }
+
+    #[test]
+    fn build_channel_rows_carries_each_rows_own_4_mapped_ccs() {
+        let decks = [entry("odj-deck-1", "Deck 1")];
+        let channels = build_channels(&[], &decks);
+        let routing = Routing::default();
+        let targets = Targets::default();
+        let high = midi::target_key(&Target { input: channels[0].key.clone(), param: Param::High });
+        let volume = midi::target_key(&Target { input: channels[0].key.clone(), param: Param::Volume });
+        targets.bind(2, high);
+        targets.bind(9, volume);
+
+        let rows = build_channel_rows(&channels, &routing, &targets);
+        assert_eq!(rows[0].midi, [Some(2), None, None, Some(9)], "High/Mid/Low/Volume, in that order");
+    }
+
+    #[test]
+    fn midi_summary_marks_an_unmapped_param_with_a_dash() {
+        assert_eq!(midi_summary(&[Some(2), None, None, Some(9)]), "MIDI  H:2  M:—  L:—  V:9");
+        assert_eq!(midi_summary(&[None, None, None, None]), "MIDI  H:—  M:—  L:—  V:—");
     }
 
     #[test]

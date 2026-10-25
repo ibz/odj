@@ -236,7 +236,10 @@ remembered in the shared settings file, so an added input is still
 there, reconnected automatically, next time odj-mixer runs — same as
 a deck or the sampler already is), or `◆`/`◇` for a deck or the
 sampler — a different shape, not just a different state, since either
-is always connected automatically and `Space` can't change that.
+is always connected automatically and `Space` can't change that. Each
+row is 2 lines tall, the 2nd showing its own MIDI mapping summary —
+`MIDI  H:n  M:n  L:n  V:n`, "—" for whichever of the 4 isn't mapped —
+so a mapping can be seen without drilling in to check one at a time.
 `↑`/`↓` picks a row; `Enter`, on either kind, drills into its own
 settings — for now just its Volume, Low, Mid and High, each showing
 whatever CC it's bound to, or "—" if none. `↑`/`↓` picks one there,

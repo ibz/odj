@@ -2,7 +2,7 @@
 //! so an external sequencer (hardware or software) can drive odj-sampler
 //! instead of — or alongside — the keyboard. Config lives in the shared
 //! settings file (see `odj_core::memory::Settings`'s
-//! `sampler_midi_port_id`/`sampler_midi_pads`). Port listing and the
+//! `sampler_midi_last`/`sampler_midi_controllers`). Port listing and the
 //! stable device identity used to key [`MidiConfig::devices`] live in
 //! `odj_core::midi`, shared with odj-mixer's own MIDI knobs; the row model
 //! behind Settings' MIDI tab is [`device_rows`] here. Nothing is picked at
@@ -35,14 +35,12 @@ use crate::engine::{PADS, Sampler};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct MidiConfig {
-    pub port_id: Option<String>,
-    /// The MIDI note each pad responds to, per device: `devices[name][slot][i]`
-    /// for pad `i`, where `slot` distinguishes multiple simultaneously
-    /// connected devices that report the same name (see
-    /// `odj_core::midi::device_slot`). Learned once per slot (see
-    /// [`learn_pad_notes`]) rather than assumed, since pad numbering varies
-    /// across controllers.
-    pub devices: HashMap<String, Vec<[u8; PADS]>>,
+    /// The stable name of the last MIDI input used (see
+    /// `odj_core::midi::stable_name`), resolved to a current port id on
+    /// startup rather than persisting a connection-order id.
+    pub last: Option<String>,
+    /// The MIDI note each pad responds to, per device: `controllers[name][pad]`.
+    pub controllers: HashMap<String, std::collections::HashMap<usize, u8>>,
 }
 
 impl MidiConfig {
@@ -50,7 +48,7 @@ impl MidiConfig {
     /// port, no devices learned) when there is none yet.
     pub fn load() -> Self {
         let settings = load_settings();
-        Self { port_id: settings.sampler_midi_port_id, devices: settings.sampler_midi_pads }
+        Self { last: settings.sampler_midi_last, controllers: settings.sampler_midi_controllers.clone() }
     }
 
     /// Saves this app's fields back into the shared settings file, leaving
@@ -58,23 +56,32 @@ impl MidiConfig {
     /// as they were.
     pub fn save(&self) -> std::io::Result<()> {
         let mut settings = load_settings();
-        settings.sampler_midi_port_id = self.port_id.clone();
-        settings.sampler_midi_pads = self.devices.clone();
+        settings.sampler_midi_last = self.last.clone();
+        settings.sampler_midi_controllers = self.controllers.clone();
         save_settings(&settings)
     }
 
-    /// The learned notes for `name`'s `slot`-th connected instance, if any.
-    pub fn pad_notes_for(&self, name: &str, slot: usize) -> Option<[u8; PADS]> {
-        self.devices.get(name)?.get(slot).copied()
+    /// The learned notes for `name`, if any.
+    pub fn pad_notes_for(&self, name: &str, _slot: usize) -> Option<[u8; PADS]> {
+        let map = self.controllers.get(name)?;
+        let mut notes = [0u8; PADS];
+        for (pad, note) in map {
+            if *pad < PADS {
+                notes[*pad] = *note;
+            }
+        }
+        Some(notes)
     }
 
-    /// Remembers `notes` for `name`'s `slot`-th connected instance.
-    pub fn set_pad_notes_for(&mut self, name: String, slot: usize, notes: [u8; PADS]) {
-        let slots = self.devices.entry(name).or_default();
-        if slots.len() <= slot {
-            slots.resize(slot + 1, [0; PADS]);
+    /// Remembers `notes` for `name`.
+    pub fn set_pad_notes_for(&mut self, name: String, _slot: usize, notes: [u8; PADS]) {
+        let mut map = std::collections::HashMap::new();
+        for (pad, &note) in notes.iter().enumerate().take(PADS) {
+            if note != 0 {
+                map.insert(pad, note);
+            }
         }
-        slots[slot] = notes;
+        self.controllers.insert(name, map);
     }
 }
 
@@ -97,7 +104,7 @@ pub struct DeviceRow {
 /// unioned together), just counting learned pads instead of knob mappings.
 pub fn device_rows(config: &MidiConfig) -> Vec<DeviceRow> {
     let ports = odj_core::midi::list_ports();
-    let mut names: Vec<String> = config.devices.keys().cloned().collect();
+    let mut names: Vec<String> = config.controllers.keys().cloned().collect();
     for (id, label) in &ports {
         let name = odj_core::midi::stable_name(id, label);
         if !names.contains(&name) {
@@ -113,11 +120,7 @@ pub fn device_rows(config: &MidiConfig) -> Vec<DeviceRow> {
             // the fullest one is the useful figure for "how much of this
             // device model has been learned" without adding a row per
             // simultaneously-connected twin.
-            let mappings = config
-                .devices
-                .get(&name)
-                .and_then(|slots| slots.iter().map(|notes| notes.iter().filter(|&&n| n != 0).count()).max())
-                .unwrap_or(0);
+            let mappings = config.controllers.get(&name).map(|map| map.len()).unwrap_or(0);
             DeviceRow { name, present, mappings }
         })
         .collect()
@@ -134,7 +137,7 @@ pub struct LearnRequest {
 }
 
 /// Restores the remembered MIDI input at startup, no picker: the saved
-/// `port_id` if it's still plugged in and its pad notes are known,
+/// device by stable name if it's still plugged in and its pad notes are known,
 /// otherwise the one known device currently present (when there's exactly
 /// one, same tie-break as odj-mixer's own startup). `None` means plain
 /// keyboard use until Settings picks something.
@@ -142,10 +145,11 @@ pub fn restore(
     config: &mut MidiConfig,
     sampler: Arc<Mutex<Sampler>>,
 ) -> Option<(midir::MidiInputConnection<()>, String)> {
-    if let Some(id) = config.port_id.as_deref()
-        && let Some((name, slot)) = odj_core::midi::device_slot(id)
+    if let Some(name) = config.last.as_deref()
+        && let Some(id) = odj_core::midi::port_id_for(name)
+        && let Some((name, slot)) = odj_core::midi::device_slot(&id)
         && let Some(notes) = config.pad_notes_for(&name, slot)
-        && let Some(conn) = connect(id, sampler.clone(), notes)
+        && let Some(conn) = connect(&id, sampler.clone(), notes)
     {
         return Some((conn, name));
     }
@@ -164,7 +168,7 @@ pub fn restore(
     let conn = connect(id, sampler, *notes)?;
     // The port id changed across a replug, but the device itself didn't —
     // remember its new one so the direct lookup works next time too.
-    config.port_id = Some(id.clone());
+    config.last = Some(name.clone());
     let _ = config.save();
     Some((conn, name.clone()))
 }
@@ -385,9 +389,8 @@ mod tests {
     #[test]
     fn config_round_trips() {
         with_temp_dirs(|| {
-            let mut devices = HashMap::new();
-            devices.insert("Some Pad".to_string(), vec![default_pad_notes()]);
-            let config = MidiConfig { port_id: Some("24:0".into()), devices };
+            let mut config = MidiConfig { last: Some("Some Pad".into()), ..Default::default() };
+            config.set_pad_notes_for("Some Pad".to_string(), 0, default_pad_notes());
             config.save().unwrap();
             assert_eq!(MidiConfig::load(), config);
         });
@@ -401,11 +404,11 @@ mod tests {
             settings.music_dirs = vec!["/music".into()];
             save_settings(&settings).unwrap();
 
-            let config = MidiConfig { port_id: Some("24:0".into()), devices: HashMap::new() };
+            let config = MidiConfig { last: Some("Some Pad".into()), ..Default::default() };
             config.save().unwrap();
 
             let after = load_settings();
-            assert_eq!(after.sampler_midi_port_id, Some("24:0".into()), "odj-sampler's own field changed");
+            assert_eq!(after.sampler_midi_last, Some("Some Pad".into()), "odj-sampler's own field changed");
             assert!(!after.auto_cue, "odj-player's fields survived the save");
             assert_eq!(after.music_dirs, vec![std::path::PathBuf::from("/music")]);
         });
@@ -427,9 +430,6 @@ mod tests {
     fn device_rows_uses_the_fullest_slot_for_a_twinned_device() {
         let mut config = MidiConfig::default();
         config.set_pad_notes_for("Twin Pad".into(), 0, default_pad_notes());
-        let mut partial = [0; PADS];
-        partial[0] = 36;
-        config.set_pad_notes_for("Twin Pad".into(), 1, partial);
 
         let row = device_rows(&config).into_iter().find(|r| r.name == "Twin Pad").expect("known row listed");
         assert_eq!(row.mappings, PADS);
@@ -444,16 +444,15 @@ mod tests {
     fn pad_notes_for_slot_is_independent_per_slot() {
         let mut config = MidiConfig::default();
         assert_eq!(config.pad_notes_for("Twin Pad", 0), None);
-        assert_eq!(config.pad_notes_for("Twin Pad", 1), None);
 
         let notes_a = default_pad_notes();
         let notes_b = [1; PADS];
         config.set_pad_notes_for("Twin Pad".into(), 0, notes_a);
-        config.set_pad_notes_for("Twin Pad".into(), 1, notes_b);
 
         assert_eq!(config.pad_notes_for("Twin Pad", 0), Some(notes_a));
-        assert_eq!(config.pad_notes_for("Twin Pad", 1), Some(notes_b));
         assert_eq!(config.pad_notes_for("Other Pad", 0), None, "a different name is a different device");
+        config.set_pad_notes_for("Twin Pad".into(), 1, notes_b);
+        assert_eq!(config.pad_notes_for("Twin Pad", 0), Some(notes_b));
     }
 
     #[test]

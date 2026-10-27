@@ -143,17 +143,18 @@ pub struct Settings {
     pub music_dirs: Vec<PathBuf>,
     /// The active kit's directory name under `kits/`. odj-sampler.
     pub kit: Option<String>,
-    /// The MIDI input port odj-sampler last used, if any.
-    #[serde(alias = "midi_port_id")]
-    pub sampler_midi_port_id: Option<String>,
+    /// The MIDI input odj-sampler last used, by its stable name (see
+    /// `odj_core::midi::stable_name` — not its connection-order port id,
+    /// which can change across a replug). Resolved back to a current port
+    /// id at startup. odj-sampler.
+    #[serde(default)]
+    pub sampler_midi_last: Option<String>,
     /// Each pad's learned MIDI note, per device:
-    /// `sampler_midi_pads[name][slot][i]` for pad `i` — see
-    /// `odj_sampler::midi` for how device/slot keys are chosen. The
-    /// array is sized to odj-sampler's pad count (16) directly rather
-    /// than via its constant, since odj-core doesn't depend on
-    /// odj-sampler. odj-sampler.
-    #[serde(default, alias = "midi_devices")]
-    pub sampler_midi_pads: HashMap<String, Vec<[u8; 16]>>,
+    /// `sampler_midi_controllers[name][pad]` for pad index `pad` (0-15).
+    /// The values use `0` as the "not learned" sentinel for pads that were
+    /// never pressed during [`learn_pad_notes`]. odj-sampler.
+    #[serde(default)]
+    pub sampler_midi_controllers: HashMap<String, std::collections::HashMap<usize, u8>>,
     /// Every MIDI controller odj-mixer's ever learned knob mappings
     /// for, keyed by its stable name (see `odj_core::midi::stable_name`
     /// — not its connection-order port id, which can change across a
@@ -194,8 +195,8 @@ impl Default for Settings {
             loop_beats: 4.0,
             music_dirs: Vec::new(),
             kit: None,
-            sampler_midi_port_id: None,
-            sampler_midi_pads: HashMap::new(),
+            sampler_midi_last: None,
+            sampler_midi_controllers: HashMap::new(),
             mixer_midi_controllers: HashMap::new(),
             mixer_midi_last: None,
             mixer_active_inputs: HashSet::new(),

@@ -444,7 +444,7 @@ impl App {
             Some(conn) => {
                 self.midi_conn = Some(conn);
                 self.midi_device = Some(name.to_string());
-                self.midi.port_id = Some(port_id.to_string());
+                self.midi.last = Some(name.to_string());
                 self.midi.set_pad_notes_for(name.to_string(), slot, notes);
                 let _ = self.midi.save();
                 self.set_status(format!("MIDI: {name}"));
@@ -458,21 +458,15 @@ impl App {
     /// notes are the whole mapping here, so leaving a "forgotten" device
     /// still triggering pads would be misleading.
     fn forget_midi_device(&mut self, name: &str) {
-        if self.midi.devices.remove(name).is_none() {
+        if self.midi.controllers.remove(name).is_none() {
             return;
         }
         if self.midi_device.as_deref() == Some(name) {
             self.midi_conn = None;
             self.midi_device = None;
         }
-        if self
-            .midi
-            .port_id
-            .as_deref()
-            .and_then(odj_core::midi::device_slot)
-            .is_some_and(|(saved, _)| saved == name)
-        {
-            self.midi.port_id = None;
+        if self.midi.last.as_deref() == Some(name) {
+            self.midi.last = None;
         }
         let _ = self.midi.save();
         self.set_status(format!("Forgot MIDI mappings for {name}"));
@@ -2127,14 +2121,16 @@ mod tests {
     fn forget_in_settings_drops_a_devices_learned_pads() {
         with_temp_dirs(|| {
             let mut a = app("settings-forget");
-            a.midi.devices.insert("zzz-not-a-real-pad".into(), vec![[36; PADS]]);
+            let mut cfg = crate::midi::MidiConfig::default();
+            cfg.set_pad_notes_for("zzz-not-a-real-pad".into(), 0, [36; PADS]);
+            a.midi = cfg;
             a.screen = Screen::Settings;
             let rows = a.midi_rows();
             a.settings_selected = rows.iter().position(|r| r.name == "zzz-not-a-real-pad").expect("known row listed");
 
             key(&mut a, 'x', KeyEventKind::Press);
 
-            assert!(a.midi.devices.is_empty(), "the learned pad notes are gone");
+            assert!(a.midi.controllers.is_empty(), "the learned pad notes are gone");
             assert!(a.status().is_some_and(|s| s.contains("Forgot MIDI mappings for zzz-not-a-real-pad")));
         });
     }

@@ -19,6 +19,7 @@ use crate::kit::{Kit, KitPad, PadSource};
 use crate::kit_browser::{self, KitRow};
 use crate::kits;
 use crate::loader::{Done, Failure, Job, Loader};
+use crate::midi::{self, DeviceRow, LearnRequest, MidiConfig};
 use crate::settings;
 use crate::starter_kit;
 
@@ -241,6 +242,11 @@ pub enum Screen {
     /// Naming the kit a change just landed on, so it can actually be
     /// saved — see `App::ensure_kit_dir`/`App::save_kit`. The typed name.
     NamingKit(String),
+    /// Settings (`` ` ``): for now just one MIDI tab, the same
+    /// device list odj-mixer's own Settings shows — see [`crate::ui`]'s
+    /// `draw_settings`. The selected row lives in
+    /// [`App::settings_selected`].
+    Settings,
 }
 
 /// Switching the active kit, or creating a new one — see `kit_browser.rs`
@@ -290,6 +296,18 @@ pub struct App {
     /// Whether the terminal reports key releases (kitty keyboard protocol).
     pub key_release: bool,
     pub output_name: String,
+    /// The MIDI input this app remembers (settings file), whether or not
+    /// it's connected right now.
+    pub midi: MidiConfig,
+    /// The live MIDI connection, if any — kept alive here for as long as
+    /// MIDI input should work. Its device's stable name names it in
+    /// Settings and in the header.
+    pub midi_conn: Option<midir::MidiInputConnection<()>>,
+    pub midi_device: Option<String>,
+    /// Set when Settings picks an unlearned device; `main`'s run loop
+    /// takes it, walks through the pads, and hands the result back.
+    midi_learn: Option<LearnRequest>,
+    pub settings_selected: usize,
     /// Gate pads held without key-release events, and when they time out.
     holds: [Option<Instant>; PADS],
     pub memory: MemoryUse,
@@ -319,6 +337,11 @@ impl App {
             status: None,
             key_release,
             output_name,
+            midi: MidiConfig::default(),
+            midi_conn: None,
+            midi_device: None,
+            midi_learn: None,
+            settings_selected: 0,
             holds: [None; PADS],
             memory: MemoryUse { process: None, system: system_memory() },
             memory_at: None,
@@ -326,6 +349,133 @@ impl App {
         };
         app.load_kit(kit_dir, kit);
         app
+    }
+
+    /// Hands over what `main` restored (or didn't) at startup: the
+    /// remembered MIDI config, plus a live connection if its device was
+    /// plugged in and already learned. No picker — Settings changes it
+    /// later instead.
+    pub fn set_midi(&mut self, config: MidiConfig, restored: Option<(midir::MidiInputConnection<()>, String)>) {
+        self.midi = config;
+        if let Some((conn, name)) = restored {
+            self.midi_conn = Some(conn);
+            self.midi_device = Some(name);
+        }
+    }
+
+    /// Settings' MIDI tab rows — see [`midi::device_rows`].
+    pub fn midi_rows(&self) -> Vec<DeviceRow> {
+        midi::device_rows(&self.midi)
+    }
+
+    /// An unlearned device Settings just picked, for `main`'s run loop to
+    /// walk through with [`midi::learn_pad_notes`] (it owns the terminal).
+    pub fn take_midi_learn(&mut self) -> Option<LearnRequest> {
+        self.midi_learn.take()
+    }
+
+    /// Applies a completed walkthrough: remembers the notes (or, if the
+    /// user cancelled before learning any, leaves everything as it was)
+    /// and connects the device.
+    pub fn finish_midi_learn(&mut self, req: LearnRequest, notes: Option<[u8; PADS]>) {
+        if let Some(notes) = notes {
+            self.connect_midi(&req.port_id, &req.name, req.slot, notes);
+        }
+    }
+
+    fn open_settings(&mut self) {
+        self.screen = Screen::Settings;
+        self.settings_selected = self.settings_selected.min(self.midi_rows().len().saturating_sub(1));
+    }
+
+    /// Settings is one tab (MIDI), so its keys are all here: the same
+    /// list/Enter/X convention odj-mixer's own MIDI tab uses.
+    fn settings_key(&mut self, key: &KeyEvent) {
+        let (code, _) = normalize(key);
+        let rows = self.midi_rows();
+        match code {
+            KeyCode::Esc | KeyCode::Char('`') => {
+                self.screen = Screen::Pads;
+                return;
+            }
+            KeyCode::Up => self.settings_selected = self.settings_selected.saturating_sub(1),
+            KeyCode::Down => self.settings_selected = (self.settings_selected + 1).min(rows.len().saturating_sub(1)),
+            KeyCode::Enter if rows.get(self.settings_selected).is_some_and(|r| r.present) => {
+                let name = rows[self.settings_selected].name.clone();
+                self.use_midi_device(&name);
+            }
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace
+                if rows.get(self.settings_selected).is_some_and(|r| r.mappings > 0) =>
+            {
+                let name = rows[self.settings_selected].name.clone();
+                self.forget_midi_device(&name);
+            }
+            _ => {}
+        }
+        self.settings_selected = self.settings_selected.min(self.midi_rows().len().saturating_sub(1));
+    }
+
+    /// Switches to the present device `name`: connects it straight away if
+    /// its pads were learned before, otherwise asks `main` to walk through
+    /// learning them first.
+    fn use_midi_device(&mut self, name: &str) {
+        let Some(port_id) = odj_core::midi::port_id_for(name) else {
+            self.set_status(format!("MIDI device {name} is not connected"));
+            return;
+        };
+        let Some((name, slot)) = odj_core::midi::device_slot(&port_id) else { return };
+        match self.midi.pad_notes_for(&name, slot) {
+            Some(notes) if self.midi_device.as_deref() != Some(name.as_str()) => {
+                self.connect_midi(&port_id, &name, slot, notes);
+            }
+            Some(_) => {}
+            None => self.midi_learn = Some(LearnRequest { name, slot, port_id }),
+        }
+    }
+
+    /// (Re)opens `port_id` with `notes` and remembers it as the one MIDI
+    /// input to restore next time. Dropping the previous connection first
+    /// matches odj-mixer's own live switching — a connection is tied to one
+    /// specific port and can't simply be redirected.
+    fn connect_midi(&mut self, port_id: &str, name: &str, slot: usize, notes: [u8; PADS]) {
+        self.midi_conn = None;
+        self.midi_device = None;
+        match midi::connect(port_id, self.sampler.clone(), notes) {
+            Some(conn) => {
+                self.midi_conn = Some(conn);
+                self.midi_device = Some(name.to_string());
+                self.midi.port_id = Some(port_id.to_string());
+                self.midi.set_pad_notes_for(name.to_string(), slot, notes);
+                let _ = self.midi.save();
+                self.set_status(format!("MIDI: {name}"));
+            }
+            None => self.set_status(format!("Could not connect MIDI device {name}")),
+        }
+    }
+
+    /// Forgets `name`'s learned pad notes and, if it's the one connected
+    /// right now, stops listening to it too — unlike odj-mixer, the learned
+    /// notes are the whole mapping here, so leaving a "forgotten" device
+    /// still triggering pads would be misleading.
+    fn forget_midi_device(&mut self, name: &str) {
+        if self.midi.devices.remove(name).is_none() {
+            return;
+        }
+        if self.midi_device.as_deref() == Some(name) {
+            self.midi_conn = None;
+            self.midi_device = None;
+        }
+        if self
+            .midi
+            .port_id
+            .as_deref()
+            .and_then(odj_core::midi::device_slot)
+            .is_some_and(|(saved, _)| saved == name)
+        {
+            self.midi.port_id = None;
+        }
+        let _ = self.midi.save();
+        self.set_status(format!("Forgot MIDI mappings for {name}"));
     }
 
     /// Replaces every pad with `kit`'s — shared by the initial load above
@@ -1031,6 +1181,7 @@ impl App {
             Screen::KitBrowser(_) if key.kind != KeyEventKind::Release => self.kit_browser_key(&key),
             Screen::SampleBrowser(_) if key.kind != KeyEventKind::Release => self.sample_browser_key(&key),
             Screen::NamingKit(_) if key.kind != KeyEventKind::Release => self.naming_kit_key(&key),
+            Screen::Settings if key.kind != KeyEventKind::Release => self.settings_key(&key),
             Screen::Pads => {
                 let (code, shift) = normalize(&key);
                 match key.kind {
@@ -1112,6 +1263,7 @@ impl App {
             KeyCode::Delete | KeyCode::Backspace => self.clear_pad(i),
             KeyCode::Char(' ') => self.sampler().stop_all(),
             KeyCode::Char('k') => self.open_kit_browser(),
+            KeyCode::Char('`') => self.open_settings(),
             _ => {}
         }
     }
@@ -1336,6 +1488,24 @@ mod tests {
         let shift = c.is_ascii_uppercase() || "!@#$".contains(c);
         let mods = if shift { KeyModifiers::SHIFT } else { KeyModifiers::NONE };
         app.handle_key(KeyEvent { code: KeyCode::Char(c), modifiers: mods, kind, state: KeyEventState::NONE });
+    }
+
+    fn with_temp_dirs<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-sampler-app-test-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-only, same pattern used throughout this crate's tests.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        let result = f();
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        result
     }
 
     fn source() -> PadSource {
@@ -1912,6 +2082,37 @@ mod tests {
         assert!(!a.help.is_open());
     }
 
+    #[test]
+    fn backtick_opens_settings_and_esc_or_backtick_closes_it() {
+        let mut a = app("settings-keys");
+        key(&mut a, '`', KeyEventKind::Press);
+        assert!(matches!(a.screen, Screen::Settings));
+        key(&mut a, 'q', KeyEventKind::Press);
+        assert!(matches!(a.screen, Screen::Settings), "pad keys don't play under Settings");
+        key(&mut a, '`', KeyEventKind::Press);
+        assert!(matches!(a.screen, Screen::Pads));
+
+        key(&mut a, '`', KeyEventKind::Press);
+        a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(a.screen, Screen::Pads));
+    }
+
+    #[test]
+    fn forget_in_settings_drops_a_devices_learned_pads() {
+        with_temp_dirs(|| {
+            let mut a = app("settings-forget");
+            a.midi.devices.insert("zzz-not-a-real-pad".into(), vec![[36; PADS]]);
+            a.screen = Screen::Settings;
+            let rows = a.midi_rows();
+            a.settings_selected = rows.iter().position(|r| r.name == "zzz-not-a-real-pad").expect("known row listed");
+
+            key(&mut a, 'x', KeyEventKind::Press);
+
+            assert!(a.midi.devices.is_empty(), "the learned pad notes are gone");
+            assert!(a.status().is_some_and(|s| s.contains("Forgot MIDI mappings for zzz-not-a-real-pad")));
+        });
+    }
+
     /// The README's Keys section mirrors the help: the same pages, each with
     /// the same keys.
     #[test]
@@ -2006,6 +2207,7 @@ mod tests {
             kit_browser_deleting,
             sample_browser,
             Screen::NamingKit("Trap".into()),
+            Screen::Settings,
         ];
         for screen in screens {
             a.screen = screen;

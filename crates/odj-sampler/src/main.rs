@@ -52,7 +52,9 @@ fn main() -> Result<()> {
              own Volume/EQ to.\n\
              Kits are folders under {}, each with its own samples; pick one (or create a new\n\
              one) at startup, and press K any time to switch. Optionally triggered by MIDI\n\
-             Note On/Off too, picked at startup; the port and each pad's note are kept in the\n\
+             Note On/Off too: a previously learned device reconnects automatically when it's\n\
+             plugged in, and ` opens Settings to choose another present device (learning its\n\
+             pads on the spot) or forget one. The device and each pad's note are kept in the\n\
              settings file shared with odj-player, {}.",
             kits::kits_dir().display(),
             odj_core::memory::settings_file().display()
@@ -78,31 +80,12 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         return Ok(());
     };
 
+    // No MIDI picker at startup: a remembered device is restored if it's
+    // plugged in and already learned, and Settings (`` ` ``) can switch to
+    // any other present device — learning its pads on the spot — at any
+    // time. The connection is kept alive by `App` for the rest of `start`.
     let mut midi_config = midi::MidiConfig::load();
-    let midi_port = odj_core::midi::pick_midi_input(terminal, midi_config.port_id.as_deref())?;
-    // Kept alive for the rest of `start`, closing automatically when it
-    // returns; `None` (no port picked, or setup below didn't finish) just
-    // means plain keyboard use.
-    let midi_conn = match midi_port.as_deref().and_then(odj_core::midi::device_slot) {
-        Some((name, slot)) => {
-            let id = midi_port.unwrap();
-            midi_config.port_id = Some(id.clone());
-            // A device/slot we haven't seen before: walk the user through
-            // pressing each pad so we learn its notes, rather than assuming
-            // a layout. Unrecognized device, same `None` either way: the
-            // port's gone, or the user cancelled partway through.
-            let pad_notes = match midi_config.pad_notes_for(&name, slot) {
-                Some(notes) => Some(notes),
-                None => midi::learn_pad_notes(terminal, &id)?,
-            };
-            pad_notes.and_then(|notes| {
-                midi_config.set_pad_notes_for(name, slot, notes);
-                let _ = midi_config.save();
-                midi::connect(&id, setup.sampler.clone(), notes)
-            })
-        }
-        None => None,
-    };
+    let midi_restored = midi::restore(&mut midi_config, setup.sampler.clone());
 
     let (kit_dir, kit) = match settings::load_active_kit() {
         Some(dir) => {
@@ -121,8 +104,8 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         },
     };
 
-    let name = format!("{}{}", setup.name, if midi_conn.is_some() { " · MIDI" } else { "" });
-    let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, name);
+    let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, setup.name);
+    app.set_midi(midi_config, midi_restored);
     run(terminal, &mut app, &setup.errors)
 }
 
@@ -203,6 +186,13 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) ->
                     break;
                 }
             }
+        }
+        // Settings picked a device whose pads aren't learned yet: walk
+        // through them here, where drawing a temporary screen is possible,
+        // then let `App` connect it and remember the result.
+        if let Some(req) = app.take_midi_learn() {
+            let notes = midi::learn_pad_notes(terminal, &req.port_id)?;
+            app.finish_midi_learn(req, notes);
         }
     }
     Ok(())

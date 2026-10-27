@@ -6,14 +6,15 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint, tab_span};
 
 use crate::app::{App, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
 use crate::engine::{Mode, PADS, PadState, Snapshot, TAIL};
+use crate::midi::DeviceRow;
 
 const PLAYING: Color = Color::Rgb(60, 220, 100);
 const PLAYING_BG: Color = Color::Rgb(20, 45, 25);
@@ -45,6 +46,9 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_sample_browser(f, b);
     } else if let Screen::NamingKit(name) = &app.screen {
         draw_naming_kit(f, name);
+    } else if let Screen::Settings = &app.screen {
+        let rows = app.midi_rows();
+        draw_settings(f, &rows, app.settings_selected.min(rows.len().saturating_sub(1)), app.midi_device.as_deref());
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -64,7 +68,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     }
     right.push(Span::styled("MEM ", Style::new().fg(DIM)));
     right.push(Span::styled(fmt_bytes(app.sample_bytes() as u64), Style::new().fg(AMBER).bold()));
-    right.push(Span::styled(format!("   {} ", app.output_name), Style::new().fg(DIM)));
+    let midi = if app.midi_device.is_some() { " · MIDI" } else { "" };
+    right.push(Span::styled(format!("   {}{midi} ", app.output_name), Style::new().fg(DIM)));
     f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
 }
 
@@ -149,7 +154,7 @@ fn draw_pad_info(f: &mut Frame, area: Rect, app: &App) {
         Screen::Editor(ed) => ed.pad,
         Screen::Picker(p) => p.pad,
         Screen::SampleBrowser(b) => b.pad,
-        Screen::Pads | Screen::KitBrowser(_) | Screen::NamingKit(_) => app.selected,
+        Screen::Pads | Screen::KitBrowser(_) | Screen::NamingKit(_) | Screen::Settings => app.selected,
     };
     let slot = &app.slots[i];
     let block = Block::bordered()
@@ -246,6 +251,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         Screen::KitBrowser(_) => " ↑↓ select  Enter choose/create  Del delete  Esc cancel",
         Screen::SampleBrowser(_) => " ↑↓ select  Enter choose/open  Esc cancel",
         Screen::NamingKit(_) => " Enter save as this name  Esc leave unsaved for now",
+        Screen::Settings => "",
     };
     if !matches!(app.screen, Screen::Pads) {
         f.render_widget(Paragraph::new(Line::styled(hints, Style::new().fg(DIM))), area);
@@ -253,15 +259,66 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     }
     // Contextual keys left, globals pinned right — mirrors odj-player's
     // `draw_footer`, the formatting every app's footer is meant to
-    // follow; see its own doc comment for the convention itself. No
-    // Settings screen here, so the global group is just help/quit.
+    // follow; see its own doc comment for the convention itself.
     let left = Line::styled(hints, Style::new().fg(DIM));
-    let right = Line::styled("? help  Ctrl+C quit ", Style::new().fg(DIM));
+    let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
     let rw = right.width() as u16;
     let [left_area, _, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
     f.render_widget(Paragraph::new(left), left_area);
     f.render_widget(Paragraph::new(right), right_area);
+}
+
+/// Settings (`` ` ``): one tab, MIDI, with the same list odj-mixer's own
+/// Settings shows and the same `Enter` use / `X` forget convention. The
+/// single tab is still drawn as a tab — not just a title — so it reads as
+/// the same kind of screen as odj-mixer's multi-tab one, and there's room
+/// for more here later without changing the shape.
+fn draw_settings(f: &mut Frame, rows: &[DeviceRow], selected: usize, current: Option<&str>) {
+    let area = centered(f.area(), 70, 70);
+    f.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Settings ")
+        .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
+        .title_bottom(Line::styled(" Enter use  X forget mappings ", Style::new().fg(DIM)).centered())
+        .border_style(Style::new().fg(AMBER));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let [tabs_area, _, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(Line::from(tab_span("MIDI", true))), tabs_area);
+
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new("(no MIDI device used or connected yet)").fg(DIM)]
+    } else {
+        let width = body.width.saturating_sub(2) as usize;
+        rows.iter()
+            .map(|r| {
+                // Same 3-icon convention as odj-mixer's MIDI tab: a
+                // distinct shape for a device known only from its saved
+                // mappings, separate from "present but not the active one".
+                let is_current = current == Some(r.name.as_str());
+                let (icon, icon_color) = match (r.present, is_current) {
+                    (false, _) => ("✕", DIM),
+                    (true, true) => ("●", AMBER),
+                    (true, false) => ("○", DIM),
+                };
+                let mappings = format!("{} mapping{}", r.mappings, if r.mappings == 1 { "" } else { "s" });
+                let pad = width.saturating_sub(r.name.chars().count() + mappings.chars().count() + 2).max(1);
+                ListItem::new(Line::from(vec![
+                    Span::raw(r.name.clone()),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(mappings, Style::new().fg(DIM)),
+                    Span::raw(" "),
+                    Span::styled(icon, Style::new().fg(icon_color)),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, body, &mut state);
 }
 
 fn draw_picker(f: &mut Frame, p: &Picker) {

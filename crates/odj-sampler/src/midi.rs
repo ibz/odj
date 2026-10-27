@@ -2,9 +2,13 @@
 //! so an external sequencer (hardware or software) can drive odj-sampler
 //! instead of — or alongside — the keyboard. Config lives in the shared
 //! settings file (see `odj_core::memory::Settings`'s
-//! `sampler_midi_port_id`/`sampler_midi_pads`). Port listing/picking
-//! and the stable device identity used to key [`MidiConfig::devices`]
-//! live in `odj_core::midi`, shared with odj-mixer's own MIDI knobs.
+//! `sampler_midi_port_id`/`sampler_midi_pads`). Port listing and the
+//! stable device identity used to key [`MidiConfig::devices`] live in
+//! `odj_core::midi`, shared with odj-mixer's own MIDI knobs; the row model
+//! behind Settings' MIDI tab is [`device_rows`] here. Nothing is picked at
+//! startup: a remembered device is restored automatically when it's
+//! plugged in, and Settings (`` ` ``) can switch to any other present
+//! device — or learn a new one — at any time.
 //!
 //! Controllers don't agree on how they number their pads (confirmed on real
 //! hardware: some send a straight ascending range, others group and jump
@@ -72,6 +76,97 @@ impl MidiConfig {
         }
         slots[slot] = notes;
     }
+}
+
+/// One row of Settings' MIDI tab: the union of every device with learned
+/// pad notes (whether or not it's plugged in right now) and every device
+/// currently plugged in that has none yet — so a learned device still
+/// shows up even unplugged, with the option to forget it, while a brand
+/// new one can be picked the moment it's seen. `mappings` is the number of
+/// pads learned on it (0 for a device that's merely present); those are
+/// what `X`/`Delete` forgets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceRow {
+    pub name: String,
+    pub present: bool,
+    pub mappings: usize,
+}
+
+/// Builds the rows Settings' MIDI tab lists — same shape and ordering as
+/// odj-mixer's own controller list (by stable name, known and present
+/// unioned together), just counting learned pads instead of knob mappings.
+pub fn device_rows(config: &MidiConfig) -> Vec<DeviceRow> {
+    let ports = odj_core::midi::list_ports();
+    let mut names: Vec<String> = config.devices.keys().cloned().collect();
+    for (id, label) in &ports {
+        let name = odj_core::midi::stable_name(id, label);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let present = ports.iter().any(|(id, label)| odj_core::midi::stable_name(id, label) == name);
+            // Multiple identical devices are kept apart by slot; showing
+            // the fullest one is the useful figure for "how much of this
+            // device model has been learned" without adding a row per
+            // simultaneously-connected twin.
+            let mappings = config
+                .devices
+                .get(&name)
+                .and_then(|slots| slots.iter().map(|notes| notes.iter().filter(|&&n| n != 0).count()).max())
+                .unwrap_or(0);
+            DeviceRow { name, present, mappings }
+        })
+        .collect()
+}
+
+/// A device whose pads still need learning before it can be connected —
+/// set by Settings' `Enter` and picked up by the main loop, which owns the
+/// terminal [`learn_pad_notes`] needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearnRequest {
+    pub name: String,
+    pub slot: usize,
+    pub port_id: String,
+}
+
+/// Restores the remembered MIDI input at startup, no picker: the saved
+/// `port_id` if it's still plugged in and its pad notes are known,
+/// otherwise the one known device currently present (when there's exactly
+/// one, same tie-break as odj-mixer's own startup). `None` means plain
+/// keyboard use until Settings picks something.
+pub fn restore(
+    config: &mut MidiConfig,
+    sampler: Arc<Mutex<Sampler>>,
+) -> Option<(midir::MidiInputConnection<()>, String)> {
+    if let Some(id) = config.port_id.as_deref()
+        && let Some((name, slot)) = odj_core::midi::device_slot(id)
+        && let Some(notes) = config.pad_notes_for(&name, slot)
+        && let Some(conn) = connect(id, sampler.clone(), notes)
+    {
+        return Some((conn, name));
+    }
+
+    let mut known_present: Vec<(String, String, [u8; PADS])> = odj_core::midi::list_ports()
+        .into_iter()
+        .filter_map(|(id, label)| {
+            let name = odj_core::midi::stable_name(&id, &label);
+            let (_, slot) = odj_core::midi::device_slot(&id)?;
+            let notes = config.pad_notes_for(&name, slot)?;
+            Some((id, name, notes))
+        })
+        .collect();
+    known_present.sort_by(|a, b| a.1.cmp(&b.1));
+    let [(id, name, notes)] = known_present.as_slice() else { return None };
+    let conn = connect(id, sampler, *notes)?;
+    // The port id changed across a replug, but the device itself didn't —
+    // remember its new one so the direct lookup works next time too.
+    config.port_id = Some(id.clone());
+    let _ = config.save();
+    Some((conn, name.clone()))
 }
 
 /// The pad whose entry in `pad_notes` is `note`, if any.
@@ -149,8 +244,7 @@ fn listen_notes(port_id: &str) -> Option<(midir::MidiInputConnection<()>, mpsc::
 /// real note 0, vanishingly unlikely on real pad hardware), returning
 /// `Ok(None)` only if nothing was learned yet either. `Ctrl+C` always
 /// discards the lot instead, same as `Ok(None)` for a port that can't be
-/// opened — the caller treats either the same way `odj_core::midi::
-/// pick_midi_input` skipping is treated.
+/// opened — the caller treats either the same way: nothing changes.
 pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<Option<[u8; PADS]>> {
     let Some((_conn, rx)) = listen_notes(port_id) else { return Ok(None) };
     let mut notes = [0u8; PADS];
@@ -315,6 +409,30 @@ mod tests {
             assert!(!after.auto_cue, "odj-player's fields survived the save");
             assert_eq!(after.music_dirs, vec![std::path::PathBuf::from("/music")]);
         });
+    }
+
+    #[test]
+    fn device_rows_lists_a_known_device_with_its_learned_pad_count() {
+        let mut config = MidiConfig::default();
+        let mut notes = default_pad_notes();
+        notes[7] = 0; // left unlearned after an early Esc
+        config.set_pad_notes_for("zzz-not-a-real-pad".into(), 0, notes);
+
+        let row = device_rows(&config).into_iter().find(|r| r.name == "zzz-not-a-real-pad").expect("known row listed");
+        assert_eq!(row.mappings, PADS - 1, "the 0 sentinel isn't a learned pad");
+        assert!(!row.present, "nothing real is named this");
+    }
+
+    #[test]
+    fn device_rows_uses_the_fullest_slot_for_a_twinned_device() {
+        let mut config = MidiConfig::default();
+        config.set_pad_notes_for("Twin Pad".into(), 0, default_pad_notes());
+        let mut partial = [0; PADS];
+        partial[0] = 36;
+        config.set_pad_notes_for("Twin Pad".into(), 1, partial);
+
+        let row = device_rows(&config).into_iter().find(|r| r.name == "Twin Pad").expect("known row listed");
+        assert_eq!(row.mappings, PADS);
     }
 
     #[test]

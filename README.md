@@ -160,12 +160,18 @@ name it, which creates its folder.
 
 Pads can also be triggered over MIDI — Note On/Off from an external
 sequencer (hardware or software) works exactly like a key press, including
-one-shot/gate/toggle behaviour. At startup, if any MIDI input is available,
-you're asked which one to use (or none). The first time you pick a given
-device, you're walked through pressing each of the 16 pads in order so its
-notes are learned rather than assumed (controllers don't agree on how they
-number pads); after that it's remembered. The chosen port and each device's
-learned notes are kept in the same shared settings file.
+one-shot/gate/toggle behaviour. There's no MIDI picker at startup: a device
+you've already learned reconnects automatically when it's plugged in, and
+plain keyboard use continues if there's nothing to restore. Press `` ` ``
+to open Settings — one **MIDI** tab, the same device list as odj-mixer's
+own Settings — where `↑`/`↓` picks a device and `Enter` switches to it.
+The first time you pick a given device, you're walked through pressing each
+of the 16 pads in order so its notes are learned rather than assumed
+(controllers don't agree on how they number pads); after that it's
+remembered. `X`/`Delete` forgets the selected device's learned pads (`●`
+marks the one connected now, `○` another one that's plugged in, `✕` one
+known only from its saved mappings). The device and each device's learned
+notes are kept in the same shared settings file.
 
 ## odj-downloader
 

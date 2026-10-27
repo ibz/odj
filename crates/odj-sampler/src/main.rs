@@ -15,6 +15,7 @@ mod settings;
 mod starter_kit;
 mod ui;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,8 +51,9 @@ fn main() -> Result<()> {
              odj-mixer is already running, in which case it routes through that instead, no\n\
              picker asked, and odj-mixer discovers it live, labeled \"Sampler\", to apply its\n\
              own Volume/EQ to.\n\
-             Kits are folders under {}, each with its own samples; pick one (or create a new\n\
-             one) at startup, and press K any time to switch. Optionally triggered by MIDI\n\
+             Kits are folders under {}, each with its own samples, plus built-in kits;\n\
+             pick one (or create a new one) at startup when none is remembered, and press\n\
+             K any time to switch. Optionally triggered by MIDI\n\
              Note On/Off too: a previously learned device reconnects automatically when it's\n\
              plugged in, and ` opens Settings to choose another present device (learning its\n\
              pads on the spot) or forget one. The device and each pad's note are kept in the\n\
@@ -88,25 +90,41 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
     let midi_restored = midi::restore(&mut midi_config, setup.sampler.clone());
 
     let (kit_dir, kit) = match settings::load_active_kit() {
-        Some(dir) => {
+        Some(settings::ActiveKit::Saved(dir)) => {
             let kit = Kit::load(&dir.join("kit.json"));
             (Some(dir), kit)
         }
-        None => match kit_browser::pick_initial_kit(terminal)? {
-            kit_browser::MaterializedKit::Saved(dir) => {
-                let kit = Kit::load(&dir.join("kit.json"));
-                let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-                settings::set_active_kit(slug);
-                (Some(dir), kit)
-            }
-            // Nothing written to disk yet — see `App::ensure_kit_dir`.
-            kit_browser::MaterializedKit::Unsaved(kit) => (None, *kit),
+        Some(settings::ActiveKit::Embedded(id)) => match kit_browser::embedded_kit(&id) {
+            Some(kit) => (None, kit),
+            // That built-in kit no longer exists in this version: fall back
+            // to the picker rather than starting with nothing.
+            None => pick_and_remember_kit(terminal)?,
         },
+        None => pick_and_remember_kit(terminal)?,
     };
 
     let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, setup.name);
     app.set_midi(midi_config, midi_restored);
     run(terminal, &mut app, &setup.errors)
+}
+
+/// Runs the one-time kit picker and remembers what it returned for the
+/// next start. Embedded picks are remembered by id without creating a
+/// kit directory; saved/new ones by slug.
+fn pick_and_remember_kit(terminal: &mut DefaultTerminal) -> Result<(Option<PathBuf>, Kit)> {
+    match kit_browser::pick_initial_kit(terminal)? {
+        kit_browser::MaterializedKit::Saved(dir) => {
+            let kit = Kit::load(&dir.join("kit.json"));
+            let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+            settings::set_active_kit(slug);
+            Ok((Some(dir), kit))
+        }
+        // Nothing written to disk yet — see `App::ensure_kit_dir`.
+        kit_browser::MaterializedKit::Embedded { id, kit } => {
+            settings::set_active_embedded_kit(&id);
+            Ok((None, *kit))
+        }
+    }
 }
 
 /// The usual path: pick a real output and play straight to it, same as

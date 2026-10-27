@@ -147,7 +147,8 @@ properties, and the samples themselves — each its own self-contained
 folder under `~/.local/share/odj/kits/<name>/` (a `kit.json` plus its
 `samples/`). Press `K` any time to switch kits or create a new, empty one;
 odj-sampler remembers the last one used (in the settings file shared with
-odj-player, `~/.config/odj/settings.json`) and loads it directly next time. On first run, with no kit yet, the same
+odj-player, `~/.config/odj/settings.json`) and loads it directly next time —
+including the built-in kit below. On first run, with no kit yet, the same
 browser offers "Acoustic (Embedded)", a small kit built into the binary
 (works offline, no setup) — picking it doesn't create a kit folder either,
 until it's actually changed, same as above — fuller kits downloaded from

@@ -510,13 +510,21 @@ impl App {
     /// Switches to `kit`, but with no directory of its own yet — nothing
     /// is written to disk until the first real change asks for a name
     /// (see [`Self::save_kit`], [`Self::ensure_kit_dir`]) and creates one.
-    /// Used both for a fresh, nameless kit (`Kit::default()`) and for the
-    /// embedded kit (already named, its pads already pointing at the
-    /// binary's bundled assets — see `kit_browser::MaterializedKit`).
+    /// Used for a fresh, nameless kit (`Kit::default()`).
     fn switch_to_unsaved_kit(&mut self, kit: Kit) {
         self.sampler().stop_all();
         self.load_kit(None, kit);
         settings::set_active_kit(None);
+    }
+
+    /// Switches to built-in kit `id` and remembers that choice, so the next
+    /// start loads it directly instead of showing the kit browser. It
+    /// still has no directory of its own; the first real change asks for
+    /// a name and turns it into a saved kit, replacing this marker.
+    fn switch_to_embedded_kit(&mut self, id: &str, kit: Kit) {
+        self.sampler().stop_all();
+        self.load_kit(None, kit);
+        settings::set_active_embedded_kit(id);
     }
 
     fn sampler(&self) -> MutexGuard<'_, Sampler> {
@@ -778,8 +786,8 @@ impl App {
                 self.switch_kit(dir);
                 self.screen = Screen::Pads;
             }
-            Action::Switch(kit_browser::MaterializedKit::Unsaved(kit)) => {
-                self.switch_to_unsaved_kit(*kit);
+            Action::Switch(kit_browser::MaterializedKit::Embedded { id, kit }) => {
+                self.switch_to_embedded_kit(&id, *kit);
                 self.screen = Screen::Pads;
             }
             Action::Cancel => self.screen = Screen::Pads,
@@ -1354,17 +1362,24 @@ fn build_browser_entries(dir: &std::path::Path) -> Vec<BrowserEntry> {
     let mut entries = Vec::new();
     if dir == kits::kits_dir() {
         entries.extend(kits::list_kits().into_iter().map(|(d, name)| BrowserEntry::Kit(d, name)));
-        // Always reachable here too, even though it's never a real, listed
-        // kit on its own (see `kit_browser::embedded_cache_dir`) — picking
-        // a sample from it still copies into the active kit as usual.
-        entries.push(BrowserEntry::Kit(kit_browser::embedded_cache_dir(), kit_browser::EMBEDDED_NAME.to_string()));
+        // Always reachable here too, even though they're never real, listed
+        // kits on their own (see `kit_browser::embedded_cache_dir`) — picking
+        // a sample from one still copies into the active kit as usual.
+        entries.extend(
+            kit_browser::embedded_kits()
+                .iter()
+                .map(|kit| BrowserEntry::Kit(kit_browser::embedded_cache_dir(kit.id), kit.name.to_string())),
+        );
     } else {
         entries.push(BrowserEntry::Up);
-        // The embedded kit's files are only written on first visit, same
-        // as `materialize_embedded` already does for picking it from the
-        // kit browser (it's a cheap no-op once they're already there).
-        if dir == kit_browser::embedded_cache_dir().join("samples") {
-            starter_kit::materialize_embedded(dir);
+        // An embedded kit's files are only written on first visit, same as
+        // `materialize_embedded` already does for picking it from the kit
+        // browser (it's a cheap no-op once they're already there).
+        if let Some(embedded) = kit_browser::embedded_kits()
+            .iter()
+            .find(|kit| dir == kit_browser::embedded_cache_dir(kit.id).join("samples"))
+        {
+            starter_kit::materialize_embedded(embedded.id, dir);
         }
         if let Ok(read) = std::fs::read_dir(dir) {
             let mut samples: Vec<PathBuf> = read
@@ -1782,16 +1797,25 @@ mod tests {
         let starter = kits::create_kit("Starter").unwrap();
         let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter), Kit::default(), true, String::new());
 
-        let Some(kit_browser::MaterializedKit::Unsaved(kit)) = kit_browser::materialize_local(&KitRow::Embedded, None) else {
+        let embedded = &kit_browser::embedded_kits()[0];
+        let Some(kit_browser::MaterializedKit::Embedded { id, kit }) =
+            kit_browser::materialize_local(&KitRow::Embedded(embedded), None)
+        else {
             panic!("picking Embedded is never a saved kit");
         };
+        assert_eq!(id, embedded.id);
         assert_eq!(kit.name, "Acoustic (Embedded)");
         assert!(kit.pads[0].source.is_some(), "the embedded pads are already filled");
-        a.switch_to_unsaved_kit(*kit);
+        a.switch_to_embedded_kit(&id, *kit);
 
         assert_eq!(a.kit_dir, None, "nothing kit-shaped on disk yet");
         assert_eq!(a.kit_name, "Acoustic (Embedded)");
         assert_eq!(kits::list_kits().len(), 1, "only Starter — not a real, listed kit until it's changed");
+        assert_eq!(
+            settings::load_active_kit(),
+            Some(settings::ActiveKit::Embedded(embedded.id.into())),
+            "the choice is remembered by id for next startup"
+        );
 
         // Press pad 1: playing it doesn't count as "changing" the kit.
         key(&mut a, '1', KeyEventKind::Press);
@@ -1889,8 +1913,10 @@ mod tests {
         a.handle_key(press(KeyCode::Enter)); // Up -> the list of kits
         let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
         assert_eq!(browser.dir, kits::kits_dir());
+        let embedded = &kit_browser::embedded_kits()[0];
+        let embedded_dir = kit_browser::embedded_cache_dir(embedded.id);
         let embedded_at = browser.entries.iter().position(|e| {
-            matches!(e, BrowserEntry::Kit(d, name) if d == &kit_browser::embedded_cache_dir() && name == kit_browser::EMBEDDED_NAME)
+            matches!(e, BrowserEntry::Kit(d, name) if d == &embedded_dir && name == embedded.name)
         });
         assert!(embedded_at.is_some(), "the embedded kit is reachable here even with no real kit directory");
         assert_eq!(kits::list_kits().len(), 1, "...and still isn't a real, listed kit — just Kit A");
@@ -1900,7 +1926,7 @@ mod tests {
         }
         a.handle_key(press(KeyCode::Enter)); // descend into it — materializes the assets on first visit
         let Screen::SampleBrowser(browser) = &a.screen else { panic!("expected the sample browser") };
-        assert_eq!(browser.dir, kit_browser::embedded_cache_dir().join("samples"));
+        assert_eq!(browser.dir, embedded_dir.join("samples"));
         assert!(
             browser.entries.iter().any(|e| matches!(e, BrowserEntry::Sample(p) if p.extension().is_some_and(|e| e == "wav"))),
             "the embedded .wav files are listed, not empty"
@@ -2177,13 +2203,14 @@ mod tests {
         };
         ed.set_len(16.0 * ed.beat().unwrap());
 
+        let embedded = &kit_browser::embedded_kits()[0];
         let kit_browser = Screen::KitBrowser(KitBrowserState {
-            rows: vec![kit_browser::KitRow::Embedded, kit_browser::KitRow::CreateNew],
+            rows: vec![kit_browser::KitRow::Embedded(embedded), kit_browser::KitRow::CreateNew],
             selected: 0,
             mode: KitBrowserMode::List,
         });
         let kit_browser_naming = Screen::KitBrowser(KitBrowserState {
-            rows: vec![kit_browser::KitRow::Embedded, kit_browser::KitRow::CreateNew],
+            rows: vec![kit_browser::KitRow::Embedded(embedded), kit_browser::KitRow::CreateNew],
             selected: 1,
             mode: KitBrowserMode::Naming("My New Kit".into()),
         });
@@ -2275,7 +2302,7 @@ mod tests {
             rows: vec![
                 kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/trap"), "Trap Essentials".into()),
                 kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/latin"), "Latin Percussion".into()),
-                kit_browser::KitRow::Embedded,
+                kit_browser::KitRow::Embedded(&kit_browser::embedded_kits()[0]),
                 kit_browser::KitRow::CreateNew,
             ],
             selected: 0,

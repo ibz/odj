@@ -1,4 +1,4 @@
-//! Choosing which kit is active: an existing kit, the built-in Embedded
+//! Choosing which kit is active: an existing kit, a built-in Embedded
 //! kit, a kit from the `odj-kits` manifest, or creating a new empty one.
 //!
 //! [`pick_initial_kit`] is the blocking, mandatory bootstrap picker used
@@ -26,68 +26,69 @@ use crate::kit::Kit;
 use crate::kits;
 use crate::starter_kit::{self, KitEntry};
 
-/// The embedded kit's name, both for its label in the list and (once it's
-/// actually saved — see [`materialize_local`]) the `Kit.name` it's given.
-pub const EMBEDDED_NAME: &str = "Acoustic (Embedded)";
+/// Every kit built into the binary, in the order the pickers list them.
+pub fn embedded_kits() -> &'static [starter_kit::EmbeddedKit] {
+    starter_kit::embedded_kits()
+}
 
-/// Where the embedded kit's assets live once materialized — shaped like a
+/// Where an embedded kit's assets live once materialized — shaped like a
 /// real kit directory (a `samples/` folder) so the sample browser's
 /// "browse another kit" navigation can reach it (see `app.rs`'s
 /// `build_browser_entries`), but with no `kit.json` of its own, so
 /// `kits::list_kits()` never lists it as a real, switchable kit.
-pub fn embedded_cache_dir() -> PathBuf {
-    kits::kits_dir().join(".embedded")
+pub fn embedded_cache_dir(id: &str) -> PathBuf {
+    kits::kits_dir().join(".embedded").join(id)
 }
 
 pub enum KitRow {
     Existing(PathBuf, String),
-    Embedded,
+    Embedded(&'static starter_kit::EmbeddedKit),
     Remote(KitEntry),
     CreateNew,
 }
 
-/// What picking a row produces: a real kit already on disk, or (just the
-/// built-in kit, for now) one that only exists in memory so far — nothing
-/// is written until it's actually changed, see `App::ensure_kit_dir`.
+/// What picking a row produces: a real kit already on disk, or a built-in
+/// kit that only exists in memory so far — nothing is written until it's
+/// actually changed, see `App::ensure_kit_dir`.
 pub enum MaterializedKit {
     Saved(PathBuf),
-    Unsaved(Box<Kit>),
+    Embedded { id: String, kit: Box<Kit> },
 }
 
 impl KitRow {
     pub fn label(&self) -> String {
         match self {
             KitRow::Existing(_, name) => name.clone(),
-            KitRow::Embedded => EMBEDDED_NAME.to_string(),
+            KitRow::Embedded(kit) => kit.name.to_string(),
             KitRow::Remote(entry) => entry.name.clone(),
             KitRow::CreateNew => "Create new kit…".to_string(),
         }
     }
 
-    /// A distinguishing color for this row in the list — just the built-in
-    /// kit, for now, so it stands out as the always-available option.
+    /// A distinguishing color for this row in the list — the built-in
+    /// kits stand out as the always-available options.
     pub fn color(&self) -> Option<Color> {
         match self {
-            KitRow::Embedded => Some(Color::Cyan),
+            KitRow::Embedded(_) => Some(Color::Cyan),
             _ => None,
         }
     }
 
     pub fn detail(&self) -> String {
         match self {
-            KitRow::Existing(..) | KitRow::Embedded => String::new(),
+            KitRow::Existing(..) | KitRow::Embedded(_) => String::new(),
             KitRow::Remote(entry) => format!("{} — {}", entry.license, entry.credit),
             KitRow::CreateNew => "Starts with all 16 pads empty.".to_string(),
         }
     }
 }
 
-/// Existing kits, the built-in kit, optionally the manifest's kits (a
+/// Existing kits, the built-in kits, optionally the manifest's kits (a
 /// network fetch — only worth it for the one-time bootstrap picker, not
 /// every time the in-app browser opens), and "create new" last.
 pub fn build_rows(include_remote: bool) -> Vec<KitRow> {
     let mut rows: Vec<KitRow> = kits::list_kits().into_iter().map(|(dir, name)| KitRow::Existing(dir, name)).collect();
-    rows.push(KitRow::Embedded);
+    rows.extend(embedded_kits().iter().map(KitRow::Embedded));
     if include_remote && let Some(manifest) = starter_kit::fetch_manifest() {
         rows.extend(manifest.kits.into_iter().map(KitRow::Remote));
     }
@@ -101,7 +102,10 @@ pub fn build_rows(include_remote: bool) -> Vec<KitRow> {
 pub fn materialize_local(row: &KitRow, name: Option<&str>) -> Option<MaterializedKit> {
     match row {
         KitRow::Existing(dir, _) => Some(MaterializedKit::Saved(dir.clone())),
-        KitRow::Embedded => Some(MaterializedKit::Unsaved(Box::new(embedded_kit()))),
+        KitRow::Embedded(embedded) => {
+            let kit = embedded_kit(embedded.id)?;
+            Some(MaterializedKit::Embedded { id: embedded.id.to_string(), kit: Box::new(kit) })
+        }
         KitRow::CreateNew => {
             let name = name?.trim();
             if name.is_empty() {
@@ -113,14 +117,16 @@ pub fn materialize_local(row: &KitRow, name: Option<&str>) -> Option<Materialize
     }
 }
 
-/// Builds the embedded kit from the binary's bundled assets, written into
-/// [`embedded_cache_dir`] rather than a new kit directory of its own.
-/// Picking this doesn't write anything kit-shaped to disk until it's
+/// Builds the embedded kit `id` from the binary's bundled assets, written
+/// into [`embedded_cache_dir`] rather than a new kit directory of its own.
+/// Picking it doesn't write anything kit-shaped to disk until it's
 /// actually changed (see `App::ensure_kit_dir`), at which point the pads
 /// built here get saved under a real kit directory for the first time.
-fn embedded_kit() -> Kit {
-    let files = starter_kit::materialize_embedded(&embedded_cache_dir().join("samples"));
-    starter_kit::build_kit(EMBEDDED_NAME, &files)
+/// `None` for an id that isn't one of the built-in kits.
+pub fn embedded_kit(id: &str) -> Option<Kit> {
+    let embedded = starter_kit::embedded_kit(id)?;
+    let files = starter_kit::materialize_embedded(id, &embedded_cache_dir(id).join("samples"));
+    Some(starter_kit::build_kit(embedded.name, &files))
 }
 
 enum Mode {
@@ -154,7 +160,14 @@ pub fn pick_initial_kit(terminal: &mut DefaultTerminal) -> Result<MaterializedKi
                 KeyCode::Enter => match &rows[selected] {
                     KitRow::CreateNew => mode = Mode::Naming(String::new()),
                     KitRow::Existing(dir, _) => return Ok(MaterializedKit::Saved(dir.clone())),
-                    KitRow::Embedded => return Ok(MaterializedKit::Unsaved(Box::new(embedded_kit()))),
+                    KitRow::Embedded(embedded) => {
+                        if let Some(kit) = embedded_kit(embedded.id) {
+                            return Ok(MaterializedKit::Embedded {
+                                id: embedded.id.to_string(),
+                                kit: Box::new(kit),
+                            });
+                        }
+                    }
                     KitRow::Remote(entry) => {
                         let entry = entry.clone();
                         let dir = kits::create_kit(&entry.name)?;

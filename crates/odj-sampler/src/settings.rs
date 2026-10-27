@@ -10,13 +10,34 @@ use odj_core::memory::{load_settings, save_settings};
 
 use crate::kits::kits_dir;
 
-/// The active kit's directory, if the shared settings name one and that
-/// kit's `kit.json` still exists — `None` covers both "never set" and
-/// "set, but since deleted," so the caller always ends up offering a kit
-/// to pick.
-pub fn load_active_kit() -> Option<PathBuf> {
-    let dir = kits_dir().join(load_settings().kit?);
-    dir.join("kit.json").is_file().then_some(dir)
+/// Prefix for the shared settings' `kit` field when the active kit is one
+/// of the built-in kits, followed by its stable id. It can't collide with
+/// a real kit slug, which is only ASCII alphanumerics and `-` (see
+/// `kits::slugify`).
+const EMBEDDED_KIT_PREFIX: &str = "@embedded:";
+
+/// What the settings say is active: a real kit directory, or a built-in
+/// kit id (which has no directory of its own until it's changed and saved).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActiveKit {
+    Saved(PathBuf),
+    Embedded(String),
+}
+
+/// The active kit, if the shared settings name one and it's still
+/// available — `None` covers both "never set" and "set, but since
+/// deleted," so the caller always ends up offering a kit to pick. Embedded
+/// ids aren't checked against the current built-in list here; the caller
+/// does that and falls back to the picker for an unknown one.
+pub fn load_active_kit() -> Option<ActiveKit> {
+    let slug = load_settings().kit?;
+    if let Some(id) = slug.strip_prefix(EMBEDDED_KIT_PREFIX)
+        && !id.is_empty()
+    {
+        return Some(ActiveKit::Embedded(id.to_owned()));
+    }
+    let dir = kits_dir().join(slug);
+    dir.join("kit.json").is_file().then_some(ActiveKit::Saved(dir))
 }
 
 /// Sets (or, with `None`, clears) the active kit, leaving every other
@@ -25,6 +46,11 @@ pub fn set_active_kit(slug: Option<String>) {
     let mut settings = load_settings();
     settings.kit = slug;
     let _ = save_settings(&settings);
+}
+
+/// Remembers one of the built-in kits by its stable id.
+pub fn set_active_embedded_kit(id: &str) {
+    set_active_kit(Some(format!("{EMBEDDED_KIT_PREFIX}{id}")));
 }
 
 #[cfg(test)]
@@ -56,6 +82,15 @@ mod tests {
     }
 
     #[test]
+    fn embedded_marker_carries_its_id_and_needs_no_directory() {
+        with_temp_dirs(|| {
+            set_active_embedded_kit("acoustic");
+            assert_eq!(load_active_kit(), Some(ActiveKit::Embedded("acoustic".into())));
+            assert_eq!(load_settings().kit.as_deref(), Some("@embedded:acoustic"));
+        });
+    }
+
+    #[test]
     fn set_active_kit_preserves_the_rest_of_the_shared_settings() {
         with_temp_dirs(|| {
             let mut settings = load_settings();
@@ -71,7 +106,7 @@ mod tests {
             assert!(!after.auto_cue, "odj-player's fields survived the save");
             assert_eq!(after.music_dirs, vec![PathBuf::from("/music")]);
 
-            assert_eq!(load_active_kit(), Some(kits_dir().join("my-kit")));
+            assert_eq!(load_active_kit(), Some(ActiveKit::Saved(kits_dir().join("my-kit"))));
         });
     }
 }

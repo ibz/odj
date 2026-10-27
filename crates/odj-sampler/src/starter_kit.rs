@@ -46,9 +46,17 @@ struct EmbeddedFile {
     bytes: &'static [u8],
 }
 
+/// One of the kits built into the binary. `id` is persisted in the shared
+/// settings file, so it must stay stable even if `name` changes.
+pub struct EmbeddedKit {
+    pub id: &'static str,
+    pub name: &'static str,
+    files: &'static [EmbeddedFile],
+}
+
 /// A handful of pads, not all 16 — enough to be immediately playable with
 /// zero network and zero setup. See `crates/odj-sampler/assets/starter/`.
-const EMBEDDED: &[EmbeddedFile] = &[
+const ACOUSTIC_FILES: &[EmbeddedFile] = &[
     EmbeddedFile { name: "kick.wav", bytes: include_bytes!("../assets/starter/kick.wav") },
     EmbeddedFile { name: "snare.wav", bytes: include_bytes!("../assets/starter/snare.wav") },
     EmbeddedFile { name: "hihat_closed.wav", bytes: include_bytes!("../assets/starter/hihat_closed.wav") },
@@ -58,6 +66,18 @@ const EMBEDDED: &[EmbeddedFile] = &[
     EmbeddedFile { name: "crash.wav", bytes: include_bytes!("../assets/starter/crash.wav") },
     EmbeddedFile { name: "clap.wav", bytes: include_bytes!("../assets/starter/clap.wav") },
 ];
+
+const EMBEDDED_KITS: &[EmbeddedKit] = &[EmbeddedKit { id: "acoustic", name: "Acoustic (Embedded)", files: ACOUSTIC_FILES }];
+
+/// Every kit built into this binary, in the order the pickers list them.
+pub fn embedded_kits() -> &'static [EmbeddedKit] {
+    EMBEDDED_KITS
+}
+
+/// The embedded kit with `id`, if it's still one of the built-in ones.
+pub fn embedded_kit(id: &str) -> Option<&'static EmbeddedKit> {
+    EMBEDDED_KITS.iter().find(|kit| kit.id == id)
+}
 
 enum DownloadMsg {
     Progress(usize, usize),
@@ -202,13 +222,15 @@ fn pad_title(file_name: &str) -> String {
     file_name.strip_suffix(".wav").unwrap_or(file_name).replace('_', " ")
 }
 
-/// Writes the embedded WAVs into `dir` once (skipped if already there) so
-/// [`decode`] has a real path to read, same as a downloaded kit's files.
-pub fn materialize_embedded(dir: &Path) -> Vec<(PathBuf, String)> {
+/// Writes the embedded WAVs for `id` into `dir` once (skipped if already
+/// there) so [`decode`] has a real path to read, same as a downloaded
+/// kit's files. Unknown ids produce no files.
+pub fn materialize_embedded(id: &str, dir: &Path) -> Vec<(PathBuf, String)> {
+    let Some(kit) = embedded_kit(id) else { return Vec::new() };
     if std::fs::create_dir_all(dir).is_err() {
         return Vec::new();
     }
-    EMBEDDED
+    kit.files
         .iter()
         .filter_map(|file| {
             let path = dir.join(file.name);
@@ -298,9 +320,19 @@ mod tests {
     #[test]
     fn embedded_kit_builds_without_network() {
         let dir = std::env::temp_dir().join(format!("odj-starter-embedded-{}", std::process::id()));
-        let kit = build_kit("Embedded", &materialize_embedded(&dir));
+        let kit = build_kit("Embedded", &materialize_embedded("acoustic", &dir));
         assert!(kit.pads[0].source.is_some(), "the embedded kit should decode and fill its pads");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embedded_kits_have_unique_safe_ids() {
+        let mut ids: Vec<&str> = embedded_kits().iter().map(|kit| kit.id).collect();
+        assert!(ids.iter().all(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')));
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
     }
 
     #[test]

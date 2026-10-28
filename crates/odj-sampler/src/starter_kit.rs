@@ -256,9 +256,6 @@ pub fn build_kit(name: &str, files: &[(PathBuf, String)]) -> Kit {
                 title: title.clone(),
                 artist: None,
                 sample_rate: decoded.sample_rate,
-                cue: "kit".into(),
-                start: 0.0,
-                end: (decoded.samples.len() / 2) as f64,
             }),
             props: Props::default(),
         };
@@ -291,9 +288,6 @@ mod tests {
         let first = kit.pads[0].source.as_ref().expect("decodable file fills its pad");
         assert_eq!(first.path, good);
         assert_eq!(first.title, "Good");
-        assert_eq!(first.start, 0.0);
-        assert_eq!(first.cue, "kit");
-        assert!(first.end > 0.0, "end should be the file's full length in frames");
 
         assert!(kit.pads[1].source.is_none(), "a file that fails to decode leaves its pad empty");
         assert!(kit.pads[2].source.is_none(), "pads past the given files stay empty");

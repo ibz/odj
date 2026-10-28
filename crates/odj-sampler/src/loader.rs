@@ -91,5 +91,7 @@ fn run(source: &PadSource, cache: &mut Option<(PathBuf, Decoded)>, out_rate: u32
     if d.id != source.track_id || d.sample_rate != source.sample_rate {
         return Err(Failure::Changed);
     }
-    Ok(cut(&d.samples, d.sample_rate, source.start, source.end, out_rate))
+    // The file already holds exactly the pad's region — the whole thing.
+    let total = (d.samples.len() / 2) as f64;
+    Ok(cut(&d.samples, d.sample_rate, 0.0, total, out_rate))
 }

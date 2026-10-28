@@ -10,10 +10,10 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widge
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint, tab_span};
+use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint, tab_span, wrap};
 
-use crate::app::{App, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
-use crate::engine::{Mode, PADS, PadState, Snapshot, TAIL};
+use crate::app::{App, AudioRoute, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
+use crate::engine::{Mode, PadState, Snapshot, TAIL};
 use crate::midi::DeviceRow;
 
 const PLAYING: Color = Color::Rgb(60, 220, 100);
@@ -55,22 +55,21 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let used = app.slots.iter().filter(|s| s.kit.source.is_some()).count();
-    let left = vec![
-        Span::styled(" ODJ SAMPLER ", Style::new().fg(Color::Black).bg(AMBER).bold()),
-        Span::styled(format!("  {used}/{PADS} pads"), Style::new().fg(DIM)),
-    ];
+    let badge = Style::new().fg(Color::Black).bg(AMBER).bold();
+    let mut left = vec![Span::styled(" ODJ SAMPLER ", badge)];
+    match &app.output {
+        AudioRoute::Mixer => {
+            left.push(Span::styled(" → ", Style::new().fg(DIM)));
+            left.push(Span::styled(" ODJ MIXER ", badge));
+        }
+        AudioRoute::Direct(name) => left.push(Span::styled(format!(" → {name}"), Style::new().fg(DIM))),
+    }
     f.render_widget(Paragraph::new(Line::from(left)), area);
 
-    let mut right = Vec::new();
     if !app.key_release {
-        right.push(Span::styled("no key-release events: gate pads are timed  ", Style::new().fg(Color::Yellow)));
+        let right = Span::styled("no key-release events: gate pads are timed  ", Style::new().fg(Color::Yellow));
+        f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
     }
-    right.push(Span::styled("MEM ", Style::new().fg(DIM)));
-    right.push(Span::styled(fmt_bytes(app.sample_bytes() as u64), Style::new().fg(AMBER).bold()));
-    let midi = if app.midi_device.is_some() { " · MIDI" } else { "" };
-    right.push(Span::styled(format!("   {}{midi} ", app.output_name), Style::new().fg(DIM)));
-    f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
 }
 
 fn draw_grid(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
@@ -79,12 +78,38 @@ fn draw_grid(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         let cols = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(*row);
         for (c, cell) in cols.iter().enumerate() {
             let i = r * 4 + c;
-            draw_pad(f, *cell, i, &app.slots[i], s.pads[i], i == app.selected);
+            draw_pad(f, *cell, i, &app.slots[i], s.pads[i], i == app.selected, app.out_rate());
         }
     }
 }
 
-fn draw_pad(f: &mut Frame, area: Rect, i: usize, slot: &Slot, state: PadState, selected: bool) {
+/// Each digit as 5 rows of a 3-column dot pattern — same font as MIDI learn screen.
+const PAD_DIGIT_FONT: [[&str; 5]; 10] = [
+    ["###", "# #", "# #", "# #", "###"],
+    ["  #", "  #", "  #", "  #", "  #"],
+    ["###", "  #", "###", "#  ", "###"],
+    ["###", "  #", "###", "  #", "###"],
+    ["# #", "# #", "###", "  #", "  #"],
+    ["###", "#  ", "###", "  #", "###"],
+    ["###", "#  ", "###", "# #", "###"],
+    ["###", "  #", "  #", "  #", "  #"],
+    ["###", "# #", "###", "# #", "###"],
+    ["###", "# #", "###", "  #", "###"],
+];
+
+/// `n`'s digits (the pad number, 1–16) as 5 rows.
+fn big_number(n: usize) -> [String; 5] {
+    let digits: Vec<usize> = n.to_string().chars().filter_map(|c| c.to_digit(10)).map(|d| d as usize).collect();
+    std::array::from_fn(|row| {
+        digits
+            .iter()
+            .map(|&d| PAD_DIGIT_FONT[d][row].chars().map(|c| if c == '#' { "██" } else { "  " }).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("  ")
+    })
+}
+
+fn draw_pad(f: &mut Frame, area: Rect, i: usize, slot: &Slot, state: PadState, selected: bool, out_rate: u32) {
     let key = PAD_KEYS[i].to_ascii_uppercase();
     let border = if selected {
         Style::new().fg(AMBER).bold()
@@ -96,8 +121,7 @@ fn draw_pad(f: &mut Frame, area: Rect, i: usize, slot: &Slot, state: PadState, s
         Style::new().fg(DIM)
     };
     let mut block = Block::bordered()
-        .title(format!(" {key} "))
-        .title(Line::from(format!(" {} ", i + 1)).right_aligned())
+        .title(Span::styled(format!(" {key} "), Style::new().fg(Color::Gray).bold()))
         .border_style(border);
     if state.playing {
         block = block.style(Style::new().bg(PLAYING_BG));
@@ -105,14 +129,27 @@ fn draw_pad(f: &mut Frame, area: Rect, i: usize, slot: &Slot, state: PadState, s
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if inner.height >= 6 {
+        let big = big_number(i + 1);
+        let color = if slot.kit.source.is_some() { AMBER } else { DIM };
+        for (r, rowstr) in big.iter().enumerate() {
+            f.render_widget(
+                Paragraph::new(Line::styled(rowstr.clone(), Style::new().fg(color))).alignment(Alignment::Center),
+                Rect { x: inner.x, y: inner.y + r as u16, width: inner.width, height: 1 },
+            );
+        }
+    }
+
     let Some(src) = &slot.kit.source else {
-        f.render_widget(Paragraph::new("—").fg(DIM).alignment(Alignment::Center), inner);
+        if inner.height < 6 {
+            f.render_widget(Paragraph::new("—").fg(DIM).alignment(Alignment::Center), inner);
+        }
         return;
     };
     let props = slot.kit.props;
     let mut lines = vec![
         Line::from(Span::styled(src.title.clone(), Style::new().bold())),
-        Line::from(Span::styled(format!("{} · {:.2} s", src.cue, src.seconds()), Style::new().fg(Color::Gray))),
+        Line::from(Span::styled(format!("{:.2} s", slot.frames as f64 / out_rate as f64), Style::new().fg(Color::Gray))),
     ];
     let status = match &slot.status {
         PadStatus::Ready | PadStatus::Empty => None,
@@ -138,7 +175,12 @@ fn draw_pad(f: &mut Frame, area: Rect, i: usize, slot: &Slot, state: PadState, s
     flags.push(Span::raw("  "));
     flags.push(status.unwrap_or_else(|| Span::styled(fmt_bytes(slot.bytes as u64), Style::new().fg(DIM))));
     lines.push(Line::from(flags));
-    f.render_widget(Paragraph::new(lines), inner);
+    let text_area = if inner.height >= 6 {
+        Rect { x: inner.x, y: inner.y + 5, width: inner.width, height: inner.height.saturating_sub(5) }
+    } else {
+        inner
+    };
+    f.render_widget(Paragraph::new(lines), text_area);
 
     // Progress along the bottom row while playing.
     if state.playing && inner.height >= 4 {
@@ -158,18 +200,34 @@ fn draw_pad_info(f: &mut Frame, area: Rect, app: &App) {
     };
     let slot = &app.slots[i];
     let block = Block::bordered()
-        .title(format!(" Pad {} · key {} ", i + 1, PAD_KEYS[i].to_ascii_uppercase()))
+        .title(Line::from(vec![
+            Span::styled(" ", Style::new().fg(DIM)),
+            Span::styled(PAD_KEYS[i].to_ascii_uppercase().to_string(), Style::new().fg(Color::Gray).bold()),
+            Span::styled(format!(" Pad {} ", i + 1), Style::new().fg(DIM)),
+        ]))
         .border_style(Style::new().fg(DIM));
     let label = |k: &str| Span::styled(format!("{k:<10}"), Style::new().fg(DIM));
+    let key = |k: &str| Span::styled(format!("{k:<10}"), Style::new().fg(Color::Gray));
+    let ctrl = |k: &str, name: &str, value: Span<'static>| {
+        Line::from(vec![key(k), Span::styled(format!("{name:<8}"), Style::new().fg(DIM)), value])
+    };
     let mut lines = Vec::new();
     match &slot.kit.source {
         Some(src) => {
-            lines.push(Line::from(Span::styled(src.title.clone(), Style::new().bold())));
+            let name_text = match &src.artist {
+                Some(a) => format!("{} ({a})", src.title),
+                None => src.title.clone(),
+            };
+            let mut name = vec![Span::styled(src.title.clone(), Style::new().bold())];
             if let Some(a) = &src.artist {
-                lines.push(Line::from(Span::styled(a.clone(), Style::new().fg(Color::Gray))));
+                name.push(Span::styled(format!(" ({a})"), Style::new().fg(Color::Gray)));
             }
-            lines.push(Line::from(vec![label("Cue"), Span::raw(format!("{} at {}", src.cue, time(src.start / src.sample_rate as f64)))]));
-            lines.push(Line::from(vec![label("Length"), Span::raw(format!("{:.3} s", src.seconds()))]));
+            lines.push(Line::from(name));
+            // Pads to 3 rows, however many the name itself wraps to, so
+            // "Length" below always lands on the same row.
+            let rows = wrap(&name_text, area.width.saturating_sub(2).max(1) as usize).len().clamp(1, 3);
+            lines.extend((rows..3).map(|_| Line::raw("")));
+            lines.push(Line::from(vec![label("Length"), Span::raw(format!("{:.3} s", slot.frames as f64 / app.out_rate() as f64))]));
             let state = match &slot.status {
                 PadStatus::Ready => Span::raw(fmt_bytes(slot.bytes as u64)),
                 PadStatus::Loading => Span::styled("loading…", Style::new().fg(DIM)),
@@ -179,17 +237,31 @@ fn draw_pad_info(f: &mut Frame, area: Rect, app: &App) {
                 PadStatus::Empty => Span::raw("—"),
             };
             lines.push(Line::from(vec![label("Memory"), state]));
-            lines.push(Line::from(Span::styled(src.path.display().to_string(), Style::new().fg(DIM))));
         }
-        None => lines.push(Line::from(Span::styled("Empty — Enter to assign a cue", Style::new().fg(DIM)))),
+        None => {
+            lines.push(ctrl("Enter", "Assign", Span::raw("")));
+            f.render_widget(Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }), area);
+            return;
+        }
     }
     let p = slot.kit.props;
-    let on_off = |b: bool| if b { Span::styled("on", Style::new().fg(PLAYING).bold()) } else { Span::styled("off", Style::new().fg(DIM)) };
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![label("Mode  M"), Span::styled(p.mode.label(), Style::new().fg(AMBER).bold())]));
-    lines.push(Line::from(vec![label("Loop  L"), on_off(p.looped)]));
-    lines.push(Line::from(vec![label("Retrig G"), on_off(p.retrigger)]));
-    lines.push(Line::from(vec![label("Gain -/="), Span::raw(format!("{:+.0} dB", p.gain_db))]));
+    lines.push(ctrl("M", "Mode", Span::styled(p.mode.label(), Style::new().fg(AMBER).bold())));
+    lines.push(ctrl(
+        "L",
+        "Loop",
+        if p.looped { Span::styled("on", Style::new().fg(PLAYING).bold()) } else { Span::styled("off", Style::new().fg(DIM)) },
+    ));
+    lines.push(ctrl(
+        "G",
+        "Retrig",
+        if p.retrigger { Span::styled("on", Style::new().fg(PLAYING).bold()) } else { Span::styled("off", Style::new().fg(DIM)) },
+    ));
+    lines.push(ctrl("-/=", "Gain", Span::raw(format!("{:+.0} dB", p.gain_db))));
+    lines.push(Line::raw(""));
+    lines.push(ctrl("T", "Trim", Span::raw("")));
+    lines.push(ctrl("Enter", "Assign", Span::raw("")));
+    lines.push(ctrl("Del", "Clear", Span::raw("")));
     f.render_widget(Paragraph::new(lines).block(block).wrap(ratatui::widgets::Wrap { trim: false }), area);
 }
 
@@ -240,33 +312,55 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hints = match &app.screen {
-        Screen::Pads => {
-            " 1-4 Q-R A-F Z-V play (Shift stop)  arrows select  Enter assign  T trim  M L G -/= props  Del clear  Space stop all  K kits"
+    let hints: &[(&str, &str)] = match &app.screen {
+        Screen::Pads => &[("↑↓←→", "select"), ("Shift+pad", "stop"), ("Space", "stop all")],
+        Screen::Picker(_) => {
+            &[("type", "to filter"), ("↑↓ PgUp PgDn Home End", "select"), ("Enter", "assign"), ("Esc", "clear/close")]
         }
-        Screen::Picker(_) => " type to filter  ↑↓ PgUp PgDn Home End select  Enter assign  Esc clear/close",
-        Screen::Editor(_) => {
-            " Tab start/end  ←/→ beat (Shift: bar)  ,/. ±10 ms (Shift: 1 ms)  [ ] halve/double  Space preview  Enter keep  Esc cancel"
-        }
-        Screen::KitBrowser(_) => " ↑↓ select  Enter choose/create  Del delete  Esc cancel",
-        Screen::SampleBrowser(_) => " ↑↓ select  Enter choose/open  Esc cancel",
-        Screen::NamingKit(_) => " Enter save as this name  Esc leave unsaved for now",
-        Screen::Settings => "",
+        Screen::Editor(_) => &[
+            ("Tab", "start/end"),
+            ("←/→", "beat (Shift: bar)"),
+            (",/.", "±10 ms (Shift: 1 ms)"),
+            ("[ ]", "halve/double"),
+            ("Space", "preview"),
+            ("Enter", "keep"),
+            ("Esc", "cancel"),
+        ],
+        Screen::KitBrowser(_) => &[("↑↓", "select"), ("Enter", "choose/create"), ("Del", "delete"), ("Esc", "cancel")],
+        Screen::SampleBrowser(_) => &[("↑↓", "select"), ("Enter", "choose/open"), ("Esc", "cancel")],
+        Screen::NamingKit(_) => &[("Enter", "save as this name"), ("Esc", "leave unsaved for now")],
+        Screen::Settings => &[],
     };
     if !matches!(app.screen, Screen::Pads) {
-        f.render_widget(Paragraph::new(Line::styled(hints, Style::new().fg(DIM))), area);
+        f.render_widget(Paragraph::new(hints_line(hints)), area);
         return;
     }
     // Contextual keys left, globals pinned right — mirrors odj-player's
     // `draw_footer`, the formatting every app's footer is meant to
     // follow; see its own doc comment for the convention itself.
-    let left = Line::styled(hints, Style::new().fg(DIM));
-    let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+    let left = hints_line(hints);
+    let right = hints_line(&[("K", "kits"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")]);
     let rw = right.width() as u16;
     let [left_area, _, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
     f.render_widget(Paragraph::new(left), left_area);
     f.render_widget(Paragraph::new(right), right_area);
+}
+
+/// Each key highlighted (bold, set apart from the rest), what it does dim —
+/// the same convention [`draw_pad_info`]'s shortcuts use.
+fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, d)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(k.to_string(), Style::new().fg(Color::Gray).bold()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(d.to_string(), Style::new().fg(DIM)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
 }
 
 /// Settings (`` ` ``): one tab, MIDI, with the same list odj-mixer's own
@@ -280,7 +374,7 @@ fn draw_settings(f: &mut Frame, rows: &[DeviceRow], selected: usize, current: Op
     let block = Block::bordered()
         .title(" Settings ")
         .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
-        .title_bottom(Line::styled(" Enter use  X forget mappings ", Style::new().fg(DIM)).centered())
+        .title_bottom(hints_line(&[("Enter", "use"), ("X", "forget mappings")]).centered())
         .border_style(Style::new().fg(AMBER));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -466,7 +560,7 @@ fn draw_naming_kit(f: &mut Frame, name: &str) {
 fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u32) {
     let src = &ed.source;
     let block = Block::bordered()
-        .title(format!(" Sample editor · pad {} · {} · {} ", ed.pad + 1, src.name(), src.cue))
+        .title(format!(" Sample editor · pad {} · {} ", ed.pad + 1, src.name()))
         .border_style(Style::new().fg(AMBER));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -479,7 +573,7 @@ fn draw_editor(f: &mut Frame, area: Rect, ed: &Editor, s: &Snapshot, out_rate: u
         Layout::vertical([Constraint::Length(2), Constraint::Length(1), Constraint::Min(3)]).areas(inner);
 
     let sr = src.sample_rate as f64;
-    let (start, end) = (src.start / sr, src.end / sr);
+    let (start, end) = (ed.start / sr, ed.end / sr);
     let secs = end - start;
     let bytes = ((secs * out_rate as f64).round() as u64 + TAIL as u64) * 8;
     let dim = |t: &str| Span::styled(t.to_string(), Style::new().fg(DIM));

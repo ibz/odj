@@ -50,6 +50,10 @@ pub struct Slot {
     pub status: PadStatus,
     /// Memory held by the pad's sample.
     pub bytes: usize,
+    /// Its length, in frames at the output rate — the pad's own sample is
+    /// always its whole file now (see `kit::PadSource`), so this is the
+    /// only place that length is tracked.
+    pub frames: usize,
     generation: u64,
 }
 
@@ -142,19 +146,32 @@ pub struct SampleBrowser {
     pub selected: usize,
 }
 
+/// Where [`Editor::end`] comes from once the track has loaded, when it
+/// wasn't given a real value up front.
+enum PendingEnd {
+    /// A fresh cue: a grid-sized region from the start (or
+    /// [`DEFAULT_SECONDS`] without a grid).
+    Default,
+    /// Re-trimming an already-assigned pad: its whole file — the same
+    /// region it was cut to before, since that's all the file holds now.
+    WholeFile,
+}
+
 /// Trimming a region of a track before it goes on a pad. It starts at the cue;
 /// both ends move, one at a time.
 pub struct Editor {
     pub pad: usize,
     pub source: PadSource,
+    pub start: f64,
+    pub end: f64,
     /// The user's grid from the player, which wins over the detected one.
     pub user_grid: Option<BeatGrid>,
     /// BPM tapped by an older player, on the detected phase.
     pub tapped_bpm: Option<f64>,
     pub track: Option<Arc<Track>>,
     loading: Option<mpsc::Receiver<anyhow::Result<Track>>>,
-    /// The end isn't known until the track is in, unless it was set before.
-    end_known: bool,
+    /// `end` isn't known until the track is in, unless it was set before.
+    pending_end: Option<PendingEnd>,
     /// The arrow and fine keys move the start rather than the end.
     pub editing_start: bool,
     pub previewing: bool,
@@ -179,7 +196,7 @@ impl Editor {
     }
 
     pub fn len(&self) -> f64 {
-        self.source.end - self.source.start
+        self.end - self.start
     }
 
     /// Moves the end by `frames`, keeping the region inside the track.
@@ -190,7 +207,7 @@ impl Editor {
     /// Moves the start by `frames`, keeping the end where it is.
     fn move_start(&mut self, frames: f64) {
         let min = MIN_SECONDS * self.source.sample_rate as f64;
-        self.source.start = (self.source.start + frames).min(self.source.end - min).max(0.0);
+        self.start = (self.start + frames).min(self.end - min).max(0.0);
     }
 
     /// Moves whichever end is being edited.
@@ -203,20 +220,20 @@ impl Editor {
     fn step_edge(&mut self, beats: i64) {
         let sr = self.source.sample_rate as f64;
         let Some(g) = self.grid() else { return self.move_edge(beats as f64 * 0.1 * sr) };
-        let from = if self.editing_start { self.source.start } else { self.source.end };
+        let from = if self.editing_start { self.start } else { self.end };
         self.move_edge(g.step(from, beats, sr) - from);
     }
 
     fn set_len(&mut self, len: f64) {
         let Some(track) = &self.track else { return };
         let min = MIN_SECONDS * self.source.sample_rate as f64;
-        let max = track.frames() as f64 - self.source.start;
-        self.source.end = self.source.start + len.min(max).max(min);
+        let max = track.frames() as f64 - self.start;
+        self.end = self.start + len.min(max).max(min);
     }
 
     fn cut(&self, out_rate: u32) -> Option<Sample> {
         let t = self.track.as_ref()?;
-        Some(cut(&t.samples, t.sample_rate, self.source.start, self.source.end, out_rate))
+        Some(cut(&t.samples, t.sample_rate, self.start, self.end, out_rate))
     }
 }
 
@@ -230,7 +247,6 @@ struct NewSample<'a> {
     end: f64,
     title: String,
     artist: Option<String>,
-    cue: String,
 }
 
 pub enum Screen {
@@ -278,6 +294,15 @@ pub struct MemoryUse {
     pub system: Option<u64>,
 }
 
+/// Where the sampler's audio is going — shown in the header (see
+/// `main.rs`'s `setup_direct`/`setup_through_mixer`).
+pub enum AudioRoute {
+    /// Through odj-mixer's own virtual sink.
+    Mixer,
+    /// Straight to a real device, named here.
+    Direct(String),
+}
+
 pub struct App {
     pub sampler: Arc<Mutex<Sampler>>,
     out_rate: u32,
@@ -295,13 +320,12 @@ pub struct App {
     status: Option<(String, Instant)>,
     /// Whether the terminal reports key releases (kitty keyboard protocol).
     pub key_release: bool,
-    pub output_name: String,
+    pub output: AudioRoute,
     /// The MIDI input this app remembers (settings file), whether or not
     /// it's connected right now.
     pub midi: MidiConfig,
     /// The live MIDI connection, if any — kept alive here for as long as
-    /// MIDI input should work. Its device's stable name names it in
-    /// Settings and in the header.
+    /// MIDI input should work. Its device's stable name names it in Settings.
     pub midi_conn: Option<midir::MidiInputConnection<()>>,
     pub midi_device: Option<String>,
     /// Set when Settings picks an unlearned device; `main`'s run loop
@@ -322,12 +346,12 @@ impl App {
         kit_dir: Option<PathBuf>,
         kit: Kit,
         key_release: bool,
-        output_name: String,
+        output: AudioRoute,
     ) -> Self {
         let mut app = Self {
             sampler,
             out_rate,
-            slots: std::array::from_fn(|_| Slot { kit: KitPad::default(), status: PadStatus::Empty, bytes: 0, generation: 0 }),
+            slots: std::array::from_fn(|_| Slot { kit: KitPad::default(), status: PadStatus::Empty, bytes: 0, frames: 0, generation: 0 }),
             selected: 0,
             screen: Screen::Pads,
             help: Help::default(),
@@ -336,7 +360,7 @@ impl App {
             loader: Loader::new(out_rate),
             status: None,
             key_release,
-            output_name,
+            output,
             midi: MidiConfig::default(),
             midi_conn: None,
             midi_device: None,
@@ -479,7 +503,7 @@ impl App {
     fn load_kit(&mut self, dir: Option<PathBuf>, kit: Kit) {
         self.kit_dir = dir;
         self.kit_name = kit.name;
-        self.slots = kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, generation: 0 });
+        self.slots = kit.pads.map(|kit| Slot { kit, status: PadStatus::Empty, bytes: 0, frames: 0, generation: 0 });
         for i in 0..PADS {
             let props = self.slots[i].kit.props;
             self.sampler().set_props(i, props);
@@ -622,16 +646,7 @@ impl App {
             self.set_status("Could not save the sample into the kit");
             return None;
         }
-        Some(PadSource {
-            track_id: decoded.id,
-            path: final_path,
-            title: new.title,
-            artist: new.artist,
-            sample_rate: decoded.sample_rate,
-            cue: new.cue,
-            start: 0.0,
-            end: (decoded.samples.len() / 2) as f64,
-        })
+        Some(PadSource { track_id: decoded.id, path: final_path, title: new.title, artist: new.artist, sample_rate: decoded.sample_rate })
     }
 
     /// Cuts the pad's sample from its file again, in the background.
@@ -647,6 +662,7 @@ impl App {
     fn set_sample(&mut self, i: usize, sample: Option<Sample>) {
         let slot = &mut self.slots[i];
         slot.bytes = sample.as_ref().map_or(0, Sample::bytes);
+        slot.frames = sample.as_ref().map_or(0, |s| s.frames);
         slot.status = if sample.is_some() { PadStatus::Ready } else { PadStatus::Empty };
         slot.generation += 1;
         let old = self.sampler().set_sample(i, sample);
@@ -950,16 +966,7 @@ impl App {
             }
         };
         let title = local_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.slots[pad].kit.source = Some(PadSource {
-            track_id: decoded.id,
-            path: local_path,
-            title,
-            artist: None,
-            sample_rate: decoded.sample_rate,
-            cue: "kit".into(),
-            start: 0.0,
-            end: (decoded.samples.len() / 2) as f64,
-        });
+        self.slots[pad].kit.source = Some(PadSource { track_id: decoded.id, path: local_path, title, artist: None, sample_rate: decoded.sample_rate });
         self.reload(pad);
         self.save_kit();
         self.screen = Screen::Pads;
@@ -974,31 +981,15 @@ impl App {
             self.set_status("No cues yet. Store some in odj-player first.");
             return;
         }
-        let mut picker = Picker::new(self.selected, entries);
-        if let Some(src) = &self.slots[self.selected].kit.source {
-            let current = picker.visible.iter().position(|(i, _)| {
-                let e = &picker.entries[*i];
-                e.track_id == src.track_id && e.cue.pos == src.start
-            });
-            picker.selected = current.unwrap_or(0);
-        }
-        self.screen = Screen::Picker(picker);
+        self.screen = Screen::Picker(Picker::new(self.selected, entries));
     }
 
     /// Takes the chosen cue: a loop goes straight on the pad, a bare cue to the editor.
     fn choose(&mut self, pad: usize, e: &CueEntry) {
-        let source = PadSource {
-            track_id: e.track_id.clone(),
-            path: e.path.clone(),
-            title: e.title.clone(),
-            artist: e.artist.clone(),
-            sample_rate: e.sample_rate,
-            cue: e.kind.clone(),
-            start: e.cue.pos,
-            end: e.cue.loop_out.unwrap_or(e.cue.pos),
-        };
+        let source =
+            PadSource { track_id: e.track_id.clone(), path: e.path.clone(), title: e.title.clone(), artist: e.artist.clone(), sample_rate: e.sample_rate };
         match e.cue.loop_out {
-            Some(_) => {
+            Some(end) => {
                 let Ok(decoded) = decode(&source.path) else {
                     self.set_status(format!("Could not read {}", source.path.display()));
                     return;
@@ -1006,11 +997,10 @@ impl App {
                 let Some(copied) = self.copy_into_kit(NewSample {
                     samples: &decoded.samples,
                     rate: decoded.sample_rate,
-                    start: source.start,
-                    end: source.end,
+                    start: e.cue.pos,
+                    end,
                     title: source.title,
                     artist: source.artist,
-                    cue: source.cue,
                 }) else {
                     return;
                 };
@@ -1022,7 +1012,7 @@ impl App {
                 self.save_kit();
                 self.screen = Screen::Pads;
             }
-            None => self.open_editor(pad, source, e.grid, e.tapped_bpm, false),
+            None => self.open_editor(pad, source, e.cue.pos, PendingEnd::Default, e.grid, e.tapped_bpm),
         }
     }
 
@@ -1030,9 +1020,10 @@ impl App {
         &mut self,
         pad: usize,
         source: PadSource,
+        start: f64,
+        pending_end: PendingEnd,
         user_grid: Option<BeatGrid>,
         tapped_bpm: Option<f64>,
-        end_known: bool,
     ) {
         let (tx, rx) = mpsc::channel();
         let path = source.path.clone();
@@ -1042,18 +1033,21 @@ impl App {
         self.screen = Screen::Editor(Box::new(Editor {
             pad,
             source,
+            start,
+            end: start,
             user_grid,
             tapped_bpm,
             track: None,
             loading: Some(rx),
-            end_known,
+            pending_end: Some(pending_end),
             editing_start: false,
             previewing: false,
             preview_bytes: 0,
         }));
     }
 
-    /// Trims the selected pad's sample: back into the editor with its region.
+    /// Trims the selected pad's sample: back into the editor with its whole
+    /// file (that's all it holds — see `kit::PadSource`).
     fn trim(&mut self) {
         let i = self.selected;
         let Some(source) = self.slots[i].kit.source.clone() else {
@@ -1062,7 +1056,7 @@ impl App {
         };
         let mem = Memory::load().tracks().into_iter().find(|t| t.id == source.track_id).map(|t| t.memory);
         let (grid, bpm) = mem.map_or((None, None), |m| (m.grid, m.bpm));
-        self.open_editor(i, source, grid, bpm, true);
+        self.open_editor(i, source, 0.0, PendingEnd::WholeFile, grid, bpm);
     }
 
     fn finish_editor_load(&mut self) {
@@ -1081,13 +1075,16 @@ impl App {
             }
             Ok(track) => {
                 ed.track = Some(Arc::new(track));
-                if !ed.end_known {
-                    let len = match ed.beat() {
-                        Some(beat) => DEFAULT_BARS * 4.0 * beat,
-                        None => DEFAULT_SECONDS * ed.source.sample_rate as f64,
+                if let Some(pending) = ed.pending_end.take() {
+                    let len = match pending {
+                        // Clamped to the track's own length by `set_len`.
+                        PendingEnd::WholeFile => f64::MAX,
+                        PendingEnd::Default => match ed.beat() {
+                            Some(beat) => DEFAULT_BARS * 4.0 * beat,
+                            None => DEFAULT_SECONDS * ed.source.sample_rate as f64,
+                        },
                     };
                     ed.set_len(len);
-                    ed.end_known = true;
                 }
                 None
             }
@@ -1108,28 +1105,21 @@ impl App {
         }
         let Some(sample) = ed.cut(self.out_rate) else { return };
         let pad = ed.pad;
-        let mut source = ed.source;
-        // Already a file this (or re-trimming, the same) kit owns: just the
-        // region changed, not the audio — no need to copy it again. A pad
-        // picked fresh from odj-player's cues (or a legacy, pre-migration
-        // pad) still points outside the kit, so gets copied in now.
-        if source.path.parent() != self.samples_dir().as_deref()
-            && let Some(track) = &ed.track
-        {
-            let Some(copied) = self.copy_into_kit(NewSample {
-                samples: &track.samples,
-                rate: track.sample_rate,
-                start: source.start,
-                end: source.end,
-                title: source.title.clone(),
-                artist: source.artist.clone(),
-                cue: source.cue.clone(),
-            }) else {
-                return;
-            };
-            source = copied;
-        }
-        let secs = source.seconds();
+        let Some(track) = &ed.track else { return };
+        // Always a fresh cut, even re-trimming an already-owned file: the
+        // pad's sample is just whatever the region now covers (see
+        // `kit::PadSource`), not something to grow back into later.
+        let Some(source) = self.copy_into_kit(NewSample {
+            samples: &track.samples,
+            rate: track.sample_rate,
+            start: ed.start,
+            end: ed.end,
+            title: ed.source.title.clone(),
+            artist: ed.source.artist.clone(),
+        }) else {
+            return;
+        };
+        let secs = sample.frames as f64 / self.out_rate as f64;
         self.slots[pad].kit.source = Some(source);
         self.set_sample(pad, Some(sample));
         self.save_kit();
@@ -1214,7 +1204,7 @@ impl App {
         if !self.sampler().press(i) {
             let msg = match self.slots[i].status {
                 PadStatus::Loading => format!("Pad {} is still loading", i + 1),
-                PadStatus::Empty => format!("Pad {} is empty, press Enter to assign a cue", i + 1),
+                PadStatus::Empty => format!("Pad {} is empty, press Enter to assign", i + 1),
                 _ => format!("Pad {} has no audio, press Enter to assign a cue", i + 1),
             };
             self.set_status(msg);
@@ -1490,7 +1480,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("odj-sampler-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let sampler = Arc::new(Mutex::new(Sampler::new()));
-        App::new(sampler, 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, String::new())
+        App::new(sampler, 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, AudioRoute::Mixer)
     }
 
     fn key(app: &mut App, c: char, kind: KeyEventKind) {
@@ -1518,16 +1508,7 @@ mod tests {
     }
 
     fn source() -> PadSource {
-        PadSource {
-            track_id: "ab".into(),
-            path: "/nonexistent.wav".into(),
-            title: "T".into(),
-            artist: None,
-            sample_rate: 48_000,
-            cue: "hot A".into(),
-            start: 0.0,
-            end: 4800.0,
-        }
+        PadSource { track_id: "ab".into(), path: "/nonexistent.wav".into(), title: "T".into(), artist: None, sample_rate: 48_000 }
     }
 
     #[test]
@@ -1535,22 +1516,12 @@ mod tests {
         let mut a = app("copy-into-kit");
         let samples = vec![0.2; 2_000];
 
-        let new_sample = || NewSample {
-            samples: &samples,
-            rate: 8_000,
-            start: 0.0,
-            end: 500.0,
-            title: "Kick".into(),
-            artist: Some("Me".into()),
-            cue: "hot A".into(),
-        };
+        let new_sample = || NewSample { samples: &samples, rate: 8_000, start: 0.0, end: 500.0, title: "Kick".into(), artist: Some("Me".into()) };
         let first = a.copy_into_kit(new_sample()).expect("decodes and writes");
         assert_eq!(first.path.parent(), a.samples_dir().as_deref());
         assert_ne!(first.path, PathBuf::from("/nonexistent.wav"));
         assert_eq!(first.title, "Kick");
         assert_eq!(first.artist, Some("Me".into()));
-        assert_eq!(first.cue, "hot A");
-        assert_eq!(first.start, 0.0);
 
         let second = a.copy_into_kit(new_sample()).expect("decodes and writes");
         assert_eq!(first.path, second.path, "identical audio reuses the same file, not a duplicate");
@@ -1576,7 +1547,7 @@ mod tests {
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, AudioRoute::Mixer);
         a.slots[3].kit.source = Some(source());
         a.save_kit();
         let kit_a_json_before = std::fs::read_to_string(kit_a.join("kit.json")).unwrap();
@@ -1619,7 +1590,7 @@ mod tests {
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, AudioRoute::Mixer);
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Rows: "Kit A" (active, row 0), "Kit B" (row 1), Embedded, Create new.
@@ -1665,7 +1636,7 @@ mod tests {
 
         let kit_a = kits::create_kit("Kit A").unwrap();
         let kit_b = kits::create_kit("Kit B").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, AudioRoute::Mixer);
         a.slots[0].kit.source = Some(source());
         a.set_sample(0, Some(Sample::new(vec![0.1; 9600], 4800)));
         a.save_kit();
@@ -1703,7 +1674,7 @@ mod tests {
         } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, AudioRoute::Mixer);
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Only "Kit A" exists, so row 0 (active) is selected by default.
@@ -1738,7 +1709,7 @@ mod tests {
         } // SAFETY: see other tests above.
 
         let starter = kits::create_kit("Starter").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter.clone()), Kit::load(&starter.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter.clone()), Kit::load(&starter.join("kit.json")), true, AudioRoute::Mixer);
         a.switch_to_unsaved_kit(Kit::default());
         assert_eq!(a.kit_dir, None);
 
@@ -1789,7 +1760,7 @@ mod tests {
         } // SAFETY: see other tests above.
 
         let starter = kits::create_kit("Starter").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter), Kit::default(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(starter), Kit::default(), true, AudioRoute::Mixer);
 
         let embedded = &kit_browser::embedded_kits()[0];
         let Some(kit_browser::MaterializedKit::Embedded { id, kit }) =
@@ -1853,7 +1824,7 @@ mod tests {
         let kit_b = kits::create_kit("Kit B").unwrap();
         odj_core::wav::write_wav(&kit_b.join("samples").join("snare.wav"), &vec![0.1; 400], 1, 8_000).unwrap();
 
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a.clone()), Kit::load(&kit_a.join("kit.json")), true, AudioRoute::Mixer);
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         a.handle_key(press(KeyCode::Enter)); // open the sample browser on pad 0
@@ -1900,7 +1871,7 @@ mod tests {
         } // SAFETY: see other tests above.
 
         let kit_a = kits::create_kit("Kit A").unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a), Kit::default(), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(kit_a), Kit::default(), true, AudioRoute::Mixer);
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         a.handle_key(press(KeyCode::Enter)); // open the sample browser on pad 0
@@ -1975,7 +1946,7 @@ mod tests {
         let mut kit = Kit::default();
         kit.pads[0].source = Some(source());
         kit.save(&dir.join("kit.json")).unwrap();
-        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, String::new());
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(dir.clone()), Kit::load(&dir.join("kit.json")), true, AudioRoute::Mixer);
         assert_eq!(a.slots[0].status, PadStatus::Loading);
         let t = Instant::now();
         while a.slots[0].status == PadStatus::Loading && t.elapsed() < Duration::from_secs(5) {
@@ -2004,12 +1975,14 @@ mod tests {
         let track = Track::from_samples("t".into(), "t".into(), None, 48_000, vec![0.0; 48_000 * 20 * 2]);
         let mut ed = Editor {
             pad: 0,
-            source: PadSource { start: 48_000.0, end: 48_000.0, ..source() },
+            source: source(),
+            start: 48_000.0,
+            end: 48_000.0,
             user_grid: Some(BeatGrid { bpm: 120.0, anchor: 0.0 }),
             tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
-            end_known: false,
+            pending_end: None,
             editing_start: false,
             previewing: false,
             preview_bytes: 0,
@@ -2019,7 +1992,7 @@ mod tests {
         ed.move_end(-ed.beat().unwrap());
         assert_eq!(ed.len(), 7.5 * 48_000.0);
         ed.set_len(1e12);
-        assert_eq!(ed.source.end, 20.0 * 48_000.0);
+        assert_eq!(ed.end, 20.0 * 48_000.0);
         ed.set_len(0.0);
         assert_eq!(ed.len(), MIN_SECONDS * 48_000.0);
     }
@@ -2029,27 +2002,29 @@ mod tests {
         let track = Track::from_samples("t".into(), "t".into(), None, 48_000, vec![0.0; 48_000 * 20 * 2]);
         let mut ed = Editor {
             pad: 0,
-            source: PadSource { start: 48_000.0, end: 96_000.0, ..source() },
+            source: source(),
+            start: 48_000.0,
+            end: 96_000.0,
             user_grid: Some(BeatGrid { bpm: 120.0, anchor: 0.0 }),
             tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
-            end_known: true,
+            pending_end: None,
             editing_start: true,
             previewing: false,
             preview_bytes: 0,
         };
         ed.move_edge(-ed.beat().unwrap());
-        assert_eq!((ed.source.start, ed.source.end), (24_000.0, 96_000.0));
+        assert_eq!((ed.start, ed.end), (24_000.0, 96_000.0));
         ed.move_edge(-1e9);
-        assert_eq!(ed.source.start, 0.0);
+        assert_eq!(ed.start, 0.0);
         ed.move_edge(1e9);
-        assert_eq!(ed.source.start, 96_000.0 - MIN_SECONDS * 48_000.0);
+        assert_eq!(ed.start, 96_000.0 - MIN_SECONDS * 48_000.0);
         // Halving and doubling keep the start.
         ed.editing_start = false;
-        ed.source.start = 24_000.0;
+        ed.start = 24_000.0;
         ed.set_len(ed.len() / 2.0);
-        assert_eq!((ed.source.start, ed.source.end), (24_000.0, 60_000.0));
+        assert_eq!((ed.start, ed.end), (24_000.0, 60_000.0));
     }
 
     #[test]
@@ -2058,28 +2033,30 @@ mod tests {
         // 120 BPM, a beat every 24 000 frames, from frame 1 000.
         let mut ed = Editor {
             pad: 0,
-            source: PadSource { start: 49_000.0, end: 60_000.0, ..source() },
+            source: source(),
+            start: 49_000.0,
+            end: 60_000.0,
             user_grid: Some(BeatGrid { bpm: 120.0, anchor: 1_000.0 }),
             tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
-            end_known: true,
+            pending_end: None,
             editing_start: false,
             previewing: false,
             preview_bytes: 0,
         };
         ed.step_edge(1);
-        assert_eq!(ed.source.end, 73_000.0, "off the grid, the first step goes to the next beat");
+        assert_eq!(ed.end, 73_000.0, "off the grid, the first step goes to the next beat");
         ed.step_edge(BAR);
-        assert_eq!(ed.source.end, 169_000.0);
+        assert_eq!(ed.end, 169_000.0);
         ed.step_edge(-1);
-        assert_eq!(ed.source.end, 145_000.0);
+        assert_eq!(ed.end, 145_000.0);
         ed.editing_start = true;
         ed.step_edge(-1);
-        assert_eq!(ed.source.start, 25_000.0);
+        assert_eq!(ed.start, 25_000.0);
         ed.user_grid = None;
         ed.step_edge(1);
-        assert_eq!(ed.source.start, 29_800.0, "a tenth of a second without a grid");
+        assert_eq!(ed.start, 29_800.0, "a tenth of a second without a grid");
     }
 
     #[test]
@@ -2187,12 +2164,14 @@ mod tests {
         let track = Track::from_samples("t".into(), "t".into(), None, 48_000, click_track(120.0, 20.0, 48_000));
         let mut ed = Editor {
             pad: 3,
-            source: PadSource { start: 48_000.0, end: 48_000.0, ..source() },
+            source: source(),
+            start: 48_000.0,
+            end: 48_000.0,
             user_grid: None,
             tapped_bpm: None,
             track: Some(Arc::new(track)),
             loading: None,
-            end_known: false,
+            pending_end: None,
             editing_start: false,
             previewing: true,
             preview_bytes: 0,
@@ -2279,12 +2258,12 @@ mod tests {
     fn screenshot_pads() {
         let mut a = app("screenshot-pads");
         a.kit_name = "Trap Essentials".into();
-        a.slots[0].kit.source = Some(PadSource { title: "Kick 808".into(), cue: "hot A".into(), ..source() });
+        a.slots[0].kit.source = Some(PadSource { title: "Kick 808".into(), ..source() });
         a.set_sample(0, Some(Sample::new(vec![0.1; 96_000], 48_000)));
-        a.slots[1].kit.source = Some(PadSource { title: "Snare Crisp".into(), cue: "hot B".into(), ..source() });
-        a.slots[2].kit.source = Some(PadSource { title: "Hi-Hat Closed".into(), cue: "hot A".into(), ..source() });
+        a.slots[1].kit.source = Some(PadSource { title: "Snare Crisp".into(), ..source() });
+        a.slots[2].kit.source = Some(PadSource { title: "Hi-Hat Closed".into(), ..source() });
         a.slots[2].kit.props.looped = true;
-        a.slots[5].kit.source = Some(PadSource { title: "Vocal Chop FX".into(), cue: "memory 1".into(), ..source() });
+        a.slots[5].kit.source = Some(PadSource { title: "Vocal Chop FX".into(), ..source() });
         a.sampler().press(0);
         a.tick();
         dump_screenshot("sampler-pads", &a, 120, 40);

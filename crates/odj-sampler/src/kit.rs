@@ -3,11 +3,12 @@
 //! directory layout, listing, and switching between multiple kits).
 //!
 //! A pad's `PadSource.path` always points at a `.wav` the kit owns in its
-//! own `samples/` directory — audio assigned from odj-player's cues is cut
-//! and copied there once, on assignment, rather than re-read from the
-//! original track every time (see `App::copy_into_kit`). Only the
-//! reference (fingerprint, path, region, pad properties) is saved here; the
-//! samples themselves live as files, and are decoded again at startup.
+//! own `samples/` directory, already cut to exactly the region assigned —
+//! every assignment or re-trim writes a fresh cut there rather than
+//! re-reading the original track at playback time (see
+//! `App::copy_into_kit`). Only a reference (fingerprint, path, title,
+//! artist, pad properties) is saved here; the samples themselves live as
+//! files, and are decoded again at startup.
 
 use std::path::{Path, PathBuf};
 
@@ -17,28 +18,19 @@ use odj_core::memory::{read_json, write_json};
 
 use crate::engine::{PADS, Props};
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
-/// One pad's region of a track. Positions are frames at the track's sample rate.
+/// One pad's sample, already cut to its final region — see the module docs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PadSource {
     pub track_id: String,
-    /// Where the track was when the pad was assigned.
     pub path: PathBuf,
     pub title: String,
     pub artist: Option<String>,
     pub sample_rate: u32,
-    /// Which cue it came from, e.g. "hot A", "memory 3", "loop".
-    pub cue: String,
-    pub start: f64,
-    pub end: f64,
 }
 
 impl PadSource {
-    pub fn seconds(&self) -> f64 {
-        (self.end - self.start) / self.sample_rate as f64
-    }
-
     pub fn name(&self) -> String {
         match &self.artist {
             Some(a) => format!("{a} – {}", self.title),
@@ -106,9 +98,6 @@ mod tests {
                 title: "A".into(),
                 artist: None,
                 sample_rate: 44_100,
-                cue: "hot B".into(),
-                start: 100.0,
-                end: 88_300.0,
             }),
             props: Props { mode: Mode::Gate, looped: true, retrigger: false, gain_db: -3.0 },
         };

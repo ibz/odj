@@ -25,16 +25,16 @@ use ratatui::crossterm::event::{self, Event};
 
 use odj_core::{audio, tui};
 
-use app::App;
+use app::{App, AudioRoute};
 use engine::Sampler;
 use kit::Kit;
 
 /// What `setup_direct`/`setup_through_mixer` have going by the time
 /// everything else in `start` can proceed the same way regardless of
-/// which one actually ran — same shape as odj-player's own `Setup`.
+/// which one actually ran.
 struct Setup {
     sampler: Arc<Mutex<Sampler>>,
-    name: String,
+    output: AudioRoute,
     out_rate: u32,
     errors: audio::Errors,
     _stream: cpal::Stream,
@@ -103,7 +103,7 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         None => pick_and_remember_kit(terminal)?,
     };
 
-    let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, setup.name);
+    let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, setup.output);
     app.set_midi(midi_config, midi_restored);
     run(terminal, &mut app, &setup.errors)
 }
@@ -138,10 +138,10 @@ fn setup_direct(terminal: &mut DefaultTerminal) -> Result<Option<Setup>> {
         drop(stream); // tear down rather than play on from the wrong device
         return Err(e);
     }
-    let name = format!("{} · {} Hz", output.name, output.sample_rate());
+    let route = AudioRoute::Direct(format!("{} · {} Hz", output.name, output.sample_rate()));
     Ok(Some(Setup {
         sampler,
-        name,
+        output: route,
         out_rate: output.sample_rate(),
         errors: output.errors,
         _stream: stream,
@@ -179,7 +179,7 @@ fn setup_through_mixer() -> Result<Option<Setup>> {
     }
     Ok(Some(Setup {
         sampler,
-        name: "Sampler".to_string(),
+        output: AudioRoute::Mixer,
         out_rate: RATE,
         errors: output.errors,
         _stream: stream,

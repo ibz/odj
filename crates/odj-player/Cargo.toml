@@ -29,14 +29,16 @@ priority = "optional"
 extended-description = "Keyboard-driven DJ player (inspired by Pioneer CDJ decks), track downloader, sampler and input mixer for the terminal."
 # $auto picks up the shared libs each binary links (rubberband, ALSA,
 # PipeWire, …); yt-dlp is odj-downloader's runtime dependency — it shells
-# out to the `yt-dlp` binary directly, so that's never auto-detected.
-depends = "$auto, yt-dlp"
+# out to the `yt-dlp` binary directly, so that's never auto-detected;
+# tmux is odj.sh's (the `odj` command).
+depends = "$auto, yt-dlp, tmux"
 assets = [
     ["target/release/odj-player", "usr/bin/", "755"],
     ["target/release/odj-sampler", "usr/bin/", "755"],
     ["target/release/odj-downloader", "usr/bin/", "755"],
     ["target/release/odj-mixer", "usr/bin/", "755"],
-    { dest = "usr/bin/odj", link_name = "odj-player" },
+    ["../../odj.sh", "usr/bin/odj.sh", "755"],
+    { dest = "usr/bin/odj", link_name = "odj.sh" },
     ["../../packaging/odj-player.desktop", "usr/share/applications/", "644"],
     ["../../README.md", "usr/share/doc/odj/", "644"],
 ]

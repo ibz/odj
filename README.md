@@ -1,9 +1,45 @@
 # odj
 
-Keyboard-driven DJ tools for the Linux terminal:
+Keyboard-driven DJ tools for the Linux terminal, built the Unix way: 
+small utilities, each its own terminal app, doing one job well and
+standing on its own. Run odj-player and odj-sampler alone and send their
+output into a real, physical mixer, same as any other line source — or
+add odj-mixer and they auto-route into it instead: same apps, same keys,
+now mixed and MIDI-mappable in software, no cables to run.
 
 - **odj-player**, a DJ player inspired by Pioneer CDJ decks.
 - **odj-sampler**, which plays the cues stored by odj-player from 16 pads.
+- **odj-downloader**, which searches YouTube and downloads straight into
+  your library.
+- **odj-mixer**, which finds every running deck and the sampler on its own
+  and mixes them in, plus any sound-card input — a turntable, synth, drum
+  machine or mic — with MIDI-mappable Volume and 3-band EQ.
+
+### Features
+
+- **Cue like a CDJ** — set the cue while paused, jump back while playing,
+  hold to preview; Auto Cue skips to the first sound.
+- **Hot cues, loops and memory** — three hot cues, loop in/out/reloop and
+  memory points, saved per track by audio fingerprint so they survive
+  renaming and moving.
+- **Tempo and Master Tempo** — a tempo fader with ±6, ±10, ±16 and WIDE
+  ranges; Master Tempo keeps the key locked, powered by Rubber Band.
+- **Sync across decks** — run up to 4 decks and they find each other; one
+  key syncs tempo and beat phase to the master, with a phase meter showing
+  how close you are.
+- **Find the key** — detects each track's musical key as a Camelot code,
+  and highlights the other decks' keys that mix well with it.
+- **Jog and search** — hold to bend the pitch, step by frame or beat while
+  paused, and search or super-search through the track.
+- **Mixer with MIDI** — odj-mixer finds every running deck and the
+  sampler on its own, each a channel with Volume and 3-band EQ; add a
+  turntable, synth, drum machine or mic input too, all mappable to MIDI.
+- **16-pad sampler** — plays your stored cues from 16 pads, organized into
+  swappable kits, triggerable from the keyboard or MIDI.
+- **Search, download and play** — search YouTube and download straight
+  into your library with odj-downloader, then play MP3, FLAC, WAV,
+  OGG/Vorbis, AAC/M4A and AIFF — with video, if the track has one and
+  `ffmpeg` is installed.
 
 ```
 cargo run --release -p odj-player                 # first run: pick & remember a music folder
@@ -20,7 +56,10 @@ session, without changing what's remembered. Manage saved folders any time
 from Settings (`` ` ``).
 
 Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
-needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF.
+needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF. If a
+track's file also has a video stream (as most downloaded music videos do),
+odj-player shows it live next to the waveform via `ffmpeg` — entirely
+optional, used only if it's installed.
 
 If there is more than one stereo output (say, a USB audio interface next to
 the built-in card), odj-player and odj-sampler ask at start which one to play
@@ -194,12 +233,13 @@ automatically, live — each is already part of the session, so it just
 plays, no extra step needed (none of them send their audio anywhere
 special for this: each plays into its own virtual sink instead of a
 real device, and odj-mixer captures it from there). A sound-card input
-(a turntable's line-in, a mixer channel, a mic) is different: there's
-usually several, not all of them meant to be mixed in, so each one
-instead waits until it's added from Settings (`` ` ``, see below) —
-once added, every Volume/EQ control works identically whether a strip
-is a turntable, a deck or the sampler. Needs PipeWire running (it
-refuses to start without it): both the virtual sinks and routing
+(a turntable's line-in, a mixer channel, a synth or drum machine, a mic)
+is different: there's usually several, not all of them meant to be mixed
+in, so each one instead waits until it's added from Settings (`` ` ``,
+see below) — once added, every Volume/EQ control works identically
+whether a strip is a turntable, a synth, a deck or the sampler. Needs
+PipeWire running (it refuses to start without it): both the virtual sinks
+and routing
 between two different real cards rely on PipeWire's shared graph
 clock, which plain ALSA has no way to provide.
 
@@ -322,6 +362,29 @@ Every error odj-mixer shows on screen (as a red "Status" popup) is also
 appended, with when it happened, to `~/.local/share/odj/mixer.log` — the
 popup itself clears on the next keypress, so this is the place to look
 for one that's already gone.
+
+## odj
+
+`odj` (see [`odj.sh`](odj.sh), what it actually runs — installed as
+`/usr/bin/odj.sh`, with `odj` a symlink to it) is nothing more than a tmux
+session with odj-mixer and two odj-player decks (`--deck 1`/`--deck 2`)
+already running side by side: mixer on the left, the two decks stacked on
+the right. Running already? `odj` just reattaches to it instead of
+starting another one.
+
+It's plain tmux underneath, so plain tmux keys move around in it — nothing
+odj itself defines. The two to know:
+
+- `Ctrl+B` then an arrow key — move between the mixer and either deck.
+- `Ctrl+B` then `k` — kill the window, ending the session (quits all three
+  at once).
+
+See [tmux's own manual](https://man.openbsd.org/tmux) (the "DEFAULT KEY
+BINDINGS" section) for the rest.
+
+Because it's running inside tmux, key-release events aren't available (see
+above), so hold-to-preview, jog nudges and search fall back to timers for
+all three.
 
 ## Keys
 
@@ -485,9 +548,9 @@ git clone https://github.com/ibz/odj && cd odj/packaging/arch
 makepkg -si
 ```
 
-This builds the latest `master`, pulls in `rubberband`, `alsa-lib`, `libpipewire`
-and `yt-dlp`, and installs all four binaries (`odj-player`, `odj-sampler`,
-`odj-downloader`, `odj-mixer`), an `odj` alias for `odj-player`, and a launcher
+This builds the latest `master`, pulls in `rubberband`, `alsa-lib`, `libpipewire`,
+`yt-dlp` and `tmux`, and installs all four binaries (`odj-player`, `odj-sampler`,
+`odj-downloader`, `odj-mixer`), `odj` (see [above](#odj)), and a launcher
 entry (Super+Space → "odj player"), which opens in your default terminal. Run
 `makepkg -si` again to update; `sudo pacman -R odj-git` removes it. Once it's
 on the AUR: `yay -S odj-git`.
@@ -502,8 +565,8 @@ sudo apt install ./packaging/debian/dist/debian-trixie/odj_*.deb
 
 This builds the package in a Docker container of the release you name (Debian
 trixie by default), so it matches that release's libraries. It installs all
-four binaries, an `odj` alias for `odj-player` and the launcher entry, and
-pulls in rubberband, ALSA, PipeWire and `yt-dlp`. `sudo apt remove odj`
+four binaries, `odj` (see [above](#odj)) and the launcher entry, and
+pulls in rubberband, ALSA, PipeWire, `yt-dlp` and `tmux`. `sudo apt remove odj`
 removes it.
 
 ## License

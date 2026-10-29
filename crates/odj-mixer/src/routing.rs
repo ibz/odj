@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use cpal::Stream;
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Split};
+use ringbuf::traits::{Consumer, Producer, Split};
 
 use odj_core::audio::{self, Source};
 use odj_core::filter::ThreeBandEq;
@@ -47,6 +47,9 @@ pub(crate) struct MixedSource {
     scratch: Vec<f32>,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
+    /// The recorder's own tap, if one's installed — every rendered block
+    /// is pushed here too, verbatim, once `out` holds the final mix.
+    rec_tap: Option<ringbuf::HeapProd<f32>>,
 }
 
 struct MixedInput {
@@ -57,11 +60,16 @@ struct MixedInput {
 
 impl MixedSource {
     fn new() -> Self {
-        Self { inputs: HashMap::new(), scratch: Vec::new(), scratch_l: Vec::new(), scratch_r: Vec::new() }
+        Self { inputs: HashMap::new(), scratch: Vec::new(), scratch_l: Vec::new(), scratch_r: Vec::new(), rec_tap: None }
     }
 
     fn is_empty(&self) -> bool {
         self.inputs.is_empty()
+    }
+
+    /// Installs (`Some`) or clears (`None`) the recorder's tap.
+    pub(crate) fn set_tap(&mut self, tap: Option<ringbuf::HeapProd<f32>>) {
+        self.rec_tap = tap;
     }
 
     fn insert(&mut self, key: DeviceKey, cons: ringbuf::HeapCons<f32>, rate: u32) {
@@ -119,6 +127,9 @@ impl Source for MixedSource {
                 out[i * 2 + 1] += r[i] * input.volume;
             }
         }
+        if let Some(tap) = &mut self.rec_tap {
+            tap.push_slice(out);
+        }
     }
 }
 
@@ -126,6 +137,9 @@ struct RoutedOutput {
     mixed: Arc<Mutex<MixedSource>>,
     _stream: Stream,
     errors: audio::Errors,
+    /// This output's own negotiated sample rate — the recorder needs it
+    /// for the WAV header.
+    rate: u32,
 }
 
 struct RoutedInput {
@@ -263,13 +277,14 @@ impl Routing {
             let (cards, choice) = devices_out.resolve(output)?;
             let host = audio::host();
             let out = audio::Output::open(&host, &cards, &choice)?;
+            let rate = out.sample_rate();
             let mixed = Arc::new(Mutex::new(MixedSource::new()));
             let stream = out.start(mixed.clone())?;
             if let Err(e) = audio::verify_route(&host, &out) {
                 drop(stream);
                 return Err(e);
             }
-            self.outputs.insert(output.clone(), RoutedOutput { mixed, _stream: stream, errors: out.errors.clone() });
+            self.outputs.insert(output.clone(), RoutedOutput { mixed, _stream: stream, errors: out.errors.clone(), rate });
         }
 
         let (cards, choice) = input_devices.resolve(input)?;
@@ -323,11 +338,29 @@ impl Routing {
     pub fn take_errors(&self) -> Vec<String> {
         self.outputs.values().filter_map(|o| o.errors.take()).collect()
     }
+
+    /// Installs (`Some`) or clears (`None`) the recorder's tap on
+    /// whichever output is currently main. `false` if there's no main
+    /// output, or nothing's routed to it yet (so it isn't actually
+    /// open) — the recorder treats that as "nothing to record".
+    pub fn set_main_output_tap(&mut self, tap: Option<ringbuf::HeapProd<f32>>) -> bool {
+        let Some(key) = &self.main_output else { return false };
+        let Some(o) = self.outputs.get(key) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_tap(tap);
+        true
+    }
+
+    /// The main output's own negotiated sample rate, for the recorder's
+    /// WAV header — `None` under the same condition as
+    /// [`set_main_output_tap`](Self::set_main_output_tap).
+    pub fn main_output_rate(&self) -> Option<u32> {
+        self.outputs.get(self.main_output.as_ref()?).map(|o| o.rate)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use ringbuf::traits::Producer;
+    use ringbuf::traits::{Observer, Producer};
 
     use odj_core::audio::Route;
 
@@ -455,5 +488,52 @@ mod tests {
         let result = routing.set_route(&devices_in, &devices_out, &key("missing-in"), Some(&key("missing-out")));
         assert!(result.is_err());
         assert!(start.elapsed() >= Routing::ROUTE_RETRY_DELAY, "should have slept between attempts");
+    }
+
+    #[test]
+    fn mixed_source_pushes_rendered_frames_into_an_installed_tap() {
+        let (mut p1, c1) = input(8);
+        p1.push_slice(&[0.2, 0.3]);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        let (tap_prod, mut tap_cons) = input(8);
+        mixed.set_tap(Some(tap_prod));
+        let mut out = [0.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        let mut tapped = [0.0f32; 2];
+        assert_eq!(tap_cons.pop_slice(&mut tapped), 2);
+        assert_eq!(tapped, out);
+    }
+
+    #[test]
+    fn mixed_source_tap_drops_rather_than_blocking_on_overrun() {
+        let (_p, c1) = input(8);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        let (tap_prod, tap_cons) = input(4); // smaller than what gets pushed below
+        mixed.set_tap(Some(tap_prod));
+        let mut out = [0.0f32; 4];
+        // Several renders in a row would overrun a 4-sample tap; this must
+        // not panic or block.
+        for _ in 0..5 {
+            mixed.render(&mut out, 0.0);
+        }
+        assert!(tap_cons.occupied_len() <= 4);
+    }
+
+    #[test]
+    fn routing_set_main_output_tap_is_a_no_op_without_a_main_output() {
+        let mut routing = Routing::default();
+        let (prod, _cons) = input(8);
+        assert!(!routing.set_main_output_tap(Some(prod)));
+    }
+
+    #[test]
+    fn routing_main_output_rate_is_none_before_anything_is_routed() {
+        let mut routing = Routing::default();
+        assert_eq!(routing.main_output_rate(), None);
+        routing.set_main_output(Some(key("Speakers")));
+        // A main output is set, but nothing's actually open for it yet.
+        assert_eq!(routing.main_output_rate(), None);
     }
 }

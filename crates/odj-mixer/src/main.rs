@@ -14,6 +14,7 @@
 mod devices;
 mod log;
 mod midi;
+mod recorder;
 mod routing;
 mod ui;
 
@@ -67,7 +68,8 @@ fn main() -> Result<()> {
              ones falls back to asking (skip with Esc/N). Once one's picked, if any decks are\n\
              already running, walks you through mapping a knob to each deck's (and the\n\
              sampler's, if it's running) Volume/Low/Mid/High that isn't mapped yet on that\n\
-             controller. Press ? for the full list of keys.\n\
+             controller. R starts/stops recording the main output to a timestamped WAV file\n\
+             under ~/.local/share/odj/recordings/. Press ? for the full list of keys.\n\
              Needs PipeWire: routing between two cards needs its shared graph clock, which\n\
              plain ALSA doesn't have.\n\
              Every error shown on screen is also logged, with when it happened, to {}.",

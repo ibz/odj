@@ -35,6 +35,7 @@ use odj_core::tui::{AMBER, DIM, Help, PAGE_HINT, Page, centered, draw_help, key_
 
 use crate::devices::{DeviceKey, Devices, Entry, device_key_string};
 use crate::midi::{self, Learning, Target, Targets};
+use crate::recorder::Recorder;
 use crate::routing::{Param, Routing};
 
 /// A channel strip's step per `,`/`.` press on a control; `Shift`
@@ -69,6 +70,7 @@ pub const HELP: &[Page] = &[
             ("← / →", "Move between channels"),
             ("↑ / ↓", "Move between its controls: High, Mid, Low, Volume"),
             ("+ / -", "Adjust the selected control (Shift: ×4)"),
+            ("R", "Start / stop recording the main output to a WAV file (saved under ~/.local/share/odj/recordings/)"),
             ("`", "Settings: pick channels, manage MIDI mappings, pick/change the output or controller"),
             ("Ctrl+C", "Quit"),
         ],
@@ -750,6 +752,7 @@ pub fn run(
     let mut midi_selected = 0usize;
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
+    let mut recorder = Recorder::default();
     // Shown via `draw_status_popup` until something replaces it or any
     // key dismisses it (see the two event-handling blocks below) —
     // otherwise an error would sit on screen forever once hit. Every
@@ -771,6 +774,12 @@ pub fn run(
             for e in r.take_errors() {
                 crate::log::log(&e);
                 status = Some(e);
+            }
+            drop(r);
+            if let Some(e) = recorder.poll_error(routing) {
+                let msg = format!("Recording stopped: {e}");
+                crate::log::log(&msg);
+                status = Some(msg);
             }
         }
 
@@ -900,6 +909,19 @@ pub fn run(
                         KeyCode::Down => output_selected = (output_selected + 1).min(out_entries.len().saturating_sub(1)),
                         KeyCode::Enter if out_entries.get(output_selected).is_some_and(|o| o.available) => {
                             let key = out_entries[output_selected].key.clone();
+                            // Switching outputs tears down and reconnects
+                            // every route (see `Routing::set_main_output`'s
+                            // own doc comment), which would otherwise
+                            // silently drop the recorder's tap along with
+                            // it and leave the writer thread running
+                            // forever with nothing left to write — stop it
+                            // first, with its own explanation.
+                            if recorder.is_active() {
+                                let _ = recorder.stop(routing);
+                                let msg = "Recording stopped: main output changed".to_string();
+                                crate::log::log(&msg);
+                                status = Some(msg);
+                            }
                             routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(key.clone()));
                             set_output(&key);
                         }
@@ -954,7 +976,7 @@ pub fn run(
 
         terminal.draw(|f| {
             let r = routing.lock().unwrap_or_else(|e| e.into_inner());
-            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status.as_deref());
+            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status.as_deref(), recorder.elapsed());
             if help.is_open() {
                 draw_help(f, &help, HELP);
             }
@@ -981,6 +1003,17 @@ pub fn run(
                 KeyCode::Char('?' | '/') => help.toggle(),
                 KeyCode::Char('`') => settings_open = true,
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                KeyCode::Char('r' | 'R') => {
+                    let was_active = recorder.is_active();
+                    let result = if was_active { recorder.stop(routing) } else { recorder.start(routing) };
+                    let msg = match result {
+                        Err(e) => format!("Could not {} recording: {e}", if was_active { "stop" } else { "start" }),
+                        Ok(path) if was_active => format!("Recording saved to {}", path.display()),
+                        Ok(path) => format!("Recording to {}", path.display()),
+                    };
+                    crate::log::log(&msg);
+                    status = Some(msg);
+                }
                 KeyCode::Left | KeyCode::Right if !channels.is_empty() => {
                     let forward = k.code == KeyCode::Right;
                     selected_channel = if forward {
@@ -1035,9 +1068,17 @@ fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-const GLOBAL_HINTS: &[(&str, &str)] = &[("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")];
-
-fn draw_mixer(f: &mut Frame, channels: &[Channel], selected_channel: usize, selected_control: usize, current_cc: Option<u8>, routing: &Routing, status: Option<&str>) {
+#[allow(clippy::too_many_arguments)]
+fn draw_mixer(
+    f: &mut Frame,
+    channels: &[Channel],
+    selected_channel: usize,
+    selected_control: usize,
+    current_cc: Option<u8>,
+    routing: &Routing,
+    status: Option<&str>,
+    recording: Option<Duration>,
+) {
     let [main_area, hint_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
 
     if channels.is_empty() {
@@ -1060,15 +1101,33 @@ fn draw_mixer(f: &mut Frame, channels: &[Channel], selected_channel: usize, sele
     // `draw_footer`, the formatting (and naming: "Settings"/"quit",
     // not "Preferences"/"exit") every app's footer is meant to follow;
     // see its own doc comment for the convention itself.
-    let mut left = hints_line(&[("←→ ↑↓", "move"), ("+/-", "adjust (Shift ×4)")]);
+    let mut left = key_hint("R", if recording.is_some() { "stop" } else { "record" }, AMBER);
+    left.spans.extend(hints_line(&[("←→ ↑↓", "move"), ("+/-", "adjust (Shift ×4)")]).spans);
     if let Some(cc) = current_cc {
         left.push_span(Span::styled(format!("  (CC {cc})"), Style::new().fg(DIM)));
     }
-    let right = hints_line(GLOBAL_HINTS);
+    let rec_badge = recording.map(|d| {
+        let s = d.as_secs();
+        Line::from(Span::styled(format!(" ● REC {:02}:{:02} ", s / 60, s % 60), Style::new().fg(Color::Black).bg(Color::Red).bold()))
+    });
+    let rec_w = rec_badge.as_ref().map_or(0, |l| l.width() as u16);
+    let right = hints_line(&[
+        ("`", "settings"),
+        ("?", "help"),
+        ("Ctrl+C", "quit"),
+    ]);
     let rw = right.width() as u16;
-    let [left_area, _, right_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(hint_area);
+    let [left_area, rec_area, _, right_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(rec_w),
+        Constraint::Length(2),
+        Constraint::Length(rw),
+    ])
+    .areas(hint_area);
     f.render_widget(Paragraph::new(left), left_area);
+    if let Some(badge) = rec_badge {
+        f.render_widget(Paragraph::new(badge), rec_area);
+    }
     f.render_widget(Paragraph::new(right), right_area);
     draw_status_popup(f, status);
 }

@@ -261,6 +261,13 @@ odj-player's own live screen, the footer's contextual keys sit on the
 left and the globals (`` ` `` settings, `?` help, `Ctrl+C` quit) stay
 pinned to the right.
 
+`R` starts or stops recording the mixed main output to a timestamped
+WAV file under `~/.local/share/odj/recordings/`, streamed to disk as it
+records rather than held in memory — a `● REC` badge and elapsed time
+show in the footer while it's running. Switching the main output from
+Settings while recording stops it first, since the switch tears down
+and reconnects every route.
+
 Picking a MIDI controller at startup needs no picker either, the same
 way the main output doesn't: every controller odj-mixer's ever learned
 knob mappings for is remembered (`Settings.mixer_midi_controllers`, by

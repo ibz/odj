@@ -12,7 +12,7 @@ use odj_core::key::Key;
 use odj_core::track::{Track, WAVE_RATE, WaveBin};
 use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint};
 
-use crate::app::App;
+use crate::app::{App, AudioRoute};
 use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
 use crate::video;
 
@@ -50,8 +50,13 @@ const MIN_VIDEO_COLS: u16 = 24;
 const MIN_WAVE_COLS: u16 = 30;
 
 pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
-    // The status rows wrap inside their box, which grows to fit them.
-    let status_lines = status_lines(app, s, f.area().width.saturating_sub(2) as usize);
+    // The status rows wrap inside their box, which grows to fit them. The
+    // right-pinned badges (see `status_right_badges`) hold their own
+    // corner on the top row, so the flowing text is kept out of their way.
+    let badges = status_right_badges(app, s);
+    let bw = badges.width() as u16;
+    let flow_width = f.area().width.saturating_sub(2).saturating_sub(bw + 2);
+    let status_lines = status_lines(app, s, flow_width as usize);
     let [header, status, zoom, overview, info, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(status_lines.len() as u16 + 2),
@@ -65,7 +70,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
 
     draw_header(f, header, app, s);
     let block = Block::bordered().border_style(Style::new().fg(DIM));
-    f.render_widget(Paragraph::new(status_lines).block(block), status);
+    let status_inner = block.inner(status);
+    f.render_widget(block, status);
+    f.render_widget(Paragraph::new(status_lines), status_inner);
+    let badges_area = Rect { x: status_inner.x + status_inner.width.saturating_sub(bw), width: bw.min(status_inner.width), height: 1, ..status_inner };
+    f.render_widget(Paragraph::new(badges), badges_area);
 
     let zoom_block = Block::bordered().border_style(Style::new().fg(DIM));
     let overview_block = Block::bordered().border_style(Style::new().fg(DIM));
@@ -191,24 +200,17 @@ fn draw_video(f: &mut Frame, area: Rect, frame: &video::Frame) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
-    let mut left = vec![Span::styled(" ODJ ", Style::new().fg(Color::Black).bg(AMBER).bold()), Span::raw(" ")];
+    let badge = Style::new().fg(Color::Black).bg(AMBER).bold();
+    let mut left = vec![Span::styled(" ODJ PLAYER ", badge)];
     if let Some(n) = s.sync.deck {
-        left.push(Span::styled(format!("DECK {n}  "), Style::new().fg(AMBER).bold()));
+        left.push(Span::styled(format!(" DECK {n} "), Style::new().fg(AMBER).bold()));
     }
-    if let Some((n, total)) = app.track_number {
-        left.push(Span::styled("TRACK ", Style::new().fg(DIM)));
-        left.push(Span::styled(format!("{n:02}"), Style::new().bold()));
-        left.push(Span::styled(format!("/{total:02}  "), Style::new().fg(DIM)));
-    }
-    match (&s.track, app.loading()) {
-        (_, Some(name)) => left.push(Span::styled(format!("Loading {name}…"), Style::new().fg(DIM))),
-        (Some(t), None) => {
-            left.push(Span::styled(t.title.clone(), Style::new().bold()));
-            if let Some(artist) = &t.artist {
-                left.push(Span::styled(format!(" — {artist}"), Style::new().fg(Color::Gray)));
-            }
+    match &app.output {
+        AudioRoute::Mixer => {
+            left.push(Span::styled(" → ", Style::new().fg(DIM)));
+            left.push(Span::styled(" ODJ MIXER ", badge));
         }
-        (None, None) => left.push(Span::styled("NO DISC", Style::new().fg(DIM))),
+        AudioRoute::Direct(name) => left.push(Span::styled(format!(" → {name}"), Style::new().fg(DIM))),
     }
     f.render_widget(Paragraph::new(Line::from(left)), area);
 
@@ -216,7 +218,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     if !app.key_release {
         right.push(Span::styled("no key-release events: holds are timed  ", Style::new().fg(Color::Yellow)));
     }
-    right.push(Span::styled(format!("{} ", app.output_name), Style::new().fg(DIM)));
+    match (&s.track, app.loading()) {
+        (_, Some(name)) => right.push(Span::styled(format!("Loading {name}… "), Style::new().fg(DIM))),
+        (Some(t), None) => {
+            right.push(Span::styled(t.title.clone(), Style::new().bold()));
+            if let Some(artist) = &t.artist {
+                right.push(Span::styled(format!(" — {artist}"), Style::new().fg(Color::Gray)));
+            }
+            right.push(Span::raw(" "));
+        }
+        (None, None) => right.push(Span::styled("NO DISC ", Style::new().fg(DIM))),
+    }
     f.render_widget(Paragraph::new(Line::from(right)).alignment(Alignment::Right), area);
 }
 
@@ -286,8 +298,17 @@ fn status_groups(app: &App, s: &Snapshot) -> Vec<(usize, Vec<Span<'static>>)> {
     }
     groups.push((2, spans));
 
-    let a_cue = if app.auto_cue() { Style::new().fg(Color::Black).bg(CUE_COLOR).bold() } else { Style::new().fg(DIM) };
-    groups.push((2, vec![Span::styled(" A.CUE ", a_cue)]));
+    if let (Some(g), Some(t)) = (s.grid, &s.track)
+        && s.show_grid
+    {
+        let (bar, beat) = g.bar_beat(s.pos, t.sample_rate as f64);
+        let mut spans = vec![Span::styled("BAR ", Style::new().fg(DIM)), Span::styled(format!("{bar}.{beat} "), Style::new().bold())];
+        for b in 1..=4 {
+            let lit = Style::new().fg(if beat == 1 { Color::Red } else { GRID_COLOR });
+            spans.push(if b == beat { Span::styled("■", lit) } else { Span::styled("□", Style::new().fg(DIM)) });
+        }
+        groups.push((3, spans));
+    }
 
     let mut spans = vec![Span::styled("TEMPO ", Style::new().fg(DIM))];
     let tempo_style = if s.tempo == 0.0 { Style::new().fg(Color::Green) } else { Style::new().bold() };
@@ -331,26 +352,32 @@ fn status_groups(app: &App, s: &Snapshot) -> Vec<(usize, Vec<Span<'static>>)> {
         }
         groups.push((3, spans));
     }
-    if let (Some(g), Some(t)) = (s.grid, &s.track)
-        && s.show_grid
-    {
-        let (bar, beat) = g.bar_beat(s.pos, t.sample_rate as f64);
-        let mut spans = vec![Span::styled("BAR ", Style::new().fg(DIM)), Span::styled(format!("{bar}.{beat} "), Style::new().bold())];
-        for b in 1..=4 {
-            let lit = Style::new().fg(if beat == 1 { Color::Red } else { GRID_COLOR });
-            spans.push(if b == beat { Span::styled("■", lit) } else { Span::styled("□", Style::new().fg(DIM)) });
-        }
-        groups.push((3, spans));
-    }
+    groups
+}
+
+/// A.CUE, QUANTIZE and SLIP — pinned to the status box's top-right
+/// corner instead of flowing inline with the rest, so they're always in
+/// the same place regardless of how much else is showing.
+fn status_right_badges(app: &App, s: &Snapshot) -> Line<'static> {
+    let a_cue = if app.auto_cue() { Style::new().fg(Color::Black).bg(CUE_COLOR).bold() } else { Style::new().fg(DIM) };
     let q_style = match (s.quantize, s.grid.is_some()) {
         (true, _) => Style::new().fg(Color::Black).bg(GRID_COLOR).bold(),
         (false, true) => Style::new().fg(DIM),
         (false, false) => Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT),
     };
-    groups.push((4, vec![Span::styled(" QUANTIZE ", q_style)]));
     let slip_style = if s.slip { Style::new().fg(Color::Black).bg(SLIP_COLOR).bold() } else { Style::new().fg(DIM) };
-    groups.push((1, vec![Span::styled(" SLIP ", slip_style)]));
-    groups
+    let mut spans = vec![
+        Span::styled(" A.CUE ", a_cue),
+        Span::raw(" "),
+        Span::styled(" QUANTIZE ", q_style),
+        Span::raw(" "),
+        Span::styled(" SLIP ", slip_style),
+    ];
+    if s.grid_adjust {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" GRID ADJ ", Style::new().fg(Color::Black).bg(GRID_COLOR).bold()));
+    }
+    Line::from(spans)
 }
 
 /// SYNC and MASTER, the phase meter, and the other decks: their tempo, and
@@ -456,9 +483,6 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     if s.loop_adjust {
         spans.push(Span::styled(" OUT ADJ ", Style::new().fg(Color::Black).bg(Color::Yellow).bold()));
     }
-    if s.grid_adjust {
-        spans.push(Span::styled(" GRID ADJ ", Style::new().fg(Color::Black).bg(GRID_COLOR).bold()));
-    }
     if let Some(beats) = s.roll {
         spans.push(Span::styled(format!(" ROLL {} ", fmt_beats(beats)), Style::new().fg(Color::Black).bg(SLIP_COLOR).bold()));
     }
@@ -474,15 +498,11 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         _ => spans.push(Span::styled(format!(" L: {} beats", fmt_beats(s.loop_size)), Style::new().fg(DIM))),
     }
     spans.push(Span::raw("    "));
-    spans.push(Span::styled("JUMP ", Style::new().fg(DIM)));
-    spans.push(Span::raw(fmt_beats(s.jump_beats)));
-
-    spans.push(Span::raw("    "));
     spans.push(Span::styled("MEM ", Style::new().fg(DIM)));
     spans.push(Span::styled(s.memories.len().to_string(), Style::new().fg(MEMORY_COLOR)));
-    if let Some((a, b)) = s.draft_loop {
+    if let Some((a, b)) = s.auto_loop {
         spans.push(Span::raw("    "));
-        spans.push(Span::styled("DRAFT ", Style::new().fg(DIM)));
+        spans.push(Span::styled("AUTO LOOP ", Style::new().fg(DIM)));
         spans.push(Span::styled(
             format!("{} → {}", short_time(a / sr), short_time(b / sr)),
             Style::new().fg(MEMORY_COLOR).add_modifier(Modifier::ITALIC),
@@ -491,11 +511,6 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     spans.push(Span::raw("    "));
     spans.push(Span::styled("CUE ", Style::new().fg(DIM)));
     spans.push(Span::styled(short_time(s.cue / sr), Style::new().fg(CUE_COLOR)));
-    spans.push(Span::raw("    "));
-    spans.push(Span::styled(
-        format!("START {:.2}s  BRAKE {:.2}s", s.start_time, s.brake_time),
-        Style::new().fg(DIM),
-    ));
     if s.reverse {
         spans.push(Span::styled("   REV", Style::new().fg(Color::Cyan).bold()));
     }
@@ -514,6 +529,28 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
 /// place and never get pushed off a narrow terminal. A status message
 /// takes over the whole line instead, below, since it's more urgent
 /// than any hint.
+/// Each key highlighted (bold, set apart from the rest), what it does dim —
+/// the same convention odj-sampler's shortcuts use.
+fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, d)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(k.to_string(), Style::new().fg(Color::Gray).bold()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(d.to_string(), Style::new().fg(DIM)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+const GLOBAL_HINTS: &[(&str, &str)] = &[("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")];
+/// Same, plus `Tab` — pinned right, before Settings, whenever a track's
+/// own deck keys are already shown on the left (so it's not competing
+/// with the no-track case's own, differently emphasized `Tab` hint).
+const PLAYING_GLOBAL_HINTS: &[(&str, &str)] = &[("Tab", "browse"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")];
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
     if let Some(msg) = app.status() {
         let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
@@ -527,7 +564,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         let mut left_spans = vec![Span::raw(" ")];
         left_spans.extend(key_hint("Tab", "browse", AMBER).spans);
         let left = Line::from(left_spans);
-        let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+        let right = hints_line(GLOBAL_HINTS);
         let (lw, rw) = (left.width() as u16, right.width() as u16);
         let [left_area, _, right_area] =
             Layout::horizontal([Constraint::Length(lw), Constraint::Fill(1), Constraint::Length(rw)]).areas(area);
@@ -535,14 +572,29 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
         f.render_widget(Paragraph::new(right), right_area);
         return;
     }
-    // Same split as the no-track case: the deck keys (which can run long,
-    // and simply clip on a narrow terminal rather than push the rest off)
-    // on the left, globals always fully visible, pinned right.
-    let left = Line::styled(
-        " Space play  C cue  1-3 hot cue  I/O/P loop  L loop  -/= jump  Z slip  F sync  Q quantize  ↑↓ tempo  ,/. jog  ←→ search  Tab browse",
-        Style::new().fg(DIM),
-    );
-    let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+    // Four mutually exclusive sets of deck keys on the left, depending on
+    // what's going on right now — hot cue REC mode wins over loop adjust
+    // and looping if somehow more than one is true, since it's the one
+    // the last keypress asked for — with the globals (now including Tab,
+    // see `PLAYING_GLOBAL_HINTS`) always fully visible, pinned right.
+    let left = if app.hot_rec {
+        hints_line(&[("1 2 3", "set hot cue"), ("I/O", "as a loop"), ("E", "exit")])
+    } else if s.loop_adjust {
+        hints_line(&[(",/.", "move out point"), ("O", "finish")])
+    } else if s.looping {
+        hints_line(&[("L", "exit loop"), ("O", "adjust loop"), ("[ / ]", "halve/double")])
+    } else {
+        let hot_cue = if s.hot.iter().any(Option::is_some) { "1 2 3" } else { "E" };
+        hints_line(&[
+            ("Space", "play"),
+            ("←→ -/=", "search/jump"),
+            ("↑↓", "tempo"),
+            ("L", "auto loop"),
+            ("P", "reloop"),
+            (hot_cue, "hot cue"),
+        ])
+    };
+    let right = hints_line(PLAYING_GLOBAL_HINTS);
     let rw = right.width() as u16;
     // A fixed gap, so clipped-on-narrow left text never runs straight into
     // the right group instead of just being cut off.
@@ -697,7 +749,7 @@ pub const HELP: &[Page] = &[
             ("Space", "Play / Pause"),
             ("C", "Cue"),
             ("1 2 3", "Hot cue A/B/C"),
-            ("L", "Beat loop / exit the loop"),
+            ("L", "Auto loop / exit the loop"),
             ("← / →", "Search (Shift: super fast)"),
             ("↑ / ↓", "Tempo (Shift: ×10)"),
             (", / .", "Jog: hold to slow down / speed up 3% (Shift: 12%)"),
@@ -730,9 +782,9 @@ pub const HELP: &[Page] = &[
             ("I / O / P", "Loop in / Loop out / Reloop-Exit (back into whatever loop you're at or just left)"),
             ("O while looping", "Loop out adjust: , / . move the out point (Shift: ×10), O to finish"),
             ("R while looping", "Play the loop backwards, R again for forwards"),
-            ("L", "Beat loop of the loop size / exit the loop"),
-            ("Shift+P", "Jump to the draft loop (last one set by I/O/L), even after visiting another memory"),
-            ("Shift+L", "Promote the draft loop to a real memory"),
+            ("L", "Auto loop of the loop size / exit the loop"),
+            ("Shift+P", "Jump to the auto loop (last one set by I/O/L), even after visiting another memory"),
+            ("Shift+L", "Promote the auto loop to a real memory"),
             ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
             ("Shift+[ / ]", "Same, but from the in point: extends or shrinks the loop to the left"),
             ("; (hold)", "Loop roll of the loop size, [ / ] change it; back to where the track would be"),
@@ -839,27 +891,46 @@ impl Widget for Wave<'_> {
                 })
             });
             let playhead = now_col == Some(x as u16);
+            let ghost = ghost_col == Some(x as u16);
+            let tick_major = tick(t0, t1).filter(|_| shade).map(|n| n.rem_euclid(4.0) == 0.0);
+            let base_bg = match tick_major {
+                Some(true) => BAR_BG,
+                Some(false) => BEAT_BG,
+                None => WAVE_BG,
+            };
+            let loop_bg = match tick_major {
+                _ if !self.s.looping => Color::Rgb(30, 40, 25),
+                Some(_) => Color::Rgb(70, 115, 45),
+                None => LOOP_BG,
+            };
+            // Full height in the zoomed wave; in the overview (no lanes) the
+            // loop only marks the bottom row — a thin indicator rather than
+            // recoloring the whole track-at-a-glance.
+            let loop_everywhere = in_loop && self.lanes;
             let bg = if playhead {
                 PLAYHEAD
-            } else if ghost_col == Some(x as u16) {
+            } else if ghost {
                 GHOST_BG
+            } else if loop_everywhere {
+                loop_bg
             } else {
-                match (in_loop, tick(t0, t1).filter(|_| shade).map(|n| n.rem_euclid(4.0) == 0.0)) {
-                    (true, Some(_)) if self.s.looping => Color::Rgb(70, 115, 45),
-                    (true, _) if self.s.looping => LOOP_BG,
-                    (true, _) => Color::Rgb(30, 40, 25),
-                    (false, Some(true)) => BAR_BG,
-                    (false, Some(false)) => BEAT_BG,
-                    (false, None) => WAVE_BG,
-                }
+                base_bg
             };
             // Bands from the centre out, each drawn over the next: bass, mids,
             // then the whole signal, whose rim shows the highs; clipping turns
             // the outer half row red.
+            // While actively looping, the deck never reaches anything past
+            // the loop until it's exited, so ghosting by raw playhead
+            // position (which sits inside the loop) would dim the loop's
+            // own first half and leave its second half bright, split by
+            // wherever the loop happens to be right now. Ghost by whether
+            // it's in the loop instead: everything outside it, both before
+            // and after, not the loop itself.
+            let dim = if self.s.looping { !in_loop } else { t1 <= now };
             let shade = |c: (u8, u8, u8)| {
                 let c = if playhead { lerp(c, (255, 90, 90), 0.4) } else { c };
                 let played = if self.dim_played { 0.6 } else { 0.35 };
-                let c = if t1 <= now { lerp(c, (0, 0, 0), played) } else { c };
+                let c = if dim { lerp(c, (0, 0, 0), played) } else { c };
                 Color::Rgb(c.0, c.1, c.2)
             };
             let layers = bin.map(|b| {
@@ -879,7 +950,8 @@ impl Widget for Wave<'_> {
                 let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + row as u16)) else {
                     continue;
                 };
-                cell.set_char(' ').set_bg(bg);
+                let row_bg = if !loop_everywhere && in_loop && !playhead && !ghost && row == h - 1 { loop_bg } else { bg };
+                cell.set_char(' ').set_bg(row_bg);
                 if row < centre - half || row >= centre + half {
                     continue;
                 }
@@ -891,7 +963,7 @@ impl Widget for Wave<'_> {
                     continue;
                 };
                 let fill = (end - k * 8).min(8);
-                let outer = if fill == 8 { inner } else { at(end).map_or(bg, |(_, c)| c) };
+                let outer = if fill == 8 { inner } else { at(end).map_or(row_bg, |(_, c)| c) };
                 if row < centre {
                     cell.set_char(BARS[fill]).set_fg(inner).set_bg(outer);
                 } else {

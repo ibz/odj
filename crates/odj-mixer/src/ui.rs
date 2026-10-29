@@ -1019,6 +1019,24 @@ pub fn run(
     }
 }
 
+/// Each key highlighted (bold, set apart from the rest), what it does dim —
+/// the same convention odj-player's and odj-sampler's own footers use.
+fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (k, d)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(k.to_string(), Style::new().fg(Color::Gray).bold()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(d.to_string(), Style::new().fg(DIM)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+const GLOBAL_HINTS: &[(&str, &str)] = &[("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")];
+
 fn draw_mixer(f: &mut Frame, channels: &[Channel], selected_channel: usize, selected_control: usize, current_cc: Option<u8>, routing: &Routing, status: Option<&str>) {
     let [main_area, hint_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
 
@@ -1042,11 +1060,11 @@ fn draw_mixer(f: &mut Frame, channels: &[Channel], selected_channel: usize, sele
     // `draw_footer`, the formatting (and naming: "Settings"/"quit",
     // not "Preferences"/"exit") every app's footer is meant to follow;
     // see its own doc comment for the convention itself.
-    let left = match current_cc {
-        Some(cc) => Line::styled(format!(" ←→ ↑↓ move  +/- adjust (Shift ×4)  (CC {cc})"), Style::new().fg(DIM)),
-        None => Line::styled(" ←→ ↑↓ move  +/- adjust (Shift ×4)", Style::new().fg(DIM)),
-    };
-    let right = Line::styled("` settings  ? help  Ctrl+C quit ", Style::new().fg(DIM));
+    let mut left = hints_line(&[("←→ ↑↓", "move"), ("+/-", "adjust (Shift ×4)")]);
+    if let Some(cc) = current_cc {
+        left.push_span(Span::styled(format!("  (CC {cc})"), Style::new().fg(DIM)));
+    }
+    let right = hints_line(GLOBAL_HINTS);
     let rw = right.width() as u16;
     let [left_area, _, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(hint_area);

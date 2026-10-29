@@ -18,7 +18,7 @@ use odj_core::library::{Browser, is_audio};
 use odj_core::memory::Memory;
 use odj_core::{audio, tui};
 
-use app::App;
+use app::{App, AudioRoute};
 use engine::Deck;
 use sync::SyncLink;
 
@@ -27,7 +27,7 @@ use sync::SyncLink;
 /// which one actually ran.
 struct Setup {
     deck: Arc<Mutex<Deck>>,
-    name: String,
+    output: AudioRoute,
     link: io::Result<SyncLink>,
     errors: audio::Errors,
     _stream: cpal::Stream,
@@ -134,7 +134,7 @@ fn start(
         return Ok(());
     };
 
-    let mut app = App::new(setup.deck, browser, key_release, setup.name, memory);
+    let mut app = App::new(setup.deck, browser, key_release, setup.output, memory);
     if let Err(e) = &setup.link {
         app.set_status(format!("Sync unavailable: {e}"));
     }
@@ -172,8 +172,8 @@ fn setup_direct(terminal: &mut DefaultTerminal, deck_number: Option<u8>) -> Resu
     // whichever number sync claims (the first one free, 1 if nothing else
     // is running).
     let link = SyncLink::start(deck.clone(), deck_number);
-    let name = format!("{} · {} Hz", output.name, output.sample_rate());
-    Ok(Some(Setup { deck, name, link, errors: output.errors, _stream: stream, _sink: None }))
+    let route = AudioRoute::Direct(format!("{} · {} Hz", output.name, output.sample_rate()));
+    Ok(Some(Setup { deck, output: route, link, errors: output.errors, _stream: stream, _sink: None }))
 }
 
 /// Instead of asking for a real output, creates a virtual sink (see
@@ -206,7 +206,7 @@ fn setup_through_mixer(deck_number: Option<u8>) -> Result<Setup> {
         drop(stream);
         return Err(e);
     }
-    Ok(Setup { deck, name: format!("Deck {n}"), link, errors: output.errors, _stream: stream, _sink: Some(sink) })
+    Ok(Setup { deck, output: AudioRoute::Mixer, link, errors: output.errors, _stream: stream, _sink: Some(sink) })
 }
 
 #[cfg(test)]

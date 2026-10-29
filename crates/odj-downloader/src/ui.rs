@@ -22,6 +22,22 @@ fn key_hint(key: &str, action: &str) -> Line<'static> {
     ])
 }
 
+/// Each key highlighted (bold, set apart from the rest), what it does dim —
+/// the same convention odj-player's and odj-sampler's own footers use.
+fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (k, d)) in parts.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(k.to_string(), Style::new().fg(Color::Gray).bold()));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(d.to_string(), Style::new().fg(DIM)));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     let [search_area, body, footer] =
         Layout::vertical([Constraint::Length(3), Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
@@ -147,14 +163,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    let left = Line::from(match app.focus {
+    let mut left_spans = match app.focus {
         Focus::Search if app.searching => key_hint("Esc", "cancel search").spans,
         Focus::Search => key_hint("Enter", "search").spans,
         Focus::Results => key_hint("Enter", "add to queue").spans,
         Focus::Queue => key_hint("x/Del", "remove queued").spans,
-    });
+    };
     let esc_hint = if app.searching { "cancel" } else { "clear" };
-    let right = Line::styled(format!("Tab focus  ↑↓ navigate  Esc {esc_hint}  Ctrl+C quit "), Style::new().fg(DIM));
+    left_spans.extend(hints_line(&[("Tab", "focus"), ("↑↓", "navigate"), ("Esc", esc_hint)]).spans);
+    let left = Line::from(left_spans);
+    let right = hints_line(&[("Ctrl+C", "quit")]);
     let rw = right.width() as u16;
     let [left_area, _, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);

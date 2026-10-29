@@ -144,6 +144,15 @@ impl SettingsScreen {
     }
 }
 
+/// Where this deck's audio is going — shown in the header (see
+/// `main.rs`'s `setup_direct`/`setup_through_mixer`).
+pub enum AudioRoute {
+    /// Through odj-mixer's own virtual sink, as "Deck n".
+    Mixer,
+    /// Straight to a real device, named here.
+    Direct(String),
+}
+
 pub struct App {
     pub deck: Arc<Mutex<Deck>>,
     pub browser: Browser,
@@ -166,7 +175,7 @@ pub struct App {
     pub track_number: Option<(usize, usize)>,
     /// Whether the terminal reports key releases (kitty keyboard protocol).
     pub key_release: bool,
-    pub output_name: String,
+    pub output: AudioRoute,
     bend_down: Option<Hold>,
     bend_up: Option<Hold>,
     search_back: Option<Hold>,
@@ -184,7 +193,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(deck: Arc<Mutex<Deck>>, browser: Browser, key_release: bool, output_name: String, memory: Memory) -> Self {
+    pub fn new(deck: Arc<Mutex<Deck>>, browser: Browser, key_release: bool, output: AudioRoute, memory: Memory) -> Self {
         {
             let mut d = deck.lock().unwrap_or_else(|e| e.into_inner());
             if JUMP_SIZES.contains(&memory.settings.jump_beats) {
@@ -206,7 +215,7 @@ impl App {
             hot_rec: false,
             track_number: None,
             key_release,
-            output_name,
+            output,
             bend_down: None,
             bend_up: None,
             search_back: None,
@@ -817,29 +826,29 @@ impl App {
                 }
             }
             KeyCode::Char('p') if once && shift => {
-                if !self.deck().reloop_draft() {
-                    self.set_status("No draft loop since the last track (I/O or L)");
+                if !self.deck().reloop_auto() {
+                    self.set_status("No auto loop since the last track (I/O or L)");
                 }
             }
             KeyCode::Char('p') if once => self.deck().reloop_exit(),
             KeyCode::Char('l') if once && shift => {
-                let (stored, had_draft) = {
+                let (stored, had_auto_loop) = {
                     let mut deck = self.deck();
-                    let had_draft = deck.snapshot().draft_loop.is_some();
-                    (deck.promote_draft_loop(), had_draft)
+                    let had_auto_loop = deck.snapshot().auto_loop.is_some();
+                    (deck.promote_auto_loop(), had_auto_loop)
                 };
                 if stored.is_some() {
                     self.remember();
                 }
                 match stored {
                     Some(n) => self.set_status(format!("Memory {n} stored")),
-                    None if had_draft => self.set_status("Already in memory"),
-                    None => self.set_status("No draft loop to promote"),
+                    None if had_auto_loop => self.set_status("Already in memory"),
+                    None => self.set_status("No auto loop to promote"),
                 }
             }
             KeyCode::Char('l') if once => {
                 if !self.deck().beat_loop() {
-                    self.set_status("Beat loops need a beat grid (tap the BPM with A)");
+                    self.set_status("Auto loops need a beat grid (tap the BPM with A)");
                 }
             }
             KeyCode::Char(c @ ('[' | ']')) => {
@@ -1062,7 +1071,7 @@ mod tests {
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
         deck.lock().unwrap().load(Arc::new(track), &mem, false);
-        App::new(deck, Browser::new(dir), true, String::new(), Memory::load())
+        App::new(deck, Browser::new(dir), true, AudioRoute::Direct(String::new()), Memory::load())
     }
 
     fn key(app: &mut App, code: KeyCode, shift: bool, kind: KeyEventKind) {
@@ -1124,11 +1133,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_p_jumps_back_to_the_draft_loop() {
+    fn shift_p_jumps_back_to_the_auto_loop() {
         let mut app = app();
         press(&mut app, KeyCode::Char('i'), false);
         app.deck().step_paused(75.0); // 1 s
-        press(&mut app, KeyCode::Char('o'), false); // the draft loop: 0..1s
+        press(&mut app, KeyCode::Char('o'), false); // the auto loop: 0..1s
         press(&mut app, KeyCode::Char('p'), false); // leave it
         app.deck().step_paused(150.0); // wander off elsewhere
         assert!(!app.deck().snapshot().looping);
@@ -1140,10 +1149,10 @@ mod tests {
     }
 
     #[test]
-    fn shift_p_without_a_draft_loop_shows_a_status() {
+    fn shift_p_without_an_auto_loop_shows_a_status() {
         let mut app = app();
         press(&mut app, KeyCode::Char('p'), true);
-        assert!(app.status().unwrap().contains("No draft loop"));
+        assert!(app.status().unwrap().contains("No auto loop"));
     }
 
     #[test]
@@ -1191,7 +1200,7 @@ mod tests {
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
         deck.lock().unwrap().load(Arc::new(loaded), &mem, false);
-        let mut app = App::new(deck, Browser::new(dir), true, String::new(), Memory::load());
+        let mut app = App::new(deck, Browser::new(dir), true, AudioRoute::Direct(String::new()), Memory::load());
 
         press(&mut app, KeyCode::Char('w'), false); // store a memory
 
@@ -1219,7 +1228,7 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), false); // also sets the cue here
         app.deck().step_paused(75.0); // 1 s
         press(&mut app, KeyCode::Char('o'), false);
-        app.deck().promote_draft_loop();
+        app.deck().promote_auto_loop();
         assert_eq!(app.deck().snapshot().memories.len(), 1);
 
         press(&mut app, KeyCode::Char('x'), false); // first X: arms, doesn't delete
@@ -1236,7 +1245,7 @@ mod tests {
         press(&mut app, KeyCode::Char('i'), false);
         app.deck().step_paused(75.0);
         press(&mut app, KeyCode::Char('o'), false);
-        app.deck().promote_draft_loop();
+        app.deck().promote_auto_loop();
 
         press(&mut app, KeyCode::Char('x'), false); // arm
         press(&mut app, KeyCode::Char(' '), false); // unrelated key: cancels the arm
@@ -1376,6 +1385,63 @@ mod tests {
         }
     }
 
+    /// The footer's left-hand hints switch between three mutually
+    /// exclusive sets depending on what's going on: hot cue REC mode,
+    /// an active loop, or the plain default — never a mix.
+    #[test]
+    fn footer_hints_switch_between_default_loop_and_hot_cue_rec() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn footer_row(app: &App) -> String {
+            let snapshot = app.deck().snapshot();
+            let mut t = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            let buf = t.backend().buffer();
+            let y = buf.area.height - 1;
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        }
+
+        let mut app = app();
+        app.status = None;
+        let footer = footer_row(&app);
+        assert!(footer.contains("Space") && footer.contains("play"), "{footer}");
+        assert!(footer.contains('E') && footer.contains("hot cue"), "no hot cues yet: {footer}");
+        assert!(footer.contains("Tab") && footer.contains("browse"), "{footer}");
+        assert!(footer.contains("auto loop") && footer.contains("reloop"), "{footer}");
+
+        // A hot cue now exists: the hint swaps from E to 1 2 3.
+        press(&mut app, KeyCode::Char('e'), false);
+        press(&mut app, KeyCode::Char('1'), false);
+        press(&mut app, KeyCode::Char('e'), false);
+        app.status = None;
+        let footer = footer_row(&app);
+        assert!(footer.contains("1 2 3") && footer.contains("hot cue"), "a hot cue is set: {footer}");
+
+        // Looping: the left side is entirely loop-specific keys instead.
+        press(&mut app, KeyCode::Char('l'), false);
+        app.status = None;
+        let footer = footer_row(&app);
+        assert!(footer.contains("exit loop") && footer.contains("adjust loop") && footer.contains("halve/double"), "{footer}");
+        assert!(!footer.contains("play"), "{footer}");
+
+        // Loop out adjust (O again, while looping): only its own keys.
+        press(&mut app, KeyCode::Char('o'), false);
+        app.status = None;
+        let footer = footer_row(&app);
+        assert!(footer.contains("move out point") && footer.contains("finish"), "{footer}");
+        assert!(!footer.contains("exit loop") && !footer.contains("halve/double"), "{footer}");
+
+        // Out of the loop and into hot cue REC mode: numbers to set a cue.
+        press(&mut app, KeyCode::Char('l'), false);
+        press(&mut app, KeyCode::Char('e'), false);
+        app.status = None;
+        let footer = footer_row(&app);
+        assert!(footer.contains("1 2 3") && footer.contains("set hot cue"), "{footer}");
+        assert!(footer.contains("I/O") && footer.contains("as a loop"), "{footer}");
+        assert!(footer.contains('E') && footer.contains("exit"), "{footer}");
+    }
+
     /// Draws the deck with the grid showing; shown with --nocapture.
     #[test]
     fn draws_the_grid() {
@@ -1409,7 +1475,7 @@ mod tests {
                 assert!(cells.iter().any(|c| c.bg == crate::ui::BAR_BG), "bar lines are drawn");
                 assert!(cells.iter().any(|c| c.bg == crate::ui::GHOST_BG), "the ghost is drawn");
                 let text: String = cells.iter().map(|c| c.symbol()).collect();
-                for label in ["ROLL 1/4", "SLIP", "JUMP 4", "┃"] {
+                for label in ["ROLL 1/4", "SLIP", "┃"] {
                     assert!(text.contains(label), "{label}");
                 }
             }
@@ -1660,7 +1726,7 @@ mod tests {
             t.backend().buffer().content.iter().map(|c| c.symbol()).collect::<String>()
         };
 
-        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, AudioRoute::Direct(String::new()), Memory::load());
         let text = render(&empty);
         assert!(text.contains("Tab") && text.contains("browse"), "Tab is explained");
         assert!(!text.contains("Space play"), "deck keys are hidden: there's nothing to play");
@@ -1698,7 +1764,7 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, AudioRoute::Direct(String::new()), Memory::load());
 
         let mut t = Terminal::new(TestBackend::new(200, 40)).unwrap();
         let snapshot = empty.deck().snapshot();
@@ -1720,7 +1786,7 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, String::new(), Memory::load());
+        let empty = App::new(Arc::new(Mutex::new(Deck::new(48_000))), Browser::new(dir), true, AudioRoute::Direct(String::new()), Memory::load());
 
         let mut t = Terminal::new(TestBackend::new(160, 40)).unwrap();
         let snapshot = empty.deck().snapshot();
@@ -2034,7 +2100,7 @@ mod tests {
         let mem = TrackMemory { quantize: Some(true), ..TrackMemory::default() };
         let track = fictional_track("Nova Satellite", "Night Drive", 128.0, 60.0);
         deck.lock().unwrap().load(Arc::new(track), &mem, false);
-        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into(), Memory::load());
+        let mut app = App::new(deck, Browser::new(dir), true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), Memory::load());
         press(&mut app, KeyCode::Char(' '), false); // play
         app.deck().render(&mut vec![0.0; 2 * 48_000 * 20]); // 20s in, so the waveform isn't at the very start
         press(&mut app, KeyCode::Char('e'), false); // hot cue REC mode
@@ -2065,7 +2131,7 @@ mod tests {
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut browser = Browser::new(dir);
         browser.open = true;
-        let app = App::new(deck, browser, true, "Built-in Audio · 48000 Hz".into(), Memory::load());
+        let app = App::new(deck, browser, true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), Memory::load());
         dump_screenshot("browser", &app, 120, 40);
     }
 
@@ -2087,7 +2153,7 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", &config);
         }
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
-        let mut app = App::new(deck, Browser::new(dir), true, "Built-in Audio · 48000 Hz".into(), Memory::load());
+        let mut app = App::new(deck, Browser::new(dir), true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), Memory::load());
         press(&mut app, KeyCode::Char('`'), false); // open settings
         press(&mut app, KeyCode::Down, false); // row 1: music folders
         press(&mut app, KeyCode::Enter, false); // drill in

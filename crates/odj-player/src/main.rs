@@ -142,10 +142,10 @@ fn start(
         }
         // No file named on the command line: straight into the browse
         // screen — Folder tab (asking which saved folder first if there
-        // are several) or Crate tab, whichever `app` defaults to; an
-        // empty crate specifically falls back to the Folder tab here
-        // (startup only — see `skip_empty_crate_tab_at_startup`'s own
-        // doc comment for why `Tab` itself doesn't do this).
+        // are several) or Files tab, whichever `app` defaults to; an
+        // empty merged roster specifically falls back to the Folder tab
+        // here (startup only — see `skip_empty_crate_tab_at_startup`'s
+        // own doc comment for why `Tab` itself doesn't do this).
         _ => {
             app.start_browsing();
             app.skip_empty_crate_tab_at_startup();

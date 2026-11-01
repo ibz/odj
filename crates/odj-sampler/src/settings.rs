@@ -4,16 +4,13 @@
 //! whole shared struct, so saving here never resets odj-player's own
 //! fields (`auto_cue`, `music_dirs`, …) to their defaults.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use odj_core::memory::{load_settings, save_settings};
 
-use crate::kits::kits_dir;
-
 /// Prefix for the shared settings' `kit` field when the active kit is one
 /// of the built-in kits, followed by its stable id. It can't collide with
-/// a real kit slug, which is only ASCII alphanumerics and `-` (see
-/// `kits::slugify`).
+/// a real kit directory path, which is always absolute (starts with `/`).
 const EMBEDDED_KIT_PREFIX: &str = "@embedded:";
 
 /// What the settings say is active: a real kit directory, or a built-in
@@ -29,28 +26,35 @@ pub enum ActiveKit {
 /// deleted," so the caller always ends up offering a kit to pick. Embedded
 /// ids aren't checked against the current built-in list here; the caller
 /// does that and falls back to the picker for an unknown one.
+///
+/// The non-embedded case stores the kit's own full directory path, not a
+/// slug relative to `kits_dir()` — a kit can live in the global kits
+/// folder or in any active crate's own `kits/`, so only a full path
+/// finds it regardless of which.
 pub fn load_active_kit() -> Option<ActiveKit> {
-    let slug = load_settings().kit?;
-    if let Some(id) = slug.strip_prefix(EMBEDDED_KIT_PREFIX)
+    let raw = load_settings().kit?;
+    if let Some(id) = raw.strip_prefix(EMBEDDED_KIT_PREFIX)
         && !id.is_empty()
     {
         return Some(ActiveKit::Embedded(id.to_owned()));
     }
-    let dir = kits_dir().join(slug);
+    let dir = PathBuf::from(raw);
     dir.join("kit.json").is_file().then_some(ActiveKit::Saved(dir))
 }
 
-/// Sets (or, with `None`, clears) the active kit, leaving every other
-/// field in the shared settings file exactly as it was.
-pub fn set_active_kit(slug: Option<String>) {
+/// Sets (or, with `None`, clears) the active kit by its full directory,
+/// leaving every other field in the shared settings file exactly as it was.
+pub fn set_active_kit(dir: Option<&Path>) {
     let mut settings = load_settings();
-    settings.kit = slug;
+    settings.kit = dir.map(|d| d.to_string_lossy().into_owned());
     let _ = save_settings(&settings);
 }
 
 /// Remembers one of the built-in kits by its stable id.
 pub fn set_active_embedded_kit(id: &str) {
-    set_active_kit(Some(format!("{EMBEDDED_KIT_PREFIX}{id}")));
+    let mut settings = load_settings();
+    settings.kit = Some(format!("{EMBEDDED_KIT_PREFIX}{id}"));
+    let _ = save_settings(&settings);
 }
 
 #[cfg(test)]
@@ -98,15 +102,31 @@ mod tests {
             settings.music_dirs = vec!["/music".into()];
             let _ = save_settings(&settings);
 
-            kits::create_kit("My Kit").unwrap();
-            set_active_kit(Some("my-kit".into()));
+            let dir = kits::create_kit("My Kit").unwrap();
+            set_active_kit(Some(&dir));
 
             let after = load_settings();
-            assert_eq!(after.kit, Some("my-kit".into()), "odj-sampler's own field changed");
+            assert_eq!(after.kit.as_deref(), Some(dir.to_string_lossy().as_ref()), "odj-sampler's own field changed");
             assert!(!after.auto_cue, "odj-player's fields survived the save");
             assert_eq!(after.music_dirs, vec![PathBuf::from("/music")]);
 
-            assert_eq!(load_active_kit(), Some(ActiveKit::Saved(kits_dir().join("my-kit"))));
+            assert_eq!(load_active_kit(), Some(ActiveKit::Saved(dir)));
+        });
+    }
+
+    #[test]
+    fn a_kit_living_in_a_crates_own_folder_is_found_by_its_full_path() {
+        with_temp_dirs(|| {
+            let crate_dir = std::env::temp_dir().join(format!("odj-settings-crate-kit-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&crate_dir);
+            odj_core::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
+            let kit_dir = odj_core::crates::Crate::kits_dir(&crate_dir).join("their-kit");
+            std::fs::create_dir_all(&kit_dir).unwrap();
+            std::fs::write(kit_dir.join("kit.json"), "{}").unwrap();
+
+            set_active_kit(Some(&kit_dir));
+            assert_eq!(load_active_kit(), Some(ActiveKit::Saved(kit_dir)));
+            std::fs::remove_dir_all(&crate_dir).unwrap();
         });
     }
 }

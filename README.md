@@ -50,12 +50,12 @@ cargo run --release -p odj-sampler                # 16 pads of stored cues
 ```
 
 With no file or folder on the command line, odj-player opens straight into
-Tab's own browse screen: the Folder tab (asking which saved folder, if
-there's more than one) or the Crate tab, whichever it defaults to.
-Ctrl+U there saves whatever folder you're browsing for next time. Passing
-a folder on the command line just browses there for that session, without
-changing what's remembered. Manage saved folders any time from Settings
-(`` ` ``).
+Tab's own browse screen: the Crate contents tab (every active crate's
+tracks, merged) or the Folder tab (asking which saved folder, if there's more
+than one), whichever it defaults to. Ctrl+U there saves whatever folder
+you're browsing for next time. Passing a folder on the command line just
+browses there for that session, without changing what's remembered.
+Manage saved folders any time from the Music folders tab.
 
 Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
 needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF. If a
@@ -170,23 +170,29 @@ versioned and backed up as a git repo you manage by hand; odj never
 touches git itself. Track audio is never copied into it: a row shows
 missing if the file isn't where it was, or if its sound no longer matches.
 
-Create one from Settings (`` ` ``) → Crate → `N`: just a name, and it's
-created under `~/.local/share/odj/crates/` — fixed, not something you pick
+Create one from odj-crates (below) — `N`, just a name, and it's created
+under `~/.local/share/odj/crates/` — fixed, not something you pick
 yourself. (A crate directory placed there by hand ahead of time, e.g.
 `git clone`d in, is adopted under its existing name rather than
-overwritten if you type a matching one.) Once a crate is active, `U` adds
-the loaded track to it; `Tab`'s own Crate tab browses its tracks (picking
-among your crates first, if you have more than one) — starting
-odj-player straight into an empty crate browses your music
-folder instead, since there's nothing to do yet but add something, but
-`Tab` itself always shows the Crate tab when asked, empty or not. With no
-crate active, odj-player and odj-sampler use the global library in
-`~/.local/share/odj`, same as always.
+overwritten if you type a matching one.)
 
-Creating and populating a crate can also be done entirely from
-odj-crates (below) — create it there, download tracks into it or add
-existing ones, and it shows up here, in odj-player's own crate list,
-right away.
+Any number of crates can be *active* at once in odj-player and
+odj-sampler — a shared setting, toggled with `Space` on either app's
+`Tab` → Crates screen. Active crates are a pure, merged, read-only
+browsing set: `Tab`'s Crate contents tab (odj-player) and kit picker
+(odj-sampler) show every active crate's tracks/kits together, tagged by
+which crate(s) they're in, but neither app ever *writes* into a crate —
+a new cue/loop/grid save, or a new kit, always lands in the global
+library under `~/.local/share/odj`, regardless of which crates are
+active. Starting odj-player with no active crates (or all of them
+empty) lands on the Folder tab instead, since there's nothing to browse
+yet, but `Tab` itself always shows the Crate contents tab when asked,
+empty or not.
+
+Populating a crate (downloading tracks into it, or adding existing
+files) is odj-crates' job — see below; what gets added there shows up in
+odj-player's and odj-sampler's merged views as soon as that crate is
+active.
 
 ## odj-sampler
 
@@ -217,12 +223,16 @@ the memory panel show how much memory the pads take.
 **Kits.** Everything above belongs to one kit at a time — pad assignments,
 properties, and the samples themselves — each its own self-contained
 folder under `~/.local/share/odj/kits/<name>/` (a `kit.json` plus its
-`samples/`). Press `K` any time to switch kits or create a new, empty one;
-odj-sampler remembers the last one used (in the settings file shared with
-odj-player, `~/.config/odj/settings.json`) and loads it directly next time —
-including the built-in kit below. On first run, with no kit yet, the same
-browser offers "Acoustic (Embedded)", a small kit built into the binary
-(works offline, no setup) — picking it doesn't create a kit folder either,
+`samples/`). Press `Tab` any time to switch kits — merged with every
+active crate's own kits, tagged by crate — or create a new, empty one
+(always created in the global folder above, regardless of which crates
+are active); the same screen's other tab picks which crates are active,
+shared with odj-player. odj-sampler remembers the last kit used (in the
+settings file shared with odj-player, `~/.config/odj/settings.json`) and
+loads it directly next time — including the built-in kit below. On first
+run, with no kit yet, the same browser offers "Acoustic (Embedded)", a
+small kit built into the binary (works offline, no setup) — picking it
+doesn't create a kit folder either,
 until it's actually changed, same as above — fuller kits downloaded from
 the companion [odj-kits](https://github.com/ibz/odj-kits) repo (currently
 Acoustic and Latin percussion, both CC0), or creating a new, empty kit of
@@ -473,9 +483,8 @@ along their bottom edge, as does the output picker at start.
 | `R` | Reverse |
 | `F` | Sync to the master deck |
 | `B / N` | Previous / next track in folder |
-| `Tab` | Browse |
-| `U` | Add this track to the active crate |
-| `` ` `` | Settings: auto-cue, music folders, crate |
+| `Tab` | Browse: crate contents, folders, active crates, music folders |
+| `` ` `` | Settings: auto-cue |
 
 #### Cues
 
@@ -543,14 +552,14 @@ along their bottom edge, as does the output picker at start.
 | `Space` | Stop all pads |
 | `← → ↑ ↓` | Select a pad |
 | `Enter` | Browse samples to assign to the selected pad |
-| `K` | Browse kits: switch, or create a new one |
+| `Tab` | Browse kits (merged across active crates), or switch which crates are active |
 
 #### Pads
 
 | Key | Does |
 | --- | --- |
 | `Enter` | Browse samples to assign to the selected pad |
-| `K` | Browse kits: switch, or create a new one |
+| `Tab` | Browse kits (merged across active crates), or switch which crates are active |
 | `T` | Trim: open the selected pad in the sample editor |
 | `M` | Mode: one-shot · gate (plays while held) · toggle |
 | `L` | Loop on/off |
@@ -572,7 +581,7 @@ along their bottom edge, as does the output picker at start.
 | --- | --- |
 | `↑ ↓` | Select a row |
 | `Enter` | Switch to that kit, or start naming a new one |
-| `Delete / Backspace` | Delete the selected kit (asks to confirm first, in red) |
+| `Delete` | Delete the selected kit (asks to confirm first, in red) |
 | `(typing)` | Name a new kit; Enter creates it, Esc cancels |
 | `Esc` | Close without switching |
 

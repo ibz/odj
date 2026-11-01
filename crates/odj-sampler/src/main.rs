@@ -117,8 +117,7 @@ fn pick_and_remember_kit(terminal: &mut DefaultTerminal) -> Result<(Option<PathB
     match kit_browser::pick_initial_kit(terminal)? {
         kit_browser::MaterializedKit::Saved(dir) => {
             let kit = Kit::load(&dir.join("kit.json"));
-            let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-            settings::set_active_kit(slug);
+            settings::set_active_kit(Some(&dir));
             Ok((Some(dir), kit))
         }
         // Nothing written to disk yet — see `App::ensure_kit_dir`.

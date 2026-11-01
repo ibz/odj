@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widge
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::track::{Track, WAVE_RATE};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint, tab_span, wrap};
+use odj_core::tui::{AMBER, DIM, PAGE_HINT, Page, centered, draw_help, hinted_box, key_hint, tab_span, wrap};
 
 use crate::app::{App, AudioRoute, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
 use crate::engine::{Mode, PadState, Snapshot, TAIL};
@@ -42,6 +42,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_picker(f, p);
     } else if let Screen::KitBrowser(state) = &app.screen {
         draw_kit_browser(f, state);
+    } else if let Screen::ActiveCrates(state) = &app.screen {
+        draw_active_crates(f, state);
     } else if let Screen::SampleBrowser(b) = &app.screen {
         draw_sample_browser(f, b);
     } else if let Screen::NamingKit(name) = &app.screen {
@@ -196,7 +198,7 @@ fn draw_pad_info(f: &mut Frame, area: Rect, app: &App) {
         Screen::Editor(ed) => ed.pad,
         Screen::Picker(p) => p.pad,
         Screen::SampleBrowser(b) => b.pad,
-        Screen::Pads | Screen::KitBrowser(_) | Screen::NamingKit(_) | Screen::Settings => app.selected,
+        Screen::Pads | Screen::KitBrowser(_) | Screen::ActiveCrates(_) | Screen::NamingKit(_) | Screen::Settings => app.selected,
     };
     let slot = &app.slots[i];
     let block = Block::bordered()
@@ -328,7 +330,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("Enter", "keep"),
             ("Esc", "cancel"),
         ],
-        Screen::KitBrowser(_) => vec![("↑↓", "select"), ("Enter", "choose/create"), ("Del", "delete"), ("Esc", "cancel")],
+        // These are full-screen modals with their own complete hint row
+        // (and, for KitBrowser/ActiveCrates, their own tab row) — same
+        // reasoning as `Screen::Settings` below: nothing left to add here
+        // without just repeating what's already on screen.
+        Screen::KitBrowser(_) | Screen::ActiveCrates(_) => vec![],
         Screen::SampleBrowser(_) => vec![("↑↓", "select"), ("Enter", "choose/open"), ("Esc", "cancel")],
         Screen::NamingKit(_) => vec![("Enter", "save as this name"), ("Esc", "leave unsaved for now")],
         Screen::Settings => vec![],
@@ -344,7 +350,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     // `draw_footer`, the formatting every app's footer is meant to
     // follow; see its own doc comment for the convention itself.
     let left = hints_line(&hints);
-    let right = hints_line(&[("K", "kits"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")]);
+    let right = hints_line(&[("Tab", "browse"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")]);
     let rw = right.width() as u16;
     let [left_area, _, right_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(rw)]).areas(area);
@@ -472,6 +478,47 @@ fn draw_picker(f: &mut Frame, p: &Picker) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// The two tabs `Tab` cycles between — "Pick a kit" on the left,
+/// "Crates" pinned to the right — drawn the same way as odj-player's
+/// own browse tabs, split the same left-content/right-globals way every
+/// footer in that app already uses (see `odj_core::tui::tab_span`).
+fn draw_kit_tabs_row(f: &mut Frame, area: Rect, current: &str) {
+    let left = Line::from(tab_span("Pick a kit", current == "Pick a kit"));
+    let right = Line::from(tab_span("Crates", current == "Crates"));
+    let (lw, rw) = (left.width() as u16, right.width() as u16);
+    let [left_area, _, right_area] =
+        Layout::horizontal([Constraint::Length(lw), Constraint::Fill(1), Constraint::Length(rw)]).areas(area);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
+}
+
+/// The other of the two tabs — there's only ever one to cycle to.
+fn next_kit_tab_label(current: &str) -> &'static str {
+    if current == "Pick a kit" { "Crates" } else { "Pick a kit" }
+}
+
+/// Borders a list with the kit browser's two tabs atop it and the usual
+/// hints below — the exact same `Esc`/`Tab` corner-badge convention as
+/// odj-player's own `draw_tabbed_list` (its track-selection dialog):
+/// `Esc` bottom-left, `Tab` (naming the other tab) bottom-right, and
+/// whatever's specific to this screen (`middle`) centered between them.
+/// `current` is this screen's own tab name.
+fn draw_kit_tabbed_box(f: &mut Frame, area: Rect, title: &str, current: &str, middle: &str) -> Rect {
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
+        .title_bottom(Line::styled(format!(" {middle} "), Style::new().fg(DIM)).centered())
+        .title_bottom(key_hint("Tab", next_kit_tab_label(current), PAGE_HINT).right_aligned())
+        .border_style(Style::new().fg(AMBER));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let [tabs_area, _, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    draw_kit_tabs_row(f, tabs_area, current);
+    list_area
+}
+
 fn draw_kit_browser(f: &mut Frame, browser: &KitBrowserState) {
     // Wide and tall: a narrower box left jagged fragments of the pad grid's
     // own row borders peeking out on both sides (they don't share row
@@ -487,18 +534,19 @@ fn draw_kit_browser(f: &mut Frame, browser: &KitBrowserState) {
         }
         KitBrowserMode::ConfirmingDelete(i) => draw_delete_warning(f, area, &browser.rows[*i].label()),
         KitBrowserMode::List => {
-            let block = Block::bordered().title(" Pick a kit ").border_style(Style::new().fg(AMBER));
-            let hints = ["↑↓ select", "Enter choose/create", "Del/Backspace delete", "Esc cancel"];
-            let inner = hinted_box(f, area, block, &hints);
+            let inner = draw_kit_tabbed_box(f, area, "Pick a kit", "Pick a kit", "Enter choose/create  Del delete");
             let [list_area, detail_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
+            let width = list_area.width.saturating_sub(2); // the highlight symbol's own width
             let items: Vec<ListItem> = browser
                 .rows
                 .iter()
-                .map(|r| {
-                    let item = ListItem::new(r.label());
+                .enumerate()
+                .map(|(i, r)| {
+                    let tag = browser.tags.get(i).and_then(|t| t.as_deref());
+                    let line = kit_row_line(r, tag, width);
                     match r.color() {
-                        Some(c) => item.style(Style::new().fg(c)),
-                        None => item,
+                        Some(c) => ListItem::new(line).style(Style::new().fg(c)),
+                        None => ListItem::new(line),
                     }
                 })
                 .collect();
@@ -509,6 +557,41 @@ fn draw_kit_browser(f: &mut Frame, browser: &KitBrowserState) {
             f.render_widget(Paragraph::new(detail).fg(DIM), detail_area);
         }
     }
+}
+
+/// A row's label, with its crate tag (if any) pushed to the right edge
+/// of `width` — dim, so it reads as metadata rather than part of the
+/// name itself.
+fn kit_row_line(r: &crate::kit_browser::KitRow, tag: Option<&str>, width: u16) -> Line<'static> {
+    let label = r.label();
+    let Some(tag) = tag else { return Line::from(label) };
+    let gap = (width as usize).saturating_sub(label.chars().count() + tag.chars().count() + 1).max(1);
+    Line::from(vec![Span::raw(label), Span::raw(" ".repeat(gap)), Span::styled(tag.to_string(), Style::new().fg(DIM))])
+}
+
+/// The "Crates" tab: every crate that exists, `Space` toggling its
+/// membership in the shared active set — mirrors odj-player's own
+/// "Crates" tab.
+fn draw_active_crates(f: &mut Frame, state: &crate::app::ActiveCratesState) {
+    let area = centered(f.area(), 92, 90);
+    let list_area = draw_kit_tabbed_box(f, area, "Crates", "Crates", "Space toggle active");
+    let active_crates = odj_core::memory::load_settings().active_crates;
+    let items: Vec<ListItem> = if state.rows.is_empty() {
+        vec![ListItem::new("(no crates yet — create one in odj-crates)").fg(DIM)]
+    } else {
+        state
+            .rows
+            .iter()
+            .map(|c| {
+                let active = active_crates.iter().any(|d| d == &c.dir);
+                let marker = if active { "[x] " } else { "[ ] " };
+                ListItem::new(format!("{marker}{}", c.name))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut listed = ListState::default().with_selected((!state.rows.is_empty()).then_some(state.selected));
+    f.render_stateful_widget(list, list_area, &mut listed);
 }
 
 /// A hard-to-miss, all-red confirmation before a kit (its whole directory,
@@ -738,14 +821,14 @@ pub const HELP: &[Page] = &[
             ("Space", "Stop all pads"),
             ("← → ↑ ↓", "Select a pad"),
             ("Enter", "Browse samples to assign to the selected pad"),
-            ("K", "Browse kits: switch, or create a new one"),
+            ("Tab", "Browse kits (merged across active crates), or switch which crates are active"),
         ],
     ),
     Page::Keys(
         "Pads",
         &[
             ("Enter", "Browse samples to assign to the selected pad"),
-            ("K", "Browse kits: switch, or create a new one"),
+            ("Tab", "Browse kits (merged across active crates), or switch which crates are active"),
             ("T", "Trim: open the selected pad in the sample editor"),
             ("M", "Mode: one-shot · gate (plays while held) · toggle"),
             ("L", "Loop on/off"),
@@ -767,7 +850,7 @@ pub const HELP: &[Page] = &[
         &[
             ("↑ ↓", "Select a row"),
             ("Enter", "Switch to that kit, or start naming a new one"),
-            ("Delete / Backspace", "Delete the selected kit (asks to confirm first, in red)"),
+            ("Delete", "Delete the selected kit (asks to confirm first, in red)"),
             ("(typing)", "Name a new kit; Enter creates it, Esc cancels"),
             ("Esc", "Close without switching"),
         ],

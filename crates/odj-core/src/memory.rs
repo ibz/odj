@@ -188,18 +188,17 @@ pub struct Settings {
     /// means it hasn't been picked yet (from Settings' own Outputs
     /// tab), and nothing plays until it is. odj-mixer.
     pub mixer_output: Option<String>,
-    /// The crate currently active, if any — redirects `Memory::load`'s
-    /// `tracks/` and odj-sampler's `kits_dir()` into it (see
-    /// `crate::crates::Crate`). `None`, or a directory that's since
-    /// stopped existing (e.g. an unplugged drive), falls back to the
-    /// global library. odj-player.
+    /// Crates currently active — a pure, merged, read-only *browsing*
+    /// set: odj-player's own Files tab and odj-sampler's own kit picker
+    /// both merge tracks/kits across every one of these (see
+    /// `crate::crates::Crate`, `crate::crates::list_crates`), tagging
+    /// each row by which crate(s) it came from. Never a write target:
+    /// `Memory::load`'s `tracks/` and odj-sampler's `kits_dir()` always
+    /// use the global library regardless of what's active here. Shared
+    /// by odj-player and odj-sampler — toggling a crate in either app's
+    /// "active crates" tab is visible in the other right away.
     #[serde(default)]
-    pub active_crate: Option<PathBuf>,
-    /// Crate directories the user's picked before, so they can be
-    /// switched back to without browsing again — mirrors `music_dirs`.
-    /// odj-player.
-    #[serde(default)]
-    pub known_crates: Vec<PathBuf>,
+    pub active_crates: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -216,8 +215,7 @@ impl Default for Settings {
             mixer_midi_last: None,
             mixer_active_inputs: HashSet::new(),
             mixer_output: None,
-            active_crate: None,
-            known_crates: Vec::new(),
+            active_crates: Vec::new(),
         }
     }
 }
@@ -383,19 +381,13 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Resolves the active crate's own `tracks/` (see
-    /// `crate::crates::Crate::tracks_dir`) if one's set and still present
-    /// on disk — e.g. not an unplugged drive — else the global library,
-    /// same as before this existed.
+    /// Always the global library's `tracks/` — active crates are a pure
+    /// browsing set now (see `Settings.active_crates`), never a write
+    /// target. A specific crate's own memory is read explicitly via
+    /// `load_from(Crate::tracks_dir(dir), settings)` wherever that's
+    /// needed (odj-player's Files tab, odj-sampler's kit picker).
     pub fn load() -> Self {
-        let settings = load_settings();
-        let tracks_dir = settings
-            .active_crate
-            .as_deref()
-            .filter(|d| d.is_dir())
-            .map(crate::crates::Crate::tracks_dir)
-            .unwrap_or_else(|| data_dir().join("tracks"));
-        Self::load_from(tracks_dir, settings)
+        Self::load_from(data_dir().join("tracks"), load_settings())
     }
 
     /// `load()`'s sibling for a caller that already has both — tests, or a
@@ -890,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn load_resolves_the_active_crates_tracks_dir() {
+    fn load_always_resolves_the_global_tracks_dir_regardless_of_active_crates() {
         let dir = std::env::temp_dir().join(format!("odj-memory-crate-load-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         unsafe {
@@ -899,25 +891,10 @@ mod tests {
         }
         let crate_dir = dir.join("my-crate");
         crate::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
-        let settings = Settings { active_crate: Some(crate_dir.clone()), ..Settings::default() };
+        let settings = Settings { active_crates: vec![crate_dir], ..Settings::default() };
         save_settings(&settings).unwrap();
 
         let m = Memory::load();
-        assert_eq!(m.tracks_dir, crate::crates::Crate::tracks_dir(&crate_dir));
-    }
-
-    #[test]
-    fn load_falls_back_to_the_global_dir_when_the_crate_is_gone() {
-        let dir = std::env::temp_dir().join(format!("odj-memory-crate-missing-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", &dir);
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
-        }
-        let settings = Settings { active_crate: Some(dir.join("does-not-exist")), ..Settings::default() };
-        save_settings(&settings).unwrap();
-
-        let m = Memory::load();
-        assert_eq!(m.tracks_dir, data_dir().join("tracks"));
+        assert_eq!(m.tracks_dir, data_dir().join("tracks"), "active crates are a browsing set, never a write target");
     }
 }

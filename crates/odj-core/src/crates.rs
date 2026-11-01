@@ -72,8 +72,8 @@ pub fn crates_root() -> PathBuf {
 
 /// Every crate that currently exists under [`crates_root`], by name —
 /// mirrors `odj_sampler::kits::list_kits`'s shape exactly. The filesystem
-/// is authoritative here, not `Settings.known_crates` (a separate,
-/// odj-player-owned "shortcuts I've visited" cache).
+/// is authoritative here; both odj-player and odj-sampler's "active
+/// crates" tabs list straight from this, with no separate cache.
 pub fn list_crates() -> Vec<Crate> {
     let Ok(entries) = fs::read_dir(crates_root()) else { return Vec::new() };
     let mut crates: Vec<Crate> = entries

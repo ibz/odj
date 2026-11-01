@@ -119,6 +119,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     draw_info(f, info, app, s);
     draw_footer(f, footer, app, s);
 
+    // `Tab`'s four-tab browse dialog (`draw_folder_picker`/`draw_browser`/
+    // `draw_crate_browser`/`draw_crates_tab`/`draw_music_folders_tab`) is
+    // the canonical, one and only place in odj-player to browse for a
+    // file to load or to activate a crate — see `BrowseTab`'s own doc
+    // comment in `app.rs`.
     if let Some(i) = app.picking_folder() {
         draw_folder_picker(f, app, i);
     } else if app.browser.open {
@@ -126,7 +131,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     } else if app.settings_screen.is_open() {
         draw_settings(f, app);
     } else if app.crate_browser.is_open() {
-        draw_crate_browser(f, app, s);
+        draw_crate_browser(f, app);
+    } else if app.crates_tab_open() {
+        draw_crates_tab(f, app);
+    } else if app.music_folders_open() {
+        draw_music_folders_tab(f, app);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -627,7 +636,7 @@ fn draw_browser(f: &mut Frame, app: &App) {
     };
     let mut block = Block::bordered()
         .title(title)
-        .title_bottom(key_hint("Tab", "Crate", PAGE_HINT).right_aligned())
+        .title_bottom(key_hint("Tab", next_browse_tab_label("Folder"), PAGE_HINT).right_aligned())
         .border_style(Style::new().fg(AMBER));
     if !already_covered {
         let badge = if first_run { "Use current folder" } else { "Add to music folders" };
@@ -678,7 +687,7 @@ fn draw_browser(f: &mut Frame, app: &App) {
     .areas(inner);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
-    f.render_widget(Paragraph::new(browse_tabs_row(true)), tabs_area);
+    draw_browse_tabs_row(f, tabs_area, "Folder");
 
     // Onboarding: Ctrl+U (on the border) is the one highlighted action, so
     // Enter/open isn't a second one — it's folded into plain navigation,
@@ -692,9 +701,9 @@ fn draw_browser(f: &mut Frame, app: &App) {
     };
     let center = Line::styled("type to filter", Style::new().fg(DIM));
     let right = if first_run {
-        Line::styled("↑↓ PgUp PgDn Home End ← → navigate", Style::new().fg(DIM))
+        Line::styled("PgUp PgDn Home End ← → navigate", Style::new().fg(DIM))
     } else {
-        Line::styled("↑↓ PgUp PgDn Home End ← navigate", Style::new().fg(DIM))
+        Line::styled("PgUp PgDn Home End ← navigate", Style::new().fg(DIM))
     };
     let (lw, cw, rw) = (left.width() as u16, center.width() as u16, right.width() as u16);
     let [left_a, _, center_a, _, right_a] = Layout::horizontal([
@@ -714,101 +723,81 @@ fn draw_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The settings screen: a top-level list of global settings, two of which
-/// (music folders, crate) drill into their own list.
+/// The settings screen: just Auto Cue now — music folders and crates
+/// each moved into their own tab of the browse screen.
 fn draw_settings(f: &mut Frame, app: &App) {
-    if let Some(name) = app.settings_screen.naming_crate() {
-        draw_naming_crate(f, name);
-        return;
-    }
-    let area = centered(f.area(), 60, 50);
-    let screen = &app.settings_screen;
-    let title = match (screen.folder().is_some(), screen.crate_row().is_some(), screen.editable()) {
-        (true, _, true) => " My music folders ",
-        (true, _, false) => " Music folders ",
-        (_, true, _) => " Crate ",
-        (false, false, _) => " Settings ",
-    };
-    let block = Block::bordered().title(title).border_style(Style::new().fg(AMBER));
-
-    let (items, hints, selected): (Vec<ListItem>, &[&str], usize) = if let Some(i) = screen.folder() {
-        let dirs = app.music_dirs();
-        let items = if dirs.is_empty() {
-            vec![ListItem::new("(none yet — Enter to browse)").fg(DIM)]
-        } else {
-            dirs.iter().map(|d| ListItem::new(d.display().to_string())).collect()
-        };
-        let hints: &[&str] = if !screen.editable() {
-            &["↑↓ select", "Enter/→ browse here", "Esc cancel"]
-        } else if dirs.is_empty() {
-            &["Enter/→ browse", "Esc back"]
-        } else {
-            &["↑↓ select", "X/Delete remove", "Enter/→ add (browse, then Ctrl+U)", "Esc back"]
-        };
-        (items, hints, i)
-    } else if let Some(i) = screen.crate_row() {
-        let known = app.known_crates();
-        let active = app.active_crate_dir();
-        let mut items = vec![ListItem::new(if active.is_none() { "None (active)" } else { "None" })];
-        items.extend(known.iter().map(|d| {
-            let name = odj_core::crates::Crate::load(d.clone()).name;
-            let label = if active == Some(d) { format!("{name} (active)") } else { name };
-            ListItem::new(label)
-        }));
-        let hints: &[&str] = &["↑↓ select", "Enter activate", "X/Delete forget", "N new", "Esc back"];
-        (items, hints, i)
-    } else {
-        // The row menu is never gated — only the music-folders list itself
-        // can be, and only during forced first-run setup.
-        let crate_name = app.active_crate_dir().map(|d| odj_core::crates::Crate::load(d.clone()).name).unwrap_or_else(|| "None".into());
-        let items = vec![
-            ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" })),
-            ListItem::new(format!("Music folders ({})", app.music_dirs().len())),
-            ListItem::new(format!("Crate: {crate_name}")),
-        ];
-        (items, &["↑↓ select", "Enter toggle/open", "Esc close"], screen.row())
-    };
+    let area = centered(f.area(), 60, 30);
+    let block = Block::bordered().title(" Settings ").border_style(Style::new().fg(AMBER));
+    let hints: &[&str] = &["Enter toggle", "Esc close"];
     let list_area = hinted_box(f, area, block, hints);
+    let items = vec![ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" }))];
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
+    let mut state = ListState::default().with_selected(Some(0));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The new crate's name, typed inline — same convention as odj-sampler's
-/// kit-naming prompt (a literal `▏` glyph stands in for a cursor).
-fn draw_naming_crate(f: &mut Frame, name: &str) {
-    let area = centered(f.area(), 60, 20);
-    let block = Block::bordered().title(" Name this crate ").border_style(Style::new().fg(AMBER));
-    let hints: &[&str] = &["Enter confirm", "Esc cancel"];
-    let body_area = hinted_box(f, area, block, hints);
-    f.render_widget(Paragraph::new(format!("{name}▏")), body_area);
+/// The next tab `Tab` would cycle to, in `Crate contents → Folder →
+/// Crates → Music folders → Crate contents` order.
+fn next_browse_tab_label(current: &str) -> &'static str {
+    match current {
+        "Crate contents" => "Folder",
+        "Folder" => "Crates",
+        "Crates" => "Music folders",
+        _ => "Crate contents",
+    }
 }
 
-/// The Folder/Crate row atop either picker, styled like the help
-/// overlay's own tabs (see `odj_core::tui::tab_span`) — black on amber
-/// for whichever's current, plain amber otherwise.
-fn browse_tabs_row(folder_current: bool) -> Line<'static> {
-    Line::from(vec![tab_span("Folder", folder_current), Span::raw(" "), tab_span("Crate", !folder_current)])
+/// The four browse tabs, split left (Crate contents/Folder) and right
+/// (Crates/Music folders) — same content-left/globals-right convention
+/// every footer in this codebase already uses; `current` is styled
+/// black-on-amber among the rest (see `odj_core::tui::tab_span`).
+fn browse_tabs_row(current: &str) -> (Line<'static>, Line<'static>) {
+    let left = Line::from(vec![
+        tab_span("Crate contents", current == "Crate contents"),
+        Span::raw("  "),
+        tab_span("Folder", current == "Folder"),
+    ]);
+    let right = Line::from(vec![
+        tab_span("Crates", current == "Crates"),
+        Span::raw("  "),
+        tab_span("Music folders", current == "Music folders"),
+    ]);
+    (left, right)
 }
 
-/// Borders a list with a tab row above it and the usual hints below,
-/// exactly the way the help overlay's own `Esc`/`Tab` corners and tab
-/// row look (see `odj_core::tui::draw_help`) — `middle` is whatever's
-/// specific to this screen (e.g. "↑↓ select  Enter/→ open").
-fn draw_tabbed_list(f: &mut Frame, area: Rect, title: &str, folder_current: bool, middle: &str) -> Rect {
-    let next_tab = if folder_current { "Crate" } else { "Folder" };
-    let block = Block::bordered()
+/// Renders `browse_tabs_row` into `area`, left and right flush to its edges.
+fn draw_browse_tabs_row(f: &mut Frame, area: Rect, current: &str) {
+    let (left, right) = browse_tabs_row(current);
+    let (lw, rw) = (left.width() as u16, right.width() as u16);
+    let [left_area, _, right_area] =
+        Layout::horizontal([Constraint::Length(lw), Constraint::Fill(1), Constraint::Length(rw)]).areas(area);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
+}
+
+/// Borders a list with the four browse tabs atop it and the usual hints
+/// below, the way the help overlay's own `Esc`/`Tab` corners and tab row
+/// look (see `odj_core::tui::draw_help`); `current` is this screen's own
+/// tab name. `middle` is whatever's specific to this screen (e.g.
+/// "Enter/→ open"). `query` shows a "filter: …" badge, top right, when
+/// it's non-empty (see `draw_browser`'s own identical badge) — pass ""
+/// for a tab with no typed filter.
+fn draw_tabbed_list(f: &mut Frame, area: Rect, title: &str, current: &str, middle: &str, query: &str) -> Rect {
+    let mut block = Block::bordered()
         .title(format!(" {title} "))
         .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
         .title_bottom(Line::styled(format!(" {middle} "), Style::new().fg(DIM)).centered())
-        .title_bottom(key_hint("Tab", next_tab, PAGE_HINT).right_aligned())
+        .title_bottom(key_hint("Tab", next_browse_tab_label(current), PAGE_HINT).right_aligned())
         .border_style(Style::new().fg(AMBER));
+    if !query.is_empty() {
+        block = block.title(Line::from(format!(" filter: {query}▏")).right_aligned().bold());
+    }
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
     let [tabs_area, _, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-    f.render_widget(Paragraph::new(browse_tabs_row(folder_current)), tabs_area);
+    draw_browse_tabs_row(f, tabs_area, current);
     list_area
 }
 
@@ -816,55 +805,77 @@ fn draw_tabbed_list(f: &mut Frame, area: Rect, title: &str, folder_current: bool
 /// `draw_browser` while there's more than one saved.
 fn draw_folder_picker(f: &mut Frame, app: &App, selected: usize) {
     let area = centered(f.area(), 60, 50);
-    let list_area = draw_tabbed_list(f, area, "Pick a music folder", true, "↑↓ select  Enter/→ open");
+    let list_area = draw_tabbed_list(f, area, "Pick a music folder", "Folder", "Enter/→ open", "");
     let items: Vec<ListItem> = app.music_dirs().iter().map(|d| ListItem::new(d.display().to_string())).collect();
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The Crate tab's own "which crate" step — shown instead of the track
-/// roster below while there's more than one known crate (or none at all).
-fn draw_crate_picker(f: &mut Frame, app: &App, selected: usize) {
-    use odj_core::crates::Crate;
-    let area = centered(f.area(), 60, 50);
-    let list_area = draw_tabbed_list(f, area, "Pick a crate", false, "↑↓ select  Enter/→ open");
-    let known = app.known_crates();
-    let items: Vec<ListItem> = if known.is_empty() {
-        vec![ListItem::new("(no crates yet — add one from Settings)").fg(DIM)]
-    } else {
-        known.iter().map(|d| ListItem::new(Crate::load(d.clone()).name)).collect()
-    };
-    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, list_area, &mut state);
+/// A track row's spans: `prefix` (the fuzzy-matched title/artist text —
+/// see `app::track_search_text`) with `matched`'s positions highlighted
+/// in amber, then `suffix` (the availability marker and "— on YouTube",
+/// plain), then its crate tag(s) (if any) pushed to the right edge of
+/// `width` and highlighted in amber too, so it's easy to spot which
+/// crate(s) a track came from at a glance. `prefix` is trimmed first so
+/// a long title can never crowd the suffix or the tag out.
+fn tagged_row_line(prefix: &str, matched: &[usize], suffix: &str, color: Color, tags: &[String], width: u16) -> Line<'static> {
+    let width = width as usize;
+    let tag = tags.join(", ");
+    let budget = width.saturating_sub(if tag.is_empty() { 0 } else { tag.chars().count() + 1 });
+    let max_prefix = budget.saturating_sub(suffix.chars().count());
+    let count = prefix.chars().count();
+    let truncated = count > max_prefix;
+    let keep = if truncated { max_prefix.saturating_sub(1) } else { count };
+    let mut spans: Vec<Span<'static>> = prefix
+        .chars()
+        .take(keep)
+        .enumerate()
+        .map(|(i, c)| {
+            if matched.contains(&i) {
+                Span::styled(c.to_string(), Style::new().fg(AMBER).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+            } else {
+                Span::styled(c.to_string(), Style::new().fg(color))
+            }
+        })
+        .collect();
+    if truncated {
+        spans.push(Span::styled("…", Style::new().fg(color)));
+    }
+    if !suffix.is_empty() {
+        spans.push(Span::styled(suffix.to_string(), Style::new().fg(color)));
+    }
+    if !tag.is_empty() {
+        let shown: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let gap = width.saturating_sub(shown + tag.chars().count()).max(1);
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(tag, Style::new().fg(AMBER)));
+    }
+    Line::from(spans)
 }
 
-/// The active crate's track roster: title/artist, a right-aligned
-/// availability marker, and "— on YouTube" when missing with a URL —
-/// or, still at the "which crate" step, `draw_crate_picker`.
-fn draw_crate_browser(f: &mut Frame, app: &App, s: &Snapshot) {
+/// Every active crate's tracks, merged: title/artist, a right-aligned
+/// availability marker, "— on YouTube" when missing with a URL, and
+/// (right-aligned past that) which crate(s) it's in.
+fn draw_crate_browser(f: &mut Frame, app: &App) {
     use odj_core::crates::Availability;
-    if let Some(i) = app.crate_browser.picking() {
-        draw_crate_picker(f, app, i);
-        return;
-    }
     let area = centered(f.area(), 70, 70);
     let any_missing = app.crate_browser.tracks().iter().any(|t| app.crate_browser.availability(&t.id) == Some(Availability::Missing));
-    let middle = if any_missing { "↑↓ select  Enter/→ load  S search missing" } else { "↑↓ select  Enter/→ load" };
-    let list_area = draw_tabbed_list(f, area, "Crate", false, middle);
-    let tracks = app.crate_browser.tracks();
-    let items: Vec<ListItem> = if tracks.is_empty() {
-        let msg = if s.track.is_some() {
-            "(no tracks yet — U adds the loaded track)"
+    let middle = if any_missing { "Enter/→ load  Ctrl+S search missing" } else { "Enter/→ load" };
+    let list_area = draw_tabbed_list(f, area, "Crate contents", "Crate contents", middle, app.crate_browser.query());
+    let width = list_area.width.saturating_sub(2); // the highlight symbol's own width
+    let visible: Vec<_> = app.crate_browser.visible().collect();
+    let items: Vec<ListItem> = if visible.is_empty() {
+        let msg = if app.crate_browser.tracks().is_empty() {
+            "(no crates active — pick some from the Crates tab)"
         } else {
-            "(no tracks yet — load one from the Folder tab, then press U)"
+            "(no matches)"
         };
         vec![ListItem::new(msg).fg(DIM)]
     } else {
-        tracks
-            .iter()
-            .map(|t| {
+        visible
+            .into_iter()
+            .map(|(t, matched)| {
                 let (marker, color) = match app.crate_browser.availability(&t.id) {
                     Some(Availability::Changed) => (" (changed)", Color::Yellow),
                     Some(Availability::Missing) => (" (missing)", Color::Red),
@@ -874,13 +885,55 @@ fn draw_crate_browser(f: &mut Frame, app: &App, s: &Snapshot) {
                     (Some(_), Some(Availability::Missing)) => " — on YouTube",
                     _ => "",
                 };
-                let artist = t.artist.as_deref().map(|a| format!(" — {a}")).unwrap_or_default();
-                ListItem::new(format!("{}{artist}{marker}{youtube}", t.title)).fg(color)
+                let prefix = crate::app::track_search_text(t);
+                let suffix = format!("{marker}{youtube}");
+                ListItem::new(tagged_row_line(&prefix, matched, &suffix, color, app.crate_browser.tags(&t.id), width))
             })
             .collect()
     };
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(app.crate_browser.selected()));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// Every crate that exists, `Space` toggling its membership in the
+/// shared active set. The canonical way to activate a crate — odj-player
+/// has no other screen that writes to `Settings.active_crates` (odj-
+/// sampler's own "Crates" tab shares and toggles the very same setting).
+fn draw_crates_tab(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 60, 50);
+    let list_area = draw_tabbed_list(f, area, "Crates", "Crates", "Space toggle active", "");
+    let rows = app.crates_tab.rows();
+    let active = app.active_crates();
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new("(no crates yet — create one in odj-crates)").fg(DIM)]
+    } else {
+        rows.iter()
+            .map(|c| {
+                let marker = if active.iter().any(|d| d == &c.dir) { "[x] " } else { "[ ] " };
+                ListItem::new(format!("{marker}{}", c.name))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected((!rows.is_empty()).then_some(app.crates_tab.selected()));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The music folders list — moved here from Settings. `X`/`Delete`
+/// removes one; `N` browses anywhere to add a brand new one (`Ctrl+U`
+/// there to confirm). No drilling into an existing folder from here.
+fn draw_music_folders_tab(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 60, 50);
+    let list_area = draw_tabbed_list(f, area, "Music folders", "Music folders", "X/Del remove  N add new", "");
+    let dirs = app.music_dirs();
+    let items: Vec<ListItem> = if dirs.is_empty() {
+        vec![ListItem::new("(none yet — N to browse and add one)").fg(DIM)]
+    } else {
+        dirs.iter().map(|d| ListItem::new(d.display().to_string())).collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected((!dirs.is_empty()).then_some(app.music_folders_selected()));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
@@ -901,9 +954,8 @@ pub const HELP: &[Page] = &[
             ("R", "Reverse"),
             ("F", "Sync to the master deck"),
             ("B / N", "Previous / next track in folder"),
-            ("Tab", "Browse"),
-            ("U", "Add this track to the active crate"),
-            ("`", "Settings: auto-cue, music folders, crate"),
+            ("Tab", "Browse: crate contents, folders, active crates, music folders"),
+            ("`", "Settings: auto-cue"),
         ],
     ),
     Page::Keys(
@@ -1284,6 +1336,31 @@ mod tests {
         assert_eq!(style(" 9A"), Some(Color::Green), "Em mixes with Am");
         assert_ne!(style(" 3A"), Some(Color::Green), "Bbm doesn't");
         assert_eq!(style(" --"), Some(DIM), "no key yet");
+    }
+
+    #[test]
+    fn tagged_row_line_trims_a_long_prefix_so_the_tag_still_fits() {
+        let prefix = "A".repeat(50);
+        let line = tagged_row_line(&prefix, &[], "", Color::Reset, &["my-crate".to_string()], 30);
+        assert_eq!(line.width(), 30, "the tag wasn't crowded off the row: {line:?}");
+        assert!(line.to_string().ends_with("my-crate"), "the tag is still the tail: {line:?}");
+    }
+
+    #[test]
+    fn tagged_row_line_highlights_matched_positions() {
+        let line = tagged_row_line("Around the World", &[0, 7], "", Color::Reset, &[], 30);
+        let styled_at = |i: usize| line.spans[i].style.fg;
+        assert_eq!(styled_at(0), Some(AMBER), "A is matched");
+        assert_eq!(styled_at(7), Some(AMBER), "W is matched");
+        assert_ne!(styled_at(1), Some(AMBER), "r is not matched");
+    }
+
+    #[test]
+    fn tagged_row_line_leaves_room_for_the_suffix_too() {
+        let prefix = "A".repeat(50);
+        let line = tagged_row_line(&prefix, &[], " (missing)", Color::Reset, &[], 30);
+        assert_eq!(line.width(), 30);
+        assert!(line.to_string().ends_with(" (missing)"), "{line:?}");
     }
 
     #[test]

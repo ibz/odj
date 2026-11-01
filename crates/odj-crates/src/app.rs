@@ -59,8 +59,9 @@ impl CrateList {
 
 /// A crate's own track roster, drilled into from [`CrateList`] — mirrors
 /// odj-player's `CrateBrowser` (same `AvailabilityChecker` reuse), minus
-/// anything about an "active" crate: odj-crates never touches
-/// `settings.active_crate`, that stays odj-player's own Settings concern.
+/// anything about "active" crates: odj-crates never touches
+/// `settings.active_crates`, that stays odj-player/odj-sampler's own
+/// browse-tab concern.
 pub struct CrateDetail {
     pub dir: PathBuf,
     pub name: String,
@@ -643,9 +644,9 @@ impl App {
     /// adopts a directory that's already sitting there under this exact
     /// name's slug and already looks like a crate (e.g. `git clone`d in by
     /// hand ahead of time) or creates a fresh one, deduped against
-    /// whatever else is already there. Either way, remembers it in the
-    /// shared `known_crates` (odj-player's own crate picker has no other
-    /// way to discover a crate made here) and opens it.
+    /// whatever else is already there, then opens it. Both odj-player and
+    /// odj-sampler discover it on their own "active crates" tab via
+    /// `list_crates()` — there's no separate "known" list to maintain.
     fn create_named_crate(&mut self, name: &str) {
         let root = crates::crates_root();
         let candidate = root.join(crates::slugify(name));
@@ -657,14 +658,7 @@ impl App {
             (dir.clone(), Crate::create(dir, name).map(|_| ()))
         };
         match result {
-            Ok(()) => {
-                let mut settings = memory::load_settings();
-                if !settings.known_crates.contains(&dir) {
-                    settings.known_crates.push(dir.clone());
-                    let _ = memory::save_settings(&settings);
-                }
-                self.screen = Screen::Crate(CrateDetail::load(dir));
-            }
+            Ok(()) => self.screen = Screen::Crate(CrateDetail::load(dir)),
             Err(e) => self.set_status(format!("Could not create crate: {e}")),
         }
     }
@@ -1010,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_crate_adds_it_to_known_crates_and_opens_its_empty_track_list() {
+    fn creating_a_crate_is_discoverable_and_opens_its_empty_track_list() {
         with_temp_dirs("create", |dir| {
             let mut app = app(Arc::new(FakeFetcher::new(Vec::new())), dir.join("downloads"));
             press(&mut app, KeyCode::Char('n'));
@@ -1021,8 +1015,6 @@ mod tests {
             assert_eq!(c.name, "My Set");
             assert!(c.tracks().is_empty());
 
-            let known = odj_core::memory::load_settings().known_crates;
-            assert_eq!(known.len(), 1);
             assert!(crates::list_crates().iter().any(|cr| cr.name == "My Set"));
         });
     }

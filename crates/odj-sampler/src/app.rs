@@ -255,7 +255,11 @@ pub enum Screen {
     Pads,
     Picker(Picker),
     Editor(Box<Editor>),
+    /// `Tab` on `Pads`: a kit to switch to, merged across the global
+    /// kits folder and every active crate's own (tagged); `Tab` again
+    /// flips to `ActiveCrates`, same screen "session" either way.
     KitBrowser(KitBrowserState),
+    ActiveCrates(ActiveCratesState),
     SampleBrowser(SampleBrowser),
     /// Naming the kit a change just landed on, so it can actually be
     /// saved — see `App::ensure_kit_dir`/`App::save_kit`. The typed name.
@@ -273,8 +277,20 @@ pub enum Screen {
 /// "create new" only).
 pub struct KitBrowserState {
     pub rows: Vec<KitRow>,
+    /// Which active crate (by directory-name slug) each row in `rows`
+    /// came from, if any — `None` for the global kits folder or a
+    /// built-in kit. Same length and order as `rows`.
+    pub tags: Vec<Option<String>>,
     pub selected: usize,
     pub mode: KitBrowserMode,
+}
+
+/// The "Crates" tab (`Tab` from the kit browser and back) — every crate
+/// that exists (see `odj_core::crates::list_crates`), `Space` toggling
+/// membership in the shared `Settings.active_crates`.
+pub struct ActiveCratesState {
+    pub rows: Vec<odj_core::crates::Crate>,
+    pub selected: usize,
 }
 
 pub enum KitBrowserMode {
@@ -540,8 +556,7 @@ impl App {
         self.sampler().stop_all();
         let kit = Kit::load(&dir.join("kit.json"));
         self.load_kit(Some(dir), kit);
-        let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-        settings::set_active_kit(slug);
+        settings::set_active_kit(self.kit_dir.as_deref());
     }
 
     /// Switches to `kit`, but with no directory of its own yet — nothing
@@ -735,8 +750,34 @@ impl App {
     // --- Kit browser -------------------------------------------------------------
 
     fn open_kit_browser(&mut self) {
-        let rows = kit_browser::build_rows(false);
-        self.screen = Screen::KitBrowser(KitBrowserState { rows, selected: 0, mode: KitBrowserMode::List });
+        let active_crates = odj_core::memory::load_settings().active_crates;
+        let (rows, tags) = kit_browser::build_rows_tagged(&active_crates);
+        self.screen = Screen::KitBrowser(KitBrowserState { rows, tags, selected: 0, mode: KitBrowserMode::List });
+    }
+
+    fn open_active_crates(&mut self) {
+        self.screen = Screen::ActiveCrates(ActiveCratesState { rows: odj_core::crates::list_crates(), selected: 0 });
+    }
+
+    fn active_crates_key(&mut self, key: &KeyEvent) {
+        let Screen::ActiveCrates(state) = &mut self.screen else { return };
+        match key.code {
+            KeyCode::Up => state.selected = state.selected.saturating_sub(1),
+            KeyCode::Down => state.selected = (state.selected + 1).min(state.rows.len().saturating_sub(1)),
+            KeyCode::Char(' ') if !state.rows.is_empty() => {
+                let dir = state.rows[state.selected].dir.clone();
+                let mut settings = odj_core::memory::load_settings();
+                if !settings.active_crates.iter().any(|d| d == &dir) {
+                    settings.active_crates.push(dir);
+                } else {
+                    settings.active_crates.retain(|d| d != &dir);
+                }
+                let _ = odj_core::memory::save_settings(&settings);
+            }
+            KeyCode::Tab => self.open_kit_browser(),
+            KeyCode::Esc => self.screen = Screen::Pads,
+            _ => {}
+        }
     }
 
     fn kit_browser_key(&mut self, key: &KeyEvent) {
@@ -746,6 +787,7 @@ impl App {
             Switch(kit_browser::MaterializedKit),
             Cancel,
             Delete(usize),
+            OpenCrates,
         }
         let Screen::KitBrowser(state) = &mut self.screen else { return };
         let action = match &mut state.mode {
@@ -797,10 +839,11 @@ impl App {
                     Some(m) => Action::Switch(m),
                     None => Action::None,
                 },
-                KeyCode::Delete | KeyCode::Backspace if matches!(state.rows[state.selected], KitRow::Existing(..)) => {
+                KeyCode::Delete if matches!(state.rows[state.selected], KitRow::Existing(..)) => {
                     state.mode = KitBrowserMode::ConfirmingDelete(state.selected);
                     Action::None
                 }
+                KeyCode::Tab => Action::OpenCrates,
                 KeyCode::Esc => Action::Cancel,
                 _ => Action::None,
             },
@@ -847,11 +890,15 @@ impl App {
                 } else {
                     self.set_status(format!("Deleted \"{name}\""));
                 }
+                let active_crates = odj_core::memory::load_settings().active_crates;
+                let (rows, tags) = kit_browser::build_rows_tagged(&active_crates);
                 let Screen::KitBrowser(state) = &mut self.screen else { return };
-                state.rows = kit_browser::build_rows(false);
+                state.rows = rows;
+                state.tags = tags;
                 state.selected = state.selected.min(state.rows.len().saturating_sub(1));
                 state.mode = KitBrowserMode::List;
             }
+            Action::OpenCrates => self.open_active_crates(),
         }
     }
 
@@ -874,8 +921,7 @@ impl App {
                         self.kit_name = name;
                         self.screen = Screen::Pads;
                         self.save_kit();
-                        let slug = self.kit_dir.as_ref().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-                        settings::set_active_kit(slug);
+                        settings::set_active_kit(self.kit_dir.as_deref());
                     }
                     Err(e) => self.set_status(format!("Could not create \"{name}\": {e}")),
                 }
@@ -1266,6 +1312,7 @@ impl App {
                 self.editor_key(code, shift);
             }
             Screen::KitBrowser(_) if key.kind != KeyEventKind::Release => self.kit_browser_key(&key),
+            Screen::ActiveCrates(_) if key.kind != KeyEventKind::Release => self.active_crates_key(&key),
             Screen::SampleBrowser(_) if key.kind != KeyEventKind::Release => self.sample_browser_key(&key),
             Screen::NamingKit(_) if key.kind != KeyEventKind::Release => self.naming_kit_key(&key),
             Screen::Settings if key.kind != KeyEventKind::Release => self.settings_key(&key),
@@ -1349,7 +1396,7 @@ impl App {
             KeyCode::Char('0') => self.update_props(|p| p.gain_db = 0.0),
             KeyCode::Delete | KeyCode::Backspace => self.clear_pad(i),
             KeyCode::Char(' ') => self.sampler().stop_all(),
-            KeyCode::Char('k') => self.open_kit_browser(),
+            KeyCode::Tab => self.open_kit_browser(),
             KeyCode::Char('`') => self.open_settings(),
             // Not `S`: that's already a pad key (see `PAD_KEYS`).
             KeyCode::Char('h') if self.missing_retry.is_some() => self.search_for_missing_track(),
@@ -1735,6 +1782,81 @@ mod tests {
     }
 
     #[test]
+    fn tab_opens_the_kit_browser_merged_with_an_active_crates_kits_tagged() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-tab-browse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests in this module.
+
+        let global_kit = kits::create_kit("Global Kit").unwrap();
+        let crate_dir = dir.join("crate");
+        odj_core::crates::Crate::create(crate_dir.clone(), "Techno Night").unwrap();
+        let crate_kit_dir = odj_core::crates::Crate::kits_dir(&crate_dir).join("their-kit");
+        std::fs::create_dir_all(&crate_kit_dir).unwrap();
+        Kit::new("Their Kit".into(), Default::default()).save(&crate_kit_dir.join("kit.json")).unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crates = vec![crate_dir];
+        odj_core::memory::save_settings(&settings).unwrap();
+
+        let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(global_kit.clone()), Kit::load(&global_kit.join("kit.json")), true, AudioRoute::Mixer);
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        a.handle_key(press(KeyCode::Tab));
+
+        let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
+        let rows: Vec<_> = state.rows.iter().map(|r| r.label()).zip(state.tags.iter().cloned()).collect();
+        assert!(rows.contains(&("Global Kit".to_string(), None)), "{rows:?}");
+        assert!(rows.contains(&("Their Kit".to_string(), Some("crate".to_string()))), "{rows:?}");
+
+        // Tab flips to the active-crates tab and back.
+        a.handle_key(press(KeyCode::Tab));
+        assert!(matches!(a.screen, Screen::ActiveCrates(_)));
+        a.handle_key(press(KeyCode::Tab));
+        assert!(matches!(a.screen, Screen::KitBrowser(_)));
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn space_toggles_an_active_crate_and_saves_immediately() {
+        use ratatui::crossterm::event::KeyEventState;
+
+        let _guard = kits::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("odj-active-crates-toggle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        } // SAFETY: see other tests in this module.
+
+        let crate_dir = odj_core::crates::crates_root().join("set");
+        odj_core::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
+
+        let mut a = app("active-crates-toggle");
+        a.screen = Screen::ActiveCrates(ActiveCratesState { rows: odj_core::crates::list_crates(), selected: 0 });
+        let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        a.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(odj_core::memory::load_settings().active_crates, vec![crate_dir.clone()]);
+
+        a.handle_key(press(KeyCode::Char(' '))); // toggles back off
+        assert!(odj_core::memory::load_settings().active_crates.is_empty());
+
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn kit_browser_switches_between_kits() {
         use ratatui::crossterm::event::KeyEventState;
 
@@ -1757,9 +1879,9 @@ mod tests {
         a.save_kit();
         let kit_a_json_before = std::fs::read_to_string(kit_a.join("kit.json")).unwrap();
 
-        key(&mut a, 'k', KeyEventKind::Press);
-        assert!(matches!(a.screen, Screen::KitBrowser(_)));
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
+        a.handle_key(press(KeyCode::Tab));
+        assert!(matches!(a.screen, Screen::KitBrowser(_)));
         // Rows sort existing kits by name: "Kit A" (the current one, row 0), "Kit B" (row 1).
         a.handle_key(press(KeyCode::Down));
         a.handle_key(press(KeyCode::Enter));
@@ -1799,7 +1921,7 @@ mod tests {
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Rows: "Kit A" (active, row 0), "Kit B" (row 1), Embedded, Create new.
-        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Tab));
         a.handle_key(press(KeyCode::Delete));
         let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
         assert!(matches!(state.mode, KitBrowserMode::ConfirmingDelete(0)), "Delete asks first, it doesn't act yet");
@@ -1818,6 +1940,13 @@ mod tests {
         a.handle_key(press(KeyCode::Enter));
         assert!(!kit_b.exists(), "confirmed: the whole directory is gone");
         assert!(matches!(a.screen, Screen::KitBrowser(_)), "stays in the browser, doesn't bounce to Pads");
+
+        // Backspace is a plain navigation key here (e.g. "up" out of a
+        // folder elsewhere in this app) — it must never arm a deletion.
+        a.handle_key(press(KeyCode::Backspace));
+        let Screen::KitBrowser(state) = &a.screen else { panic!("expected the kit browser") };
+        assert!(matches!(state.mode, KitBrowserMode::List), "Backspace doesn't delete a kit");
+        assert!(kit_a.join("kit.json").is_file(), "Kit A is still there");
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
@@ -1848,15 +1977,15 @@ mod tests {
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Rows: "Kit A" (active, row 0), "Kit B" (row 1).
-        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Tab));
         a.handle_key(press(KeyCode::Delete));
         a.handle_key(press(KeyCode::Enter));
 
         assert!(!kit_a.exists(), "actually removed, not just emptied");
-        assert_eq!(a.kit_dir, Some(kit_b), "fell back to the other kit");
+        assert_eq!(a.kit_dir, Some(kit_b.clone()), "fell back to the other kit");
         assert_eq!(a.kit_name, "Kit B");
         assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to \"Kit B\""));
-        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), "kit-b");
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), kit_b.to_string_lossy());
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
@@ -1883,7 +2012,7 @@ mod tests {
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
 
         // Only "Kit A" exists, so row 0 (active) is selected by default.
-        a.handle_key(press(KeyCode::Char('k')));
+        a.handle_key(press(KeyCode::Tab));
         a.handle_key(press(KeyCode::Delete));
         a.handle_key(press(KeyCode::Enter));
 
@@ -1942,7 +2071,7 @@ mod tests {
         let kit = Kit::load(&dir.join("kit.json"));
         assert_eq!(kit.name, "Trap");
         assert_eq!(kit.pads[2].props.mode, Mode::Gate, "the change that triggered the prompt was kept, not lost");
-        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), dir.file_name().unwrap().to_string_lossy());
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), dir.to_string_lossy());
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
@@ -2386,18 +2515,28 @@ mod tests {
         let embedded = &kit_browser::embedded_kits()[0];
         let kit_browser = Screen::KitBrowser(KitBrowserState {
             rows: vec![kit_browser::KitRow::Embedded(embedded), kit_browser::KitRow::CreateNew],
+            tags: vec![None, None],
             selected: 0,
             mode: KitBrowserMode::List,
         });
         let kit_browser_naming = Screen::KitBrowser(KitBrowserState {
             rows: vec![kit_browser::KitRow::Embedded(embedded), kit_browser::KitRow::CreateNew],
+            tags: vec![None, None],
             selected: 1,
             mode: KitBrowserMode::Naming("My New Kit".into()),
         });
         let kit_browser_deleting = Screen::KitBrowser(KitBrowserState {
             rows: vec![kit_browser::KitRow::Existing(PathBuf::from("/tmp/kits/trap"), "Trap".into())],
+            tags: vec![None],
             selected: 0,
             mode: KitBrowserMode::ConfirmingDelete(0),
+        });
+        let active_crates = Screen::ActiveCrates(ActiveCratesState {
+            rows: vec![
+                odj_core::crates::Crate { dir: PathBuf::from("/tmp/crates/techno-night"), name: "Techno Night".into() },
+                odj_core::crates::Crate { dir: PathBuf::from("/tmp/crates/house-set"), name: "House Set".into() },
+            ],
+            selected: 0,
         });
         let sample_browser = Screen::SampleBrowser(SampleBrowser {
             pad: 3,
@@ -2412,6 +2551,7 @@ mod tests {
             kit_browser,
             kit_browser_naming,
             kit_browser_deleting,
+            active_crates,
             sample_browser,
             Screen::NamingKit("Trap".into()),
             Screen::Settings,
@@ -2485,9 +2625,24 @@ mod tests {
                 kit_browser::KitRow::Embedded(&kit_browser::embedded_kits()[0]),
                 kit_browser::KitRow::CreateNew,
             ],
+            tags: vec![None, Some("techno-night".into()), None, None],
             selected: 0,
             mode: KitBrowserMode::List,
         });
         dump_screenshot("sampler-kit-browser", &a, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_active_crates() {
+        let mut a = app("screenshot-active-crates");
+        a.screen = Screen::ActiveCrates(ActiveCratesState {
+            rows: vec![
+                odj_core::crates::Crate { dir: PathBuf::from("/tmp/crates/techno-night"), name: "Techno Night".into() },
+                odj_core::crates::Crate { dir: PathBuf::from("/tmp/crates/house-set"), name: "House Set".into() },
+            ],
+            selected: 0,
+        });
+        dump_screenshot("sampler-active-crates", &a, 120, 40);
     }
 }

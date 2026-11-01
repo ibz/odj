@@ -53,7 +53,9 @@ fn main() -> Result<()> {
              own Volume/EQ to.\n\
              Kits are folders under {}, each with its own samples, plus built-in kits;\n\
              pick one (or create a new one) at startup when none is remembered, and press\n\
-             K any time to switch. Optionally triggered by MIDI\n\
+             K any time to switch. With a crate active (set from odj-player's Settings),\n\
+             kits live inside it instead — picked up live, no restart needed either side.\n\
+             Optionally triggered by MIDI\n\
              Note On/Off too: a previously learned device reconnects automatically when it's\n\
              plugged in, and ` opens Settings to choose another present device (learning its\n\
              pads on the spot) or forget one. The device and each pad's note are kept in the\n\

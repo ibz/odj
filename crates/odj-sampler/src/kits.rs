@@ -1,9 +1,9 @@
-//! Multiple kits, each a self-contained directory under
-//! `$XDG_DATA_HOME/odj/kits/<slug>/`: its own `kit.json` (pad mapping and
-//! properties, see `kit.rs`) plus a `samples/` folder of `.wav` files it
-//! owns. There's no separate registry file listing them — the directory
-//! listing itself is the list (see [`list_kits`]); which one is active is
-//! tracked separately, in `settings.rs`.
+//! Multiple kits, each a self-contained directory under [`kits_dir`]: its
+//! own `kit.json` (pad mapping and properties, see `kit.rs`) plus a
+//! `samples/` folder of `.wav` files it owns. There's no separate registry
+//! file listing them — the directory listing itself is the list (see
+//! [`list_kits`]); which one is active is tracked separately, in
+//! `settings.rs`.
 
 use std::path::PathBuf;
 
@@ -11,8 +11,18 @@ use odj_core::memory::data_dir;
 
 use crate::kit::Kit;
 
+/// `$XDG_DATA_HOME/odj/kits/`, or the active crate's own `kits/` (see
+/// `odj_core::crates::Crate::kits_dir`) when one's set and still present on
+/// disk — e.g. not an unplugged drive. Reads settings fresh every call, so
+/// activating/deactivating a crate from odj-player is picked up live, with
+/// no odj-sampler restart needed.
 pub fn kits_dir() -> PathBuf {
-    data_dir().join("kits")
+    let settings = odj_core::memory::load_settings();
+    settings
+        .active_crate
+        .filter(|d| d.is_dir())
+        .map(|d| odj_core::crates::Crate::kits_dir(&d))
+        .unwrap_or_else(|| data_dir().join("kits"))
 }
 
 /// Every kit that currently exists, as `(directory, name)`, by name.
@@ -89,9 +99,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: test-only, same pattern odj-player's tests already use;
         // serialized against other such tests by `ENV_LOCK` above.
-        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        // XDG_CONFIG_HOME is isolated too, now that `kits_dir` reads
+        // settings — else it would fall back to this machine's real
+        // settings.json (and whatever `active_crate` it has set).
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
         let result = f();
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
         std::fs::remove_dir_all(dir).unwrap();
         result
     }
@@ -125,6 +144,35 @@ mod tests {
             create_kit("Acoustic").unwrap();
             let names: Vec<_> = list_kits().into_iter().map(|(_, name)| name).collect();
             assert_eq!(names, vec!["Acoustic".to_string(), "Zebra".to_string()], "sorted by name");
+        });
+    }
+
+    #[test]
+    fn kits_dir_redirects_into_the_active_crate() {
+        with_temp_data_dir(|| {
+            let global = kits_dir();
+            assert_eq!(global, data_dir().join("kits"));
+
+            let crate_dir = std::env::temp_dir().join(format!("odj-kits-test-crate-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&crate_dir);
+            odj_core::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
+            let mut settings = odj_core::memory::load_settings();
+            settings.active_crate = Some(crate_dir.clone());
+            odj_core::memory::save_settings(&settings).unwrap();
+
+            assert_eq!(kits_dir(), odj_core::crates::Crate::kits_dir(&crate_dir));
+            std::fs::remove_dir_all(&crate_dir).unwrap();
+        });
+    }
+
+    #[test]
+    fn kits_dir_falls_back_to_global_when_the_crate_is_gone() {
+        with_temp_data_dir(|| {
+            let mut settings = odj_core::memory::load_settings();
+            settings.active_crate = Some(std::env::temp_dir().join("odj-kits-test-crate-does-not-exist"));
+            odj_core::memory::save_settings(&settings).unwrap();
+
+            assert_eq!(kits_dir(), data_dir().join("kits"));
         });
     }
 

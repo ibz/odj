@@ -307,17 +307,19 @@ fn draw_memory(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(msg) = app.status() {
+    // A running search takes priority over a one-off status message — see
+    // odj-player's own `draw_footer` for the same convention.
+    if let Some(msg) = app.search_status().or_else(|| app.status().map(str::to_string)) {
         let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
         f.render_widget(Paragraph::new(line), area);
         return;
     }
-    let hints: &[(&str, &str)] = match &app.screen {
-        Screen::Pads => &[("↑↓←→", "select"), ("Shift+pad", "stop"), ("Space", "stop all")],
+    let mut hints: Vec<(&str, &str)> = match &app.screen {
+        Screen::Pads => vec![("↑↓←→", "select"), ("Shift+pad", "stop"), ("Space", "stop all")],
         Screen::Picker(_) => {
-            &[("type", "to filter"), ("↑↓ PgUp PgDn Home End", "select"), ("Enter", "assign"), ("Esc", "clear/close")]
+            vec![("type", "to filter"), ("↑↓ PgUp PgDn Home End", "select"), ("Enter", "assign"), ("Esc", "clear/close")]
         }
-        Screen::Editor(_) => &[
+        Screen::Editor(_) => vec![
             ("Tab", "start/end"),
             ("←/→", "beat (Shift: bar)"),
             (",/.", "±10 ms (Shift: 1 ms)"),
@@ -326,19 +328,22 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("Enter", "keep"),
             ("Esc", "cancel"),
         ],
-        Screen::KitBrowser(_) => &[("↑↓", "select"), ("Enter", "choose/create"), ("Del", "delete"), ("Esc", "cancel")],
-        Screen::SampleBrowser(_) => &[("↑↓", "select"), ("Enter", "choose/open"), ("Esc", "cancel")],
-        Screen::NamingKit(_) => &[("Enter", "save as this name"), ("Esc", "leave unsaved for now")],
-        Screen::Settings => &[],
+        Screen::KitBrowser(_) => vec![("↑↓", "select"), ("Enter", "choose/create"), ("Del", "delete"), ("Esc", "cancel")],
+        Screen::SampleBrowser(_) => vec![("↑↓", "select"), ("Enter", "choose/open"), ("Esc", "cancel")],
+        Screen::NamingKit(_) => vec![("Enter", "save as this name"), ("Esc", "leave unsaved for now")],
+        Screen::Settings => vec![],
     };
+    if matches!(app.screen, Screen::Pads) && app.missing_retry_pending() {
+        hints.push(("H", "search missing"));
+    }
     if !matches!(app.screen, Screen::Pads) {
-        f.render_widget(Paragraph::new(hints_line(hints)), area);
+        f.render_widget(Paragraph::new(hints_line(&hints)), area);
         return;
     }
     // Contextual keys left, globals pinned right — mirrors odj-player's
     // `draw_footer`, the formatting every app's footer is meant to
     // follow; see its own doc comment for the convention itself.
-    let left = hints_line(hints);
+    let left = hints_line(&hints);
     let right = hints_line(&[("K", "kits"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")]);
     let rw = right.width() as u16;
     let [left_area, _, right_area] =

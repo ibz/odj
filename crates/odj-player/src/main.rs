@@ -54,7 +54,12 @@ fn main() -> Result<()> {
                      if odj-mixer is running when this starts, this deck routes its output\n\
                      through it instead of a real device, and odj-mixer applies Volume/EQ\n\
                      live to that — pick it there, as \"Deck n\". Otherwise this plays\n\
-                     straight to a real output, same as always, with no filters available."
+                     straight to a real output, same as always, with no filters available.\n\n\
+                     Tab opens a browse screen with two tabs — Folder (a plain filesystem\n\
+                     browser) and Crate (a curated track roster of your own, with its own cue\n\
+                     memory and odj-sampler kits, instead of the global library) — Tab again\n\
+                     flips between them. Settings (`) manages crates and saved folders; see\n\
+                     the README's Crates section."
                 );
                 return Ok(());
             }
@@ -69,16 +74,10 @@ fn main() -> Result<()> {
         }
     }
     let memory = Memory::load();
-    // No folder named on the command line, and more than one saved to
-    // choose from: let the user pick instead of silently guessing one.
-    let mut pick_music_dir = false;
     let (dir, file) = match positional {
         Some(p) if p.is_file() => (p.parent().map(PathBuf::from).unwrap_or_default(), Some(p)),
         Some(p) => (p, None),
-        None => {
-            pick_music_dir = memory.settings.music_dirs.len() > 1;
-            (default_music_dir(&memory), None)
-        }
+        None => (default_music_dir(&memory), None),
     };
     let dir = dir.canonicalize().unwrap_or(dir);
 
@@ -89,7 +88,7 @@ fn main() -> Result<()> {
     }
 
     let (mut terminal, key_release) = tui::init();
-    let result = start(&mut terminal, browser, file, key_release, memory, pick_music_dir, deck_number);
+    let result = start(&mut terminal, browser, file, key_release, memory, deck_number);
     tui::restore(key_release);
     result
 }
@@ -116,7 +115,6 @@ fn start(
     file: Option<PathBuf>,
     key_release: bool,
     memory: Memory,
-    pick_music_dir: bool,
     deck_number: Option<u8>,
 ) -> Result<()> {
     // If odj-mixer is running right now, route through a virtual sink for
@@ -142,14 +140,16 @@ fn start(
         Some(f) if is_audio(&f) => {
             app.load(f);
         }
-        // Nothing configured yet: straight to "my music folders" instead of
-        // a browser that has nowhere useful to call home.
-        _ if app.music_dirs().is_empty() => app.settings_screen.open_to_music_dirs(),
-        // Several saved folders and no folder named on the command line:
-        // let the user pick instead of opening whichever one happened to
-        // be saved first.
-        _ if pick_music_dir => app.settings_screen.open_to_switch(0),
-        _ => app.browser.open = true,
+        // No file named on the command line: straight into the browse
+        // screen — Folder tab (asking which saved folder first if there
+        // are several) or Crate tab, whichever `app` defaults to; an
+        // empty crate specifically falls back to the Folder tab here
+        // (startup only — see `skip_empty_crate_tab_at_startup`'s own
+        // doc comment for why `Tab` itself doesn't do this).
+        _ => {
+            app.start_browsing();
+            app.skip_empty_crate_tab_at_startup();
+        }
     }
     let result = run(terminal, &mut app, &setup.errors);
     app.remember();

@@ -10,7 +10,7 @@ use tui_big_text::{BigText, PixelSize};
 
 use odj_core::key::Key;
 use odj_core::track::{Track, WAVE_RATE, WaveBin};
-use odj_core::tui::{AMBER, DIM, Page, centered, draw_help, hinted_box, key_hint};
+use odj_core::tui::{AMBER, DIM, PAGE_HINT, Page, centered, draw_help, hinted_box, key_hint, tab_span};
 
 use crate::app::{App, AudioRoute};
 use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
@@ -119,10 +119,14 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     draw_info(f, info, app, s);
     draw_footer(f, footer, app, s);
 
-    if app.browser.open {
+    if let Some(i) = app.picking_folder() {
+        draw_folder_picker(f, app, i);
+    } else if app.browser.open {
         draw_browser(f, app);
     } else if app.settings_screen.is_open() {
         draw_settings(f, app);
+    } else if app.crate_browser.is_open() {
+        draw_crate_browser(f, app, s);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -552,7 +556,11 @@ const GLOBAL_HINTS: &[(&str, &str)] = &[("`", "settings"), ("?", "help"), ("Ctrl
 const PLAYING_GLOBAL_HINTS: &[(&str, &str)] = &[("Tab", "browse"), ("`", "settings"), ("?", "help"), ("Ctrl+C", "quit")];
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
-    if let Some(msg) = app.status() {
+    // A running search takes priority over a one-off status message —
+    // it's the more currently-relevant thing — but steps aside the
+    // instant it's done, for the "Found N"/"No missing tracks" message
+    // `finish_search_for_missing_tracks` sets right as it finishes.
+    if let Some(msg) = app.crate_browser.search_status().or_else(|| app.status().map(str::to_string)) {
         let line = Line::from(Span::styled(format!(" {msg}"), Style::new().fg(AMBER)));
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -617,7 +625,10 @@ fn draw_browser(f: &mut Frame, app: &App) {
     } else {
         format!(" {} ", b.dir.display())
     };
-    let mut block = Block::bordered().title(title).border_style(Style::new().fg(AMBER));
+    let mut block = Block::bordered()
+        .title(title)
+        .title_bottom(key_hint("Tab", "Crate", PAGE_HINT).right_aligned())
+        .border_style(Style::new().fg(AMBER));
     if !already_covered {
         let badge = if first_run { "Use current folder" } else { "Add to music folders" };
         block = block.title_bottom(key_hint("Ctrl+U", badge, AMBER).left_aligned());
@@ -651,13 +662,23 @@ fn draw_browser(f: &mut Frame, app: &App) {
             })
             .collect()
     };
-    // Three groups on one row: the primary action highlighted on the left,
-    // how to search in the middle, plain navigation on the right. Tab
-    // (close) isn't worth a mention — Esc already does that.
+    // A tab row below the top border (see `draw_tabbed_list`'s own doc
+    // comment — this screen predates it and has its own title/Ctrl+U
+    // badge going on, so it isn't built from that helper, but still gets
+    // the same tab row and border Tab badge). Three groups on the hints
+    // row below the list: the primary action highlighted on the left,
+    // how to search in the middle, plain navigation on the right.
     let inner = block.inner(area);
-    let [list_area, hints_row] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+    let [tabs_area, _, list_area, hints_row] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    f.render_widget(Paragraph::new(browse_tabs_row(true)), tabs_area);
 
     // Onboarding: Ctrl+U (on the border) is the one highlighted action, so
     // Enter/open isn't a second one — it's folded into plain navigation,
@@ -693,15 +714,20 @@ fn draw_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The settings screen: a top-level list of global settings, one of which
-/// (music folders) drills into its own list.
+/// The settings screen: a top-level list of global settings, two of which
+/// (music folders, crate) drill into their own list.
 fn draw_settings(f: &mut Frame, app: &App) {
+    if let Some(name) = app.settings_screen.naming_crate() {
+        draw_naming_crate(f, name);
+        return;
+    }
     let area = centered(f.area(), 60, 50);
     let screen = &app.settings_screen;
-    let title = match (screen.folder().is_some(), screen.editable()) {
-        (true, true) => " My music folders ",
-        (true, false) => " Music folders ",
-        (false, _) => " Settings ",
+    let title = match (screen.folder().is_some(), screen.crate_row().is_some(), screen.editable()) {
+        (true, _, true) => " My music folders ",
+        (true, _, false) => " Music folders ",
+        (_, true, _) => " Crate ",
+        (false, false, _) => " Settings ",
     };
     let block = Block::bordered().title(title).border_style(Style::new().fg(AMBER));
 
@@ -714,28 +740,147 @@ fn draw_settings(f: &mut Frame, app: &App) {
         };
         let hints: &[&str] = if !screen.editable() {
             &["↑↓ select", "Enter/→ browse here", "Esc cancel"]
-        } else if dirs.is_empty() && screen.onboarding() {
-            // Forced first-run setup: nothing to select or remove yet, and
-            // no backing out either — a folder is needed before anything else.
-            &["Enter/→ browse"]
         } else if dirs.is_empty() {
             &["Enter/→ browse", "Esc back"]
         } else {
             &["↑↓ select", "X/Delete remove", "Enter/→ add (browse, then Ctrl+U)", "Esc back"]
         };
         (items, hints, i)
+    } else if let Some(i) = screen.crate_row() {
+        let known = app.known_crates();
+        let active = app.active_crate_dir();
+        let mut items = vec![ListItem::new(if active.is_none() { "None (active)" } else { "None" })];
+        items.extend(known.iter().map(|d| {
+            let name = odj_core::crates::Crate::load(d.clone()).name;
+            let label = if active == Some(d) { format!("{name} (active)") } else { name };
+            ListItem::new(label)
+        }));
+        let hints: &[&str] = &["↑↓ select", "Enter activate", "X/Delete forget", "N new", "Esc back"];
+        (items, hints, i)
     } else {
         // The row menu is never gated — only the music-folders list itself
         // can be, and only during forced first-run setup.
+        let crate_name = app.active_crate_dir().map(|d| odj_core::crates::Crate::load(d.clone()).name).unwrap_or_else(|| "None".into());
         let items = vec![
             ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" })),
             ListItem::new(format!("Music folders ({})", app.music_dirs().len())),
+            ListItem::new(format!("Crate: {crate_name}")),
         ];
         (items, &["↑↓ select", "Enter toggle/open", "Esc close"], screen.row())
     };
     let list_area = hinted_box(f, area, block, hints);
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The new crate's name, typed inline — same convention as odj-sampler's
+/// kit-naming prompt (a literal `▏` glyph stands in for a cursor).
+fn draw_naming_crate(f: &mut Frame, name: &str) {
+    let area = centered(f.area(), 60, 20);
+    let block = Block::bordered().title(" Name this crate ").border_style(Style::new().fg(AMBER));
+    let hints: &[&str] = &["Enter confirm", "Esc cancel"];
+    let body_area = hinted_box(f, area, block, hints);
+    f.render_widget(Paragraph::new(format!("{name}▏")), body_area);
+}
+
+/// The Folder/Crate row atop either picker, styled like the help
+/// overlay's own tabs (see `odj_core::tui::tab_span`) — black on amber
+/// for whichever's current, plain amber otherwise.
+fn browse_tabs_row(folder_current: bool) -> Line<'static> {
+    Line::from(vec![tab_span("Folder", folder_current), Span::raw(" "), tab_span("Crate", !folder_current)])
+}
+
+/// Borders a list with a tab row above it and the usual hints below,
+/// exactly the way the help overlay's own `Esc`/`Tab` corners and tab
+/// row look (see `odj_core::tui::draw_help`) — `middle` is whatever's
+/// specific to this screen (e.g. "↑↓ select  Enter/→ open").
+fn draw_tabbed_list(f: &mut Frame, area: Rect, title: &str, folder_current: bool, middle: &str) -> Rect {
+    let next_tab = if folder_current { "Crate" } else { "Folder" };
+    let block = Block::bordered()
+        .title(format!(" {title} "))
+        .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
+        .title_bottom(Line::styled(format!(" {middle} "), Style::new().fg(DIM)).centered())
+        .title_bottom(key_hint("Tab", next_tab, PAGE_HINT).right_aligned())
+        .border_style(Style::new().fg(AMBER));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let [tabs_area, _, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(browse_tabs_row(folder_current)), tabs_area);
+    list_area
+}
+
+/// The Folder tab's own "which saved folder" step — shown instead of
+/// `draw_browser` while there's more than one saved.
+fn draw_folder_picker(f: &mut Frame, app: &App, selected: usize) {
+    let area = centered(f.area(), 60, 50);
+    let list_area = draw_tabbed_list(f, area, "Pick a music folder", true, "↑↓ select  Enter/→ open");
+    let items: Vec<ListItem> = app.music_dirs().iter().map(|d| ListItem::new(d.display().to_string())).collect();
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The Crate tab's own "which crate" step — shown instead of the track
+/// roster below while there's more than one known crate (or none at all).
+fn draw_crate_picker(f: &mut Frame, app: &App, selected: usize) {
+    use odj_core::crates::Crate;
+    let area = centered(f.area(), 60, 50);
+    let list_area = draw_tabbed_list(f, area, "Pick a crate", false, "↑↓ select  Enter/→ open");
+    let known = app.known_crates();
+    let items: Vec<ListItem> = if known.is_empty() {
+        vec![ListItem::new("(no crates yet — add one from Settings)").fg(DIM)]
+    } else {
+        known.iter().map(|d| ListItem::new(Crate::load(d.clone()).name)).collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
+/// The active crate's track roster: title/artist, a right-aligned
+/// availability marker, and "— on YouTube" when missing with a URL —
+/// or, still at the "which crate" step, `draw_crate_picker`.
+fn draw_crate_browser(f: &mut Frame, app: &App, s: &Snapshot) {
+    use odj_core::crates::Availability;
+    if let Some(i) = app.crate_browser.picking() {
+        draw_crate_picker(f, app, i);
+        return;
+    }
+    let area = centered(f.area(), 70, 70);
+    let any_missing = app.crate_browser.tracks().iter().any(|t| app.crate_browser.availability(&t.id) == Some(Availability::Missing));
+    let middle = if any_missing { "↑↓ select  Enter/→ load  S search missing" } else { "↑↓ select  Enter/→ load" };
+    let list_area = draw_tabbed_list(f, area, "Crate", false, middle);
+    let tracks = app.crate_browser.tracks();
+    let items: Vec<ListItem> = if tracks.is_empty() {
+        let msg = if s.track.is_some() {
+            "(no tracks yet — U adds the loaded track)"
+        } else {
+            "(no tracks yet — load one from the Folder tab, then press U)"
+        };
+        vec![ListItem::new(msg).fg(DIM)]
+    } else {
+        tracks
+            .iter()
+            .map(|t| {
+                let (marker, color) = match app.crate_browser.availability(&t.id) {
+                    Some(Availability::Changed) => (" (changed)", Color::Yellow),
+                    Some(Availability::Missing) => (" (missing)", Color::Red),
+                    Some(Availability::Available) | None => ("", Color::Reset),
+                };
+                let youtube = match (&t.youtube_url, app.crate_browser.availability(&t.id)) {
+                    (Some(_), Some(Availability::Missing)) => " — on YouTube",
+                    _ => "",
+                };
+                let artist = t.artist.as_deref().map(|a| format!(" — {a}")).unwrap_or_default();
+                ListItem::new(format!("{}{artist}{marker}{youtube}", t.title)).fg(color)
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(app.crate_browser.selected()));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
@@ -756,9 +901,9 @@ pub const HELP: &[Page] = &[
             ("R", "Reverse"),
             ("F", "Sync to the master deck"),
             ("B / N", "Previous / next track in folder"),
-            ("Tab", "File browser"),
-            ("Ctrl+U in the browser", "Add this folder to your music folders"),
-            ("`", "Settings: auto-cue, music folders"),
+            ("Tab", "Browse"),
+            ("U", "Add this track to the active crate"),
+            ("`", "Settings: auto-cue, music folders, crate"),
         ],
     ),
     Page::Keys(

@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use odj_core::grid::{BAR, BeatGrid};
 use odj_core::library::fuzzy_match;
+use odj_core::library_index::{IndexRefresher, LibraryIndex, RefreshProgress};
 use odj_core::memory::{Cue, Memory, user_grid};
 use odj_core::track::{Track, decode};
 use odj_core::tui::Help;
@@ -58,6 +59,7 @@ pub struct Slot {
 }
 
 /// A stored cue as the picker lists it.
+#[derive(Clone)]
 pub struct CueEntry {
     pub track_id: String,
     pub path: PathBuf,
@@ -336,6 +338,19 @@ pub struct App {
     holds: [Option<Instant>; PADS],
     pub memory: MemoryUse,
     memory_at: Option<Instant>,
+    /// A pick that failed because its file couldn't be found where the
+    /// cue remembered it — kept so `S` can retry it once a music-folder
+    /// search finds the file elsewhere (it moved to a different subfolder
+    /// within an already-configured music dir; see `odj_core::library_index`).
+    missing_retry: Option<(usize, CueEntry)>,
+    /// One `IndexRefresher` per configured music folder while a search for
+    /// `missing_retry` is running, drained into `found` as each finishes;
+    /// `search_total` is only for the status line and to know a search
+    /// both happened and is now fully done (`> 0`, `searching` empty)
+    /// versus never started (`== 0`).
+    searching: Vec<(PathBuf, IndexRefresher)>,
+    found: Vec<(PathBuf, LibraryIndex)>,
+    search_total: usize,
     pub quit: bool,
 }
 
@@ -369,6 +384,10 @@ impl App {
             holds: [None; PADS],
             memory: MemoryUse { process: None, system: system_memory() },
             memory_at: None,
+            missing_retry: None,
+            searching: Vec::new(),
+            found: Vec::new(),
+            search_total: 0,
             quit: false,
         };
         app.load_kit(kit_dir, kit);
@@ -986,6 +1005,11 @@ impl App {
 
     /// Takes the chosen cue: a loop goes straight on the pad, a bare cue to the editor.
     fn choose(&mut self, pad: usize, e: &CueEntry) {
+        if !e.path.is_file() {
+            self.set_status(format!("{}: not found — press H to search your music folders", e.name));
+            self.missing_retry = Some((pad, e.clone()));
+            return;
+        }
         let source =
             PadSource { track_id: e.track_id.clone(), path: e.path.clone(), title: e.title.clone(), artist: e.artist.clone(), sample_rate: e.sample_rate };
         match e.cue.loop_out {
@@ -1096,6 +1120,76 @@ impl App {
         }
     }
 
+    /// A status line for an in-progress missing-track search, overriding
+    /// the timed one so progress stays visible for as long as it runs.
+    pub fn search_status(&self) -> Option<String> {
+        (self.search_total > 0 && !self.searching.is_empty())
+            .then(|| format!("Searching {}/{} music folders for the missing track…", self.found.len(), self.search_total))
+    }
+
+    /// Whether `S` would do anything right now — a failed pick waiting to
+    /// be retried.
+    pub fn missing_retry_pending(&self) -> bool {
+        self.missing_retry.is_some()
+    }
+
+    /// `S` from `Screen::Pads`, with a pick waiting on `missing_retry`:
+    /// starts a search of every configured music folder — a no-op if
+    /// one's already running or none are configured.
+    fn search_for_missing_track(&mut self) {
+        if self.missing_retry.is_none() || self.search_total > 0 {
+            return;
+        }
+        let music_dirs = Memory::load().settings.music_dirs;
+        if music_dirs.is_empty() {
+            self.set_status("No music folders configured to search");
+            return;
+        }
+        self.found.clear();
+        self.search_total = music_dirs.len();
+        self.searching = music_dirs.into_iter().map(|dir| (dir.clone(), IndexRefresher::start(dir))).collect();
+    }
+
+    /// Once every folder's search has finished, tries `missing_retry`
+    /// against the results: a hit heals its stored path (`Memory::heal_path`)
+    /// and retries the original pick with the found path; a miss leaves
+    /// `missing_retry` in place so adding another folder and pressing `S`
+    /// again can still find it.
+    fn finish_missing_search(&mut self) {
+        if self.search_total == 0 {
+            return;
+        }
+        let mut i = 0;
+        while i < self.searching.len() {
+            match self.searching[i].1.poll() {
+                Some(RefreshProgress::Finished(index)) => {
+                    let (dir, _) = self.searching.remove(i);
+                    self.found.push((dir, index));
+                }
+                Some(RefreshProgress::Scanning { .. }) | None => i += 1,
+            }
+        }
+        if !self.searching.is_empty() {
+            return;
+        }
+        self.search_total = 0;
+        let found = std::mem::take(&mut self.found);
+        let Some((_, entry)) = &self.missing_retry else { return };
+        let hit = found.iter().find_map(|(dir, index)| index.find(dir, &entry.track_id));
+        match hit {
+            Some(new_path) => {
+                let (pad, mut entry) = self.missing_retry.take().expect("checked above");
+                let _ = Memory::load().heal_path(&entry.track_id, &new_path);
+                entry.path = new_path;
+                self.choose(pad, &entry);
+            }
+            None => {
+                let name = entry.name.clone();
+                self.set_status(format!("{name}: still not found in your music folders"));
+            }
+        }
+    }
+
     fn close_editor(&mut self, keep: bool) {
         let Screen::Editor(ed) = std::mem::replace(&mut self.screen, Screen::Pads) else { return };
         let old = self.sampler().set_preview(None);
@@ -1143,6 +1237,7 @@ impl App {
     pub fn tick(&mut self) {
         self.finish_loads();
         self.finish_editor_load();
+        self.finish_missing_search();
         let now = Instant::now();
         for i in 0..PADS {
             if self.holds[i].is_some_and(|t| now >= t) {
@@ -1256,6 +1351,8 @@ impl App {
             KeyCode::Char(' ') => self.sampler().stop_all(),
             KeyCode::Char('k') => self.open_kit_browser(),
             KeyCode::Char('`') => self.open_settings(),
+            // Not `S`: that's already a pad key (see `PAD_KEYS`).
+            KeyCode::Char('h') if self.missing_retry.is_some() => self.search_for_missing_track(),
             _ => {}
         }
     }
@@ -1527,6 +1624,114 @@ mod tests {
         assert_eq!(first.path, second.path, "identical audio reuses the same file, not a duplicate");
         let files: Vec<_> = std::fs::read_dir(a.samples_dir().unwrap()).unwrap().collect();
         assert_eq!(files.len(), 1, "no duplicate written to disk");
+    }
+
+    /// A cue whose file moved to a different subfolder within the same
+    /// configured music dir (too far for `memory::resolve` alone): picking
+    /// it offers a retry, and `H` finds and heals it via the library
+    /// index, then retries the pick successfully.
+    #[test]
+    fn a_moved_cue_offers_a_retry_and_h_heals_it_via_the_library_index() {
+        with_temp_dirs(|| {
+            let dir = std::env::temp_dir().join(format!("odj-sampler-missing-track-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let music = dir.join("music");
+            std::fs::create_dir_all(music.join("old-folder")).unwrap();
+            std::fs::create_dir_all(music.join("new-folder")).unwrap();
+            odj_core::wav::write_wav(&music.join("old-folder/track.wav"), &[0.1, -0.1, 0.2, -0.2], 2, 44_100).unwrap();
+            let id = odj_core::track::decode(&music.join("old-folder/track.wav")).unwrap().id;
+
+            let mut m = Memory::load();
+            m.settings.music_dirs = vec![music.clone()];
+            m.save_settings().unwrap();
+            let mut track = Track::from_samples(music.join("old-folder/track.wav"), "T".into(), None, 44_100, vec![0.0; 4]);
+            track.id = id.clone();
+            let mem = odj_core::memory::TrackMemory {
+                hot: [Some(Cue { pos: 0.0, loop_out: Some(2.0) }), None, None],
+                ..Default::default()
+            };
+            m.save_track(&track, &mem).unwrap();
+
+            // Moved far enough that `resolve` (which only tries each
+            // configured music dir's own root) won't find it any more.
+            std::fs::rename(music.join("old-folder/track.wav"), music.join("new-folder/track.wav")).unwrap();
+
+            let mut a = app("missing-track-retry");
+            let entry = CueEntry {
+                track_id: id.clone(),
+                path: music.join("old-folder/track.wav"),
+                title: "T".into(),
+                artist: None,
+                sample_rate: 44_100,
+                grid: None,
+                tapped_bpm: None,
+                kind: "hot A".into(),
+                cue: Cue { pos: 0.0, loop_out: Some(2.0) },
+                name: "T".into(),
+            };
+            a.choose(3, &entry);
+            assert!(a.missing_retry_pending());
+            assert!(a.status().is_some_and(|s| s.contains("not found")), "{:?}", a.status());
+            assert!(a.slots[3].kit.source.is_none(), "not assigned yet — the file isn't found");
+
+            key(&mut a, 'h', KeyEventKind::Press);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while a.missing_retry_pending() && std::time::Instant::now() < deadline {
+                a.tick();
+            }
+            assert!(!a.missing_retry_pending(), "the search should have found and healed the track");
+            assert!(a.slots[3].kit.source.is_some(), "the retried pick assigns the pad");
+
+            let healed = Memory::load().tracks().into_iter().find(|t| t.id == id).expect("still registered");
+            assert_eq!(healed.path, music.join("new-folder/track.wav"), "healed on disk too");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A search that comes up empty leaves the retry pending — not
+    /// discarded — so adding another music folder and pressing `H` again
+    /// can still find it later.
+    #[test]
+    fn a_search_that_finds_nothing_leaves_the_retry_pending() {
+        with_temp_dirs(|| {
+            let dir = std::env::temp_dir().join(format!("odj-sampler-missing-track-not-found-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let music = dir.join("music");
+            std::fs::create_dir_all(&music).unwrap();
+
+            let mut m = Memory::load();
+            m.settings.music_dirs = vec![music.clone()];
+            m.save_settings().unwrap();
+
+            let mut a = app("missing-track-not-found");
+            let entry = CueEntry {
+                track_id: "deadbeef".into(),
+                path: music.join("gone.wav"),
+                title: "Gone".into(),
+                artist: None,
+                sample_rate: 44_100,
+                grid: None,
+                tapped_bpm: None,
+                kind: "hot A".into(),
+                cue: Cue { pos: 0.0, loop_out: Some(2.0) },
+                name: "Gone".into(),
+            };
+            a.choose(5, &entry);
+            assert!(a.missing_retry_pending());
+
+            key(&mut a, 'h', KeyEventKind::Press);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while a.search_status().is_some() && std::time::Instant::now() < deadline {
+                a.tick();
+            }
+            a.tick();
+            assert!(a.missing_retry_pending(), "a miss keeps the pick around for a later retry");
+            assert!(a.status().is_some_and(|s| s.contains("still not found")), "{:?}", a.status());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

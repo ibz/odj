@@ -49,11 +49,13 @@ cargo run --release -p odj-player -- --deck 2     # forces deck 2 (defaults to w
 cargo run --release -p odj-sampler                # 16 pads of stored cues
 ```
 
-The first run (or whenever no music folder is set yet) asks you to pick one
-and remembers it; with more than one saved, it asks which to open instead of
-guessing. Passing a folder on the command line just browses there for that
-session, without changing what's remembered. Manage saved folders any time
-from Settings (`` ` ``).
+With no file or folder on the command line, odj-player opens straight into
+Tab's own browse screen: the Folder tab (asking which saved folder, if
+there's more than one) or the Crate tab, whichever it defaults to.
+Ctrl+U there saves whatever folder you're browsing for next time. Passing
+a folder on the command line just browses there for that session, without
+changing what's remembered. Manage saved folders any time from Settings
+(`` ` ``).
 
 Needs `librubberband` (for Master Tempo), ALSA and PipeWire; building also
 needs libclang. Plays MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A and AIFF. If a
@@ -152,8 +154,34 @@ mixer.
 Press `?` in the app for all keys, or see [Keys](#keys). Memory points, hot cues, loops, beat grid
 corrections and quantize are remembered per track, one JSON file each under
 `~/.local/share/odj/tracks/`. Files are named by a fingerprint of the audio, so
-cues survive renaming, moving and retagging. Settings such as Auto Cue live in
-`~/.config/odj/settings.json`.
+cues survive renaming, moving and retagging. The path saved alongside them is
+relative to whichever music folder the track was under, not absolute — so a
+drive moving to a different mount point, or a crate's roster opened on a
+different machine, still finds every track as long as a music folder with the
+same layout underneath is added back (Ctrl+U in the browser); a path outside
+every music folder is kept absolute, as before. Settings such as Auto Cue live
+in `~/.config/odj/settings.json`.
+
+### Crates
+
+A crate is a directory holding a curated set's track memory and
+odj-sampler kits (including their `.wav` files), so the whole thing can be
+versioned and backed up as a git repo you manage by hand; odj never
+touches git itself. Track audio is never copied into it: a row shows
+missing if the file isn't where it was, or if its sound no longer matches.
+
+Create one from Settings (`` ` ``) → Crate → `N`: just a name, and it's
+created under `~/.local/share/odj/crates/` — fixed, not something you pick
+yourself. (A crate directory placed there by hand ahead of time, e.g.
+`git clone`d in, is adopted under its existing name rather than
+overwritten if you type a matching one.) Once a crate is active, `U` adds
+the loaded track to it; `Tab`'s own Crate tab browses its tracks (picking
+among your crates first, if you have more than one) — starting
+odj-player straight into an empty crate browses your music
+folder instead, since there's nothing to do yet but add something, but
+`Tab` itself always shows the Crate tab when asked, empty or not. With no
+crate active, odj-player and odj-sampler use the global library in
+`~/.local/share/odj`, same as always.
 
 ## odj-sampler
 
@@ -418,9 +446,9 @@ along their bottom edge, as does the output picker at start.
 | `R` | Reverse |
 | `F` | Sync to the master deck |
 | `B / N` | Previous / next track in folder |
-| `Tab` | File browser |
-| `Ctrl+U in the browser` | Add this folder to your music folders |
-| `` ` `` | Settings: auto-cue, music folders |
+| `Tab` | Browse |
+| `U` | Add this track to the active crate |
+| `` ` `` | Settings: auto-cue, music folders, crate |
 
 #### Cues
 

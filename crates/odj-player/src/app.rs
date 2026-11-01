@@ -1,5 +1,6 @@
 //! Keyboard handling and app state around the deck.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
@@ -7,9 +8,11 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use odj_core::crates::{Availability, AvailabilityChecker, Crate};
 use odj_core::library::{Browser, siblings};
+use odj_core::library_index::{IndexRefresher, LibraryIndex, RefreshProgress};
 use odj_core::link;
-use odj_core::memory::{Memory, TrackMemory};
+use odj_core::memory::{LibraryTrack, Memory, TrackMemory};
 use odj_core::track::Track;
 use odj_core::tui::Help;
 
@@ -56,26 +59,27 @@ struct Hold {
     until: Option<Instant>,
 }
 
-/// How many rows the settings screen has (auto-cue, music folders).
-const SETTINGS_ROWS: usize = 2;
+/// How many rows the settings screen has (auto-cue, music folders, crate).
+const SETTINGS_ROWS: usize = 3;
 
-/// The settings screen: a list of global settings, one of which (music
-/// folders) drills into its own list.
+/// The settings screen: a list of global settings, two of which (music
+/// folders, crate) drill into their own list.
 #[derive(Default)]
 pub struct SettingsScreen {
     open: bool,
     row: usize,
     /// Set while drilled into the music-folders row, with the selected index.
     folder: Option<usize>,
+    /// Set while drilled into the crate row, with the selected index — `0`
+    /// is "None" (deactivate), `i` is `known_crates[i - 1]`.
+    crate_row: Option<usize>,
+    /// Set while typing the new crate's name — the crate row shows a name
+    /// prompt instead of the list.
+    naming_crate: Option<String>,
     /// False when this is the quick switcher opened by going "up" from a
     /// music folder while browsing: picking is still allowed, but adding
     /// and removing folders is something only the real settings screen does.
     editable: bool,
-    /// True only for the forced first-run flow (`open_to_music_dirs`): no
-    /// folder configured yet anywhere, so there's nothing else to do. Not
-    /// re-triggered by later emptying an already-set-up list by hand — that
-    /// Esc should still work, since you're not stuck, you just chose to.
-    onboarding: bool,
 }
 
 impl SettingsScreen {
@@ -91,30 +95,25 @@ impl SettingsScreen {
         self.folder
     }
 
-    pub fn editable(&self) -> bool {
-        self.editable
+    pub fn crate_row(&self) -> Option<usize> {
+        self.crate_row
     }
 
-    pub fn onboarding(&self) -> bool {
-        self.onboarding
+    pub fn naming_crate(&self) -> Option<&str> {
+        self.naming_crate.as_deref()
+    }
+
+    pub fn editable(&self) -> bool {
+        self.editable
     }
 
     fn toggle(&mut self) {
         self.open = !self.open;
         self.row = 0;
         self.folder = None;
+        self.crate_row = None;
+        self.naming_crate = None;
         self.editable = true;
-        self.onboarding = false;
-    }
-
-    /// Opens straight into the (editable) music folders list, for first-run
-    /// setup when nothing's configured yet, skipping the row menu.
-    pub fn open_to_music_dirs(&mut self) {
-        self.open = true;
-        self.row = 1;
-        self.folder = Some(0);
-        self.editable = true;
-        self.onboarding = true;
     }
 
     /// Opens the non-editable quick switcher, folder `i` selected — for
@@ -125,22 +124,25 @@ impl SettingsScreen {
         self.row = 1;
         self.folder = Some(i);
         self.editable = false;
-        self.onboarding = false;
     }
 
-    /// Esc: out of the folder list first, else closes. The quick switcher
-    /// has no row list to step back to, so it always closes outright.
+    /// Esc: out of the folder or crate list first, else closes. The quick
+    /// switcher has no row list to step back to, so it always closes outright.
     fn back(&mut self) {
-        if !self.editable || self.folder.take().is_none() {
+        let drilled = self.folder.take().is_some() || self.crate_row.take().is_some();
+        if !self.editable || !drilled {
             self.open = false;
             self.folder = None;
+            self.crate_row = None;
         }
     }
 
-    /// Jumping to a folder leaves the screen entirely, not just its list.
+    /// Jumping to a folder or crate leaves the screen entirely, not just its list.
     fn close(&mut self) {
         self.open = false;
         self.folder = None;
+        self.crate_row = None;
+        self.naming_crate = None;
     }
 }
 
@@ -151,6 +153,121 @@ pub enum AudioRoute {
     Mixer,
     /// Straight to a real device, named here.
     Direct(String),
+}
+
+/// Which of the two browse tabs is current — opened by `Tab`, either from
+/// the deck or at startup; `Tab`/`Shift+Tab` flip between them while
+/// either is open. Not saved to disk; `App::new` just picks whichever
+/// matches the crate that's already active, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowseTab {
+    /// `self.browser`: a plain filesystem folder, same as always.
+    Folder,
+    /// `self.crate_browser`: the active crate's own curated roster.
+    Crate,
+}
+
+/// The active crate's curated track roster — the active crate's
+/// `Memory::tracks()`, each row's on-disk availability checked off the UI
+/// thread (decoding a file to confirm its id can be slow; see
+/// `odj_core::crates::AvailabilityChecker`).
+#[derive(Default)]
+pub struct CrateBrowser {
+    open: bool,
+    /// `Some(i)` while still choosing which known crate to open (index
+    /// into `known_crates`, selectable even when that list is empty) —
+    /// `None` once one's picked and `tracks` holds its roster.
+    picking: Option<usize>,
+    selected: usize,
+    tracks: Vec<LibraryTrack>,
+    availability: HashMap<String, Availability>,
+    checker: AvailabilityChecker,
+    /// "Search for missing tracks" (`S`): one refresher per configured
+    /// music folder while a search is running, drained into `found` as
+    /// each finishes; `search_total` is only for the status line ("2/3")
+    /// and to know a search both happened and is now fully done (`> 0`,
+    /// `searching` empty) versus never started (`== 0`).
+    searching: Vec<(PathBuf, IndexRefresher)>,
+    found: Vec<(PathBuf, LibraryIndex)>,
+    search_total: usize,
+}
+
+impl CrateBrowser {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn picking(&self) -> Option<usize> {
+        self.picking
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn tracks(&self) -> &[LibraryTrack] {
+        &self.tracks
+    }
+
+    pub fn availability(&self, id: &str) -> Option<Availability> {
+        self.availability.get(id).copied()
+    }
+
+    /// A status line for an in-progress search, or `None` once it's
+    /// either finished or never started.
+    pub fn search_status(&self) -> Option<String> {
+        (self.search_total > 0 && !self.searching.is_empty())
+            .then(|| format!("Searching {}/{} music folders for missing tracks…", self.found.len(), self.search_total))
+    }
+
+    /// Starts one `IndexRefresher` per folder in `music_dirs` — there's no
+    /// way to know in advance which one (if any) now has a given missing
+    /// track, so all of them are searched. A no-op if one's already
+    /// running, or if `music_dirs` is empty.
+    fn start_search(&mut self, music_dirs: &[PathBuf]) {
+        if self.search_total > 0 || music_dirs.is_empty() {
+            return;
+        }
+        self.found.clear();
+        self.search_total = music_dirs.len();
+        self.searching = music_dirs.iter().map(|dir| (dir.clone(), IndexRefresher::start(dir.clone()))).collect();
+    }
+
+    /// `Some` exactly once, the frame a search's last refresher finishes —
+    /// the found indices, for the caller (which holds the `Memory` this
+    /// type doesn't) to try healing any still-`Missing` tracks against.
+    fn take_finished_search(&mut self) -> Option<Vec<(PathBuf, LibraryIndex)>> {
+        if self.search_total > 0 && self.searching.is_empty() {
+            self.search_total = 0;
+            Some(std::mem::take(&mut self.found))
+        } else {
+            None
+        }
+    }
+
+    /// Updates one row's path in place, so a healed track reflects
+    /// immediately without waiting for the crate to be reopened.
+    fn update_track_path(&mut self, id: &str, path: PathBuf) {
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == id) {
+            t.path = path;
+        }
+    }
+
+    fn poll(&mut self) {
+        while let Some((id, a)) = self.checker.poll() {
+            self.availability.insert(id, a);
+        }
+        let mut i = 0;
+        while i < self.searching.len() {
+            match self.searching[i].1.poll() {
+                Some(RefreshProgress::Finished(index)) => {
+                    let (dir, _) = self.searching.remove(i);
+                    self.found.push((dir, index));
+                }
+                Some(RefreshProgress::Scanning { .. }) | None => i += 1,
+            }
+        }
+    }
 }
 
 pub struct App {
@@ -164,10 +281,17 @@ pub struct App {
     status: Option<(String, Instant)>,
     pub help: Help,
     pub settings_screen: SettingsScreen,
+    pub crate_browser: CrateBrowser,
     /// Browsing to pick a new music folder (from Settings' Tab): a plain
     /// file browser, so going up stays a filesystem "up" even at an
     /// existing music folder, rather than jumping to the quick switcher.
     picking_music_dir: bool,
+    /// Which browse tab `Tab` opens into — see `BrowseTab`.
+    browse_tab: BrowseTab,
+    /// The Folder tab's own "which saved folder" step, shown instead of
+    /// `self.browser` when there's more than one saved — mirrors
+    /// `CrateBrowser.picking`. `Some(i)` selects `music_dirs[i]`.
+    picking_folder: Option<usize>,
     pub show_remaining: bool,
     /// Hot cue REC mode: the hot cue keys store instead of trigger.
     pub hot_rec: bool,
@@ -201,6 +325,9 @@ impl App {
             }
             d.loop_size = memory.settings.loop_beats.clamp(MIN_LOOP_BEATS, MAX_LOOP_BEATS);
         }
+        // A crate already active from a previous session defaults the
+        // Crate tab open first; otherwise Folder, same as always.
+        let browse_tab = if memory.settings.active_crate.is_some() { BrowseTab::Crate } else { BrowseTab::Folder };
         Self {
             deck,
             browser,
@@ -210,7 +337,10 @@ impl App {
             status: None,
             help: Help::default(),
             settings_screen: SettingsScreen::default(),
+            crate_browser: CrateBrowser::default(),
             picking_music_dir: false,
+            browse_tab,
+            picking_folder: None,
             show_remaining: false,
             hot_rec: false,
             track_number: None,
@@ -357,6 +487,383 @@ impl App {
         }
     }
 
+    // --- Crates ------------------------------------------------------------
+
+    pub fn known_crates(&self) -> &[PathBuf] {
+        &self.memory.settings.known_crates
+    }
+
+    pub fn active_crate_dir(&self) -> Option<&PathBuf> {
+        self.memory.settings.active_crate.as_ref()
+    }
+
+    /// Sets the active crate, saves it, then reloads `self.memory` so its
+    /// `tracks_dir` picks up the change immediately in the running app (see
+    /// `Memory::load`). odj-sampler picks up the same change on its own,
+    /// next time it reads settings — no restart needed either side.
+    fn activate_crate(&mut self, dir: PathBuf) {
+        let name = Crate::load(dir.clone()).name;
+        self.memory.settings.active_crate = Some(dir);
+        if let Err(e) = self.memory.save_settings() {
+            self.set_status(format!("Could not save settings: {e}"));
+            return;
+        }
+        self.memory = Memory::load();
+        self.set_status(format!("Crate \"{name}\" activated"));
+    }
+
+    fn deactivate_crate(&mut self) {
+        self.memory.settings.active_crate = None;
+        if let Err(e) = self.memory.save_settings() {
+            self.set_status(format!("Could not save settings: {e}"));
+            return;
+        }
+        self.memory = Memory::load();
+        self.set_status("Crate deactivated — back to the global library");
+    }
+
+    /// Removes the crate at `i` from the known list — never touches its
+    /// directory. Deactivates first if it's the active one.
+    fn forget_crate(&mut self, i: usize) {
+        let Some(dir) = self.memory.settings.known_crates.get(i).cloned() else { return };
+        if self.memory.settings.active_crate.as_ref() == Some(&dir) {
+            self.deactivate_crate();
+        }
+        self.memory.settings.known_crates.remove(i);
+        match self.memory.save_settings() {
+            Ok(()) => self.set_status(format!("Forgot {}", dir.display())),
+            Err(e) => self.set_status(format!("Could not save settings: {e}")),
+        }
+        let last = self.memory.settings.known_crates.len();
+        self.settings_screen.crate_row = Some((i + 1).min(last));
+    }
+
+    /// Enter on the name prompt: under the one fixed crates folder
+    /// (`odj_core::crates::crates_root`, not user-configurable), either
+    /// adopts a directory that's already sitting there under this exact
+    /// name's slug and already looks like a crate (e.g. `git clone`d in
+    /// by hand ahead of time) or creates a fresh one, deduped against
+    /// whatever else is already there (see `odj_core::crates::unique_slug`)
+    /// so it never overwrites an unrelated folder. Either way, remembers
+    /// and activates it.
+    fn create_named_crate(&mut self, name: &str) {
+        let root = odj_core::crates::crates_root();
+        let candidate = root.join(odj_core::crates::slugify(name));
+        let already_a_crate = Crate::manifest_file(&candidate).is_file() || Crate::tracks_dir(&candidate).is_dir();
+        let (dir, result) = if already_a_crate {
+            (candidate.clone(), Ok(()))
+        } else {
+            let dir = root.join(odj_core::crates::unique_slug(&root, name));
+            (dir.clone(), Crate::create(dir, name).map(|_| ()))
+        };
+        match result {
+            Ok(()) => {
+                if !self.memory.settings.known_crates.contains(&dir) {
+                    self.memory.settings.known_crates.push(dir.clone());
+                }
+                self.settings_screen.naming_crate = None;
+                self.activate_crate(dir);
+                self.settings_screen.close();
+            }
+            Err(e) => self.set_status(format!("Could not create crate: {e}")),
+        }
+    }
+
+    /// While typing the new crate's name: push/pop characters, Enter
+    /// confirms (a no-op on an empty/blank name), Esc cancels back to the
+    /// crate row list. Takes the raw `KeyEvent`, not just its `KeyCode`,
+    /// so Ctrl/Alt combos don't get typed as text — same convention as
+    /// `browser_key`.
+    fn naming_crate_key(&mut self, key: &KeyEvent) {
+        let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char(c) if typing => {
+                if let Some(name) = &mut self.settings_screen.naming_crate {
+                    name.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(name) = &mut self.settings_screen.naming_crate {
+                    name.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let name = self.settings_screen.naming_crate.as_ref().map(|n| n.trim().to_string());
+                if let Some(name) = name.filter(|n| !n.is_empty()) {
+                    self.create_named_crate(&name);
+                }
+            }
+            KeyCode::Esc => self.settings_screen.naming_crate = None,
+            _ => {}
+        }
+    }
+
+    /// `U`: registers the loaded track with the active crate's roster — a
+    /// cheap, idempotent `Memory::register_track`, not a cue save.
+    fn add_to_crate(&mut self) {
+        if self.memory.settings.active_crate.is_none() {
+            self.set_status("No crate active — pick one in Settings (`)");
+            return;
+        }
+        let Some(track) = self.deck().track.clone() else {
+            self.set_status("No track loaded");
+            return;
+        };
+        match self.memory.register_track(&track) {
+            Ok(()) => self.set_status(format!("Added {} to the crate", track.title)),
+            Err(e) => self.set_status(format!("Could not add to the crate: {e}")),
+        }
+    }
+
+    /// Landing on the Crate tab with a crate to show straight away: opens
+    /// the active crate's track roster, kicking off an availability check
+    /// for each one. Also the landing point once a crate's been chosen
+    /// from `crate_picking_key`'s pick list.
+    fn open_crate_browser(&mut self) {
+        if self.memory.settings.active_crate.is_none() {
+            self.set_status("No crate active — pick one in Settings (`)");
+            return;
+        }
+        let tracks = self.memory.tracks();
+        for t in &tracks {
+            self.crate_browser.checker.check(t.id.clone(), t.path.clone());
+        }
+        self.crate_browser.tracks = tracks;
+        self.crate_browser.selected = 0;
+        self.crate_browser.availability.clear();
+        self.crate_browser.open = true;
+        self.crate_browser.picking = None;
+    }
+
+    fn close_crate_browser(&mut self) {
+        self.crate_browser.open = false;
+        self.crate_browser.picking = None;
+    }
+
+    /// While the crate browser is open it's modal, same convention as
+    /// `settings_key` — delegates to `crate_picking_key` first if it's
+    /// still at that step.
+    fn crate_browser_key(&mut self, code: KeyCode) -> bool {
+        if !self.crate_browser.open {
+            return false;
+        }
+        if let Some(i) = self.crate_browser.picking {
+            return self.crate_picking_key(i, code);
+        }
+        let len = self.crate_browser.tracks.len();
+        match code {
+            KeyCode::Esc => self.close_crate_browser(),
+            KeyCode::Up => self.crate_browser.selected = self.crate_browser.selected.saturating_sub(1),
+            KeyCode::Down if len > 0 => self.crate_browser.selected = (self.crate_browser.selected + 1).min(len - 1),
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(track) = self.crate_browser.tracks.get(self.crate_browser.selected) {
+                    let path = track.path.clone();
+                    self.close_crate_browser();
+                    self.load(path);
+                }
+            }
+            KeyCode::Char('s') => self.search_for_missing_tracks(),
+            _ => {}
+        }
+        true
+    }
+
+    /// `S` in the crate browser: with at least one row currently
+    /// `Missing`, starts a search of every configured music folder (see
+    /// `CrateBrowser::start_search`) — a no-op (with a status explaining
+    /// why) if nothing's missing or a search is already running.
+    fn search_for_missing_tracks(&mut self) {
+        let any_missing =
+            self.crate_browser.tracks().iter().any(|t| self.crate_browser.availability(&t.id) == Some(Availability::Missing));
+        if !any_missing {
+            self.set_status("Nothing missing to search for");
+            return;
+        }
+        let music_dirs = self.memory.settings.music_dirs.clone();
+        if music_dirs.is_empty() {
+            self.set_status("No music folders configured to search");
+            return;
+        }
+        self.crate_browser.start_search(&music_dirs);
+    }
+
+    /// Once every folder's search has finished, tries each still-`Missing`
+    /// row against the results: a hit heals its stored path
+    /// (`Memory::heal_path`) and refreshes that row's availability, so it
+    /// updates live without the crate needing to be reopened.
+    fn finish_search_for_missing_tracks(&mut self) {
+        let Some(found) = self.crate_browser.take_finished_search() else { return };
+        let still_missing: Vec<(String, PathBuf)> = self
+            .crate_browser
+            .tracks()
+            .iter()
+            .filter(|t| self.crate_browser.availability(&t.id) == Some(Availability::Missing))
+            .map(|t| (t.id.clone(), t.path.clone()))
+            .collect();
+        let mut healed = 0;
+        for (id, _old_path) in still_missing {
+            let Some(new_path) = found.iter().find_map(|(dir, index)| index.find(dir, &id)) else { continue };
+            if self.memory.heal_path(&id, &new_path).is_ok() {
+                self.crate_browser.update_track_path(&id, new_path.clone());
+                self.crate_browser.checker.check(id, new_path);
+                healed += 1;
+            }
+        }
+        self.set_status(if healed > 0 {
+            format!("Found {healed} missing track{}", if healed == 1 { "" } else { "s" })
+        } else {
+            "No missing tracks found in your music folders".to_string()
+        });
+    }
+
+    /// The Crate tab's own "which crate" step (2+ known crates): ↑↓ to
+    /// move, Enter/→ to activate the selected one and show its tracks
+    /// (`open_crate_browser` — even if it's empty: picking one by name is
+    /// an explicit request to see it), Esc to close the browse screen
+    /// outright.
+    fn crate_picking_key(&mut self, i: usize, code: KeyCode) -> bool {
+        let count = self.memory.settings.known_crates.len();
+        match code {
+            KeyCode::Esc => self.close_crate_browser(),
+            KeyCode::Up => self.crate_browser.picking = Some(i.saturating_sub(1)),
+            KeyCode::Down if count > 0 => self.crate_browser.picking = Some((i + 1).min(count - 1)),
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(dir) = self.memory.settings.known_crates.get(i).cloned() {
+                    self.activate_crate(dir);
+                    self.open_crate_browser();
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Opens the browse screen on whichever tab (`browse_tab`) is
+    /// current — from `Tab` at the deck or from `switch_browse_tab`,
+    /// where landing on an empty crate still shows it: a key explicitly
+    /// asking for the Crate tab deserves to see that it's genuinely
+    /// empty, not be silently bounced elsewhere with nothing to show for
+    /// it. Only real startup
+    /// (`skip_empty_crate_tab_at_startup`, called once by `main.rs`)
+    /// skips an empty crate instead, since nothing there was an explicit
+    /// request yet.
+    pub fn start_browsing(&mut self) {
+        match self.browse_tab {
+            BrowseTab::Folder => self.open_folder_tab(),
+            BrowseTab::Crate => self.open_crate_tab(),
+        }
+    }
+
+    /// Startup-only follow-up to `start_browsing`: if it landed on an
+    /// empty crate roster, shows the Folder tab instead — there's nothing
+    /// useful to do with an empty roster at the very first screen but add
+    /// something, and that starts with finding a track to load. Not
+    /// applied to `Tab`'s own switching or to picking a specific crate
+    /// from a list (`crate_picking_key`) — those are explicit requests to
+    /// see the Crate tab, honored even when it's empty.
+    pub fn skip_empty_crate_tab_at_startup(&mut self) {
+        if self.crate_browser.is_open() && self.crate_browser.picking().is_none() && self.crate_browser.tracks().is_empty() {
+            self.close_crate_browser();
+            self.browse_tab = BrowseTab::Folder;
+            self.open_folder_tab();
+            self.set_status("Crate has no tracks yet — U adds the loaded one");
+        }
+    }
+
+    /// Flips between the Folder and Crate tabs, closing whichever's open
+    /// and opening the other fresh — bound to `Tab`/`Shift+Tab` while
+    /// either is showing.
+    fn switch_browse_tab(&mut self) {
+        self.browser.open = false;
+        self.picking_folder = None;
+        self.close_crate_browser();
+        self.browse_tab = match self.browse_tab {
+            BrowseTab::Folder => BrowseTab::Crate,
+            BrowseTab::Crate => BrowseTab::Folder,
+        };
+        self.start_browsing();
+    }
+
+    /// The Folder tab: straight into `self.browser` (wherever its `dir`
+    /// already is) when there's at most one saved music folder, else the
+    /// "which one" pick step first (`folder_picking_key`).
+    fn open_folder_tab(&mut self) {
+        if self.memory.settings.music_dirs.len() > 1 {
+            self.picking_folder = Some(0);
+        } else {
+            self.picking_folder = None;
+            self.browser.open = true;
+        }
+    }
+
+    /// The Crate tab: straight into the one known crate's tracks (shown
+    /// even if it's empty — see `start_browsing`'s own doc comment) when
+    /// there's exactly one known crate, else the "which one" pick step
+    /// first (`crate_picking_key`) — shown even with zero known crates,
+    /// as a dead end pointing at Settings rather than a confusing empty
+    /// tab (there's no crate to activate and show in that case).
+    fn open_crate_tab(&mut self) {
+        if self.memory.settings.known_crates.len() == 1 {
+            let dir = self.memory.settings.known_crates[0].clone();
+            self.activate_crate(dir);
+            self.open_crate_browser();
+        } else {
+            self.crate_browser.open = true;
+            self.crate_browser.picking = Some(0);
+        }
+    }
+
+    pub fn picking_folder(&self) -> Option<usize> {
+        self.picking_folder
+    }
+
+    /// The Folder tab's own "which one" step: ↑↓ to move, Enter/→ to open
+    /// it (`self.browser`), Esc to close the browse screen outright.
+    fn folder_picking_key(&mut self, i: usize, code: KeyCode) {
+        let dirs = &self.memory.settings.music_dirs;
+        match code {
+            KeyCode::Esc => self.picking_folder = None,
+            KeyCode::Up => self.picking_folder = Some(i.saturating_sub(1)),
+            KeyCode::Down if !dirs.is_empty() => self.picking_folder = Some((i + 1).min(dirs.len() - 1)),
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(dir) = dirs.get(i).cloned() {
+                    self.browser.enter(dir, None);
+                    self.browser.open = true;
+                    self.picking_folder = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles a key while drilled into the crate row: ↑↓ to move among
+    /// "None" (index 0) and each known crate, Enter to activate the
+    /// selected one, X/Delete to forget a known crate (never deletes its
+    /// directory), N to name and create a new one (see `naming_crate_key`),
+    /// Esc to back out to the row menu.
+    fn crate_settings_key(&mut self, i: usize, code: KeyCode) -> bool {
+        let count = self.memory.settings.known_crates.len();
+        match code {
+            KeyCode::Esc => return false,
+            KeyCode::Up => self.settings_screen.crate_row = Some(i.saturating_sub(1)),
+            KeyCode::Down => self.settings_screen.crate_row = Some((i + 1).min(count)),
+            KeyCode::Char('x') | KeyCode::Delete if i > 0 => self.forget_crate(i - 1),
+            KeyCode::Enter if i == 0 => {
+                self.deactivate_crate();
+                self.settings_screen.close();
+            }
+            KeyCode::Enter => {
+                if let Some(dir) = self.memory.settings.known_crates.get(i - 1).cloned() {
+                    self.activate_crate(dir);
+                    self.settings_screen.close();
+                }
+            }
+            KeyCode::Char('n') => self.settings_screen.naming_crate = Some(String::new()),
+            _ => {}
+        }
+        true
+    }
+
     /// While the settings screen is open it's modal: ↑↓ to move or drill,
     /// Enter/X to act, Esc falls through to close it, anything else is
     /// swallowed rather than reaching the deck underneath.
@@ -364,12 +871,10 @@ impl App {
         if !self.settings_screen.open {
             return false;
         }
+        if let Some(i) = self.settings_screen.crate_row {
+            return self.crate_settings_key(i, code);
+        }
         match (self.settings_screen.folder, code) {
-            // Forced first-run setup, nothing picked yet: there's nothing
-            // else to do, so no backing out (Ctrl+C still quits the app).
-            // Not triggered by later emptying an already-set-up list by
-            // hand — that's a deliberate choice, not being stuck.
-            (Some(_), KeyCode::Esc) if self.settings_screen.onboarding => {}
             (_, KeyCode::Esc) => return false,
             (Some(i), KeyCode::Up) => self.settings_screen.folder = Some(i.saturating_sub(1)),
             (Some(i), KeyCode::Down) => {
@@ -395,7 +900,8 @@ impl App {
             (None, KeyCode::Up) => self.settings_screen.row = self.settings_screen.row.saturating_sub(1),
             (None, KeyCode::Down) => self.settings_screen.row = (self.settings_screen.row + 1).min(SETTINGS_ROWS - 1),
             (None, KeyCode::Enter) if self.settings_screen.row == 0 => self.toggle_auto_cue(),
-            (None, KeyCode::Enter) => self.settings_screen.folder = Some(0),
+            (None, KeyCode::Enter) if self.settings_screen.row == 1 => self.settings_screen.folder = Some(0),
+            (None, KeyCode::Enter) => self.settings_screen.crate_row = Some(0),
             _ => {}
         }
         true
@@ -485,6 +991,7 @@ impl App {
         let Some(current) = current else {
             self.browser.open = true;
             self.picking_music_dir = false;
+            self.picking_folder = None;
             return;
         };
         let list = siblings(&current);
@@ -540,6 +1047,8 @@ impl App {
         self.finish_loading();
         self.apply_holds();
         self.update_video();
+        self.crate_browser.poll();
+        self.finish_search_for_missing_tracks();
     }
 
     /// Drains any frame the video worker decoded, and requests one at the
@@ -626,10 +1135,24 @@ impl App {
             self.handle_release(code);
         } else {
             let repeat = key.kind == KeyEventKind::Repeat;
+            // `self.browser` is also reused by Settings as a plain "pick a
+            // directory" utility (adding a music folder) — Tab shouldn't
+            // flip browse tabs during that unrelated use, only while it's
+            // genuinely the Folder tab.
+            let plain_browser = self.browser.open && !self.picking_music_dir;
+            let browsing = plain_browser || self.crate_browser.is_open() || self.picking_folder.is_some();
             if ctrl && code == KeyCode::Char('c') {
                 self.quit = true;
+            } else if self.settings_screen.naming_crate().is_some() {
+                self.naming_crate_key(&key);
+            } else if browsing && !repeat && code == KeyCode::Tab {
+                self.switch_browse_tab();
+            } else if let Some(i) = self.picking_folder {
+                self.folder_picking_key(i, code);
             } else if self.browser.open {
                 self.browser_key(&key);
+            } else if self.crate_browser.is_open() {
+                self.crate_browser_key(code);
             } else {
                 self.deck_key(code, shift, repeat);
             }
@@ -681,12 +1204,9 @@ impl App {
                     self.browser.close();
                 }
             }
-            KeyCode::Esc => {
-                if !self.browser.clear_query() {
-                    self.browser.close();
-                }
-            }
-            KeyCode::Tab | KeyCode::BackTab => self.browser.close(),
+            KeyCode::Esc if !self.browser.clear_query() => self.browser.close(),
+            // Tab/Shift+Tab never reach here — `handle_key` intercepts
+            // them first, to flip to the Crate tab instead of closing.
             _ => {}
         }
     }
@@ -761,9 +1281,10 @@ impl App {
             }
             KeyCode::Char('/') if once => self.help.toggle(),
             KeyCode::Tab if once => {
-                self.browser.open = true;
                 self.picking_music_dir = false;
+                self.start_browsing();
             }
+            KeyCode::Char('u') if once => self.add_to_crate(),
 
             KeyCode::Char(' ') if once => self.deck().play_pause(),
             KeyCode::Char('c') if once => {
@@ -1067,6 +1588,13 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
+        // `App::new`'s `browse_tab` default depends on `active_crate` —
+        // clear it first so a prior test that left a crate active (the
+        // tests all share one settings file) doesn't change which tab
+        // this one's App defaults into.
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = None;
+        let _ = odj_core::memory::save_settings(&settings);
         let track = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
@@ -1544,23 +2072,6 @@ mod tests {
     }
 
     #[test]
-    fn open_to_music_dirs_skips_straight_to_the_list() {
-        let mut app = app();
-        app.settings_screen.open_to_music_dirs();
-        assert!(app.settings_screen.is_open());
-        assert!(app.settings_screen.editable());
-        assert_eq!(app.settings_screen.folder(), Some(0));
-
-        // Enter, X and Ctrl+U all behave exactly as in the normal editable list.
-        app.memory.settings.music_dirs.clear();
-        let dir = app.browser.dir.clone();
-        press(&mut app, KeyCode::Enter, false);
-        press_ctrl(&mut app, KeyCode::Char('u'));
-        assert_eq!(app.music_dirs(), [dir]);
-        assert!(!app.settings_screen.is_open(), "picking a folder concludes setup");
-    }
-
-    #[test]
     fn open_to_switch_picks_among_folders_without_editing_them() {
         let mut app = app();
         let dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
@@ -1568,7 +2079,6 @@ mod tests {
         app.settings_screen.open_to_switch(1);
         assert!(app.settings_screen.is_open());
         assert!(!app.settings_screen.editable(), "a quick pick, not the real settings screen");
-        assert!(!app.settings_screen.onboarding());
         assert_eq!(app.settings_screen.folder(), Some(1));
 
         // X does nothing here — it's not editable — only Enter jumps.
@@ -1640,7 +2150,10 @@ mod tests {
         assert!(enter_at < esc_at, "Enter is left of Esc: {row:?}");
         assert!(esc_at < filter_at, "Esc is left of the filter hint: {row:?}");
         assert!(filter_at < nav_at, "the filter hint is left of navigate: {row:?}");
-        assert!(!row.contains("Tab"), "Tab isn't worth a mention: {row:?}");
+
+        let text: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains(" Folder ") && text.contains(" Crate "), "the tab row is shown: {text}");
+        assert!(text.contains(" Tab  Crate "), "highlighted like the help overlay's Tab hint: {text}");
     }
 
     #[test]
@@ -1690,7 +2203,7 @@ mod tests {
         press_ctrl(&mut app, KeyCode::Char('u'));
         assert_eq!(app.music_dirs().len(), 1);
 
-        press(&mut app, KeyCode::Tab, false); // close the browser
+        press(&mut app, KeyCode::Esc, false); // close the browser (Tab now switches tabs instead)
         press(&mut app, KeyCode::Char('`'), false); // open settings
         press(&mut app, KeyCode::Down, false); // row 1: music folders
         press(&mut app, KeyCode::Enter, false); // drill in
@@ -1828,7 +2341,9 @@ mod tests {
 
         let mut app = app();
         app.memory.settings.music_dirs.clear();
-        app.settings_screen.open_to_music_dirs();
+        press(&mut app, KeyCode::Char('`'), false); // open settings
+        press(&mut app, KeyCode::Down, false); // row 1: music folders
+        press(&mut app, KeyCode::Enter, false); // drill in, empty
 
         let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let snapshot = app.deck().snapshot();
@@ -1839,18 +2354,7 @@ mod tests {
         assert!(!text.contains("Ctrl+U"), "nothing to add yet, so don't mention it here");
         assert!(!text.contains("select"), "nothing to select with an empty list");
         assert!(!text.contains("remove"), "nothing to remove with an empty list");
-        assert!(!text.contains("Esc"), "no backing out of setup with no folder yet either");
-    }
-
-    #[test]
-    fn cant_escape_the_music_folders_list_with_none_configured() {
-        let mut app = app();
-        app.memory.settings.music_dirs.clear();
-        app.settings_screen.open_to_music_dirs();
-
-        press(&mut app, KeyCode::Esc, false);
-        assert!(app.settings_screen.is_open(), "Esc does nothing: still empty, still gated");
-        assert_eq!(app.settings_screen.folder(), Some(0));
+        assert!(text.contains("Esc"), "backing out is always possible now");
     }
 
     #[test]
@@ -1874,7 +2378,6 @@ mod tests {
         press(&mut app, KeyCode::Char('`'), false); // open settings normally
         press(&mut app, KeyCode::Down, false); // row 1: music folders
         press(&mut app, KeyCode::Enter, false); // drill in
-        assert!(!app.settings_screen.onboarding());
         press(&mut app, KeyCode::Char('x'), false); // delete the only folder
         assert!(app.music_dirs().is_empty());
 
@@ -1973,6 +2476,591 @@ mod tests {
 
         assert!(app.browser.open, "existing entries or not, Enter is how you add one");
         assert_eq!(app.music_dirs(), [other], "nothing changed yet, just browsing");
+    }
+
+    /// Opens settings and drills into the crate row (row 2).
+    fn open_crate_row(app: &mut App) {
+        press(app, KeyCode::Char('`'), false);
+        press(app, KeyCode::Down, false);
+        press(app, KeyCode::Down, false);
+        press(app, KeyCode::Enter, false);
+    }
+
+    #[test]
+    fn crate_row_starts_on_none() {
+        let mut app = app();
+        // The tests share a settings file; start from a clean slate.
+        app.memory.settings.known_crates = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        app.memory.settings.active_crate = None;
+
+        open_crate_row(&mut app);
+        assert_eq!(app.settings_screen.crate_row(), Some(0), "None is first");
+    }
+
+    #[test]
+    fn activating_a_known_crate_redirects_memorys_tracks_dir_and_back() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("odj-crate-activate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Crate::create(dir.clone(), "My Set").unwrap();
+        app.memory.settings.known_crates = vec![dir.clone()];
+        app.memory.settings.active_crate = None;
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Down, false); // move off None, onto the known crate
+        assert_eq!(app.settings_screen.crate_row(), Some(1));
+        press(&mut app, KeyCode::Enter, false); // activate it
+
+        assert_eq!(app.active_crate_dir(), Some(&dir));
+        assert!(app.status().is_some_and(|s| s.contains("activated")), "{:?}", app.status());
+
+        // Deactivating (re-entering settings, selecting None) goes back to
+        // the global library.
+        open_crate_row(&mut app);
+        assert_eq!(app.settings_screen.crate_row(), Some(0), "reopening starts on None again");
+        press(&mut app, KeyCode::Enter, false);
+        assert_eq!(app.active_crate_dir(), None);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forgetting_the_active_crate_deactivates_it_but_keeps_its_directory() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("odj-crate-forget-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Crate::create(dir.clone(), "Forget Me").unwrap();
+        app.memory.settings.known_crates = vec![dir.clone()];
+        app.memory.settings.active_crate = Some(dir.clone());
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Down, false); // onto the known crate
+        press(&mut app, KeyCode::Char('x'), false); // forget it
+
+        assert!(app.known_crates().is_empty());
+        assert_eq!(app.active_crate_dir(), None, "forgetting the active one deactivates it");
+        assert!(dir.is_dir(), "the directory itself is untouched");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn n_always_goes_straight_to_naming() {
+        let mut app = app();
+        app.memory.settings.known_crates.clear();
+        app.memory.settings.active_crate = None;
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Char('n'), false);
+
+        assert!(!app.browser.open, "no folder to pick any more — the crates folder is fixed");
+        assert_eq!(app.settings_screen.naming_crate(), Some(""));
+    }
+
+    #[test]
+    fn typing_a_name_and_enter_creates_and_activates_a_crate_under_the_fixed_root() {
+        let dir = std::env::temp_dir().join(format!("odj-crate-naming-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Char('n'), false); // straight to naming
+        for c in "My Set".chars() {
+            press(&mut app, KeyCode::Char(c), false);
+        }
+        press(&mut app, KeyCode::Enter, false);
+
+        let expected = odj_core::crates::crates_root().join("my-set");
+        assert_eq!(app.active_crate_dir(), Some(&expected));
+        assert_eq!(app.known_crates(), [expected.clone()].as_slice());
+        assert!(!app.settings_screen.is_open());
+        assert!(Crate::manifest_file(&expected).is_file());
+        assert_eq!(Crate::load(expected).name, "My Set");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn naming_an_already_placed_crate_adopts_it_instead_of_overwriting_its_name() {
+        // A crate `git clone`d in by hand ahead of time, under the slug
+        // "my-set" but with a display name that doesn't match it.
+        let dir = std::env::temp_dir().join(format!("odj-crate-adopt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let existing = odj_core::crates::crates_root().join("my-set");
+        Crate::create(existing.clone(), "Original Name").unwrap();
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Char('n'), false);
+        for c in "My Set".chars() {
+            press(&mut app, KeyCode::Char(c), false);
+        }
+        press(&mut app, KeyCode::Enter, false);
+
+        assert_eq!(app.active_crate_dir(), Some(&existing));
+        assert_eq!(Crate::load(existing).name, "Original Name", "adopted, not overwritten");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn naming_a_crate_whose_slug_collides_with_an_unrelated_folder_dedupes() {
+        let dir = std::env::temp_dir().join(format!("odj-crate-dedupe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        // Not a crate — just a folder that happens to share the slug.
+        std::fs::create_dir_all(odj_core::crates::crates_root().join("my-set")).unwrap();
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Char('n'), false);
+        for c in "My Set".chars() {
+            press(&mut app, KeyCode::Char(c), false);
+        }
+        press(&mut app, KeyCode::Enter, false);
+
+        let expected = odj_core::crates::crates_root().join("my-set-2");
+        assert_eq!(app.active_crate_dir(), Some(&expected), "dedupes rather than clobbering the unrelated folder");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_while_naming_cancels_back_to_the_crate_row() {
+        let mut app = app();
+        app.memory.settings.known_crates.clear();
+
+        open_crate_row(&mut app);
+        press(&mut app, KeyCode::Char('n'), false);
+        press(&mut app, KeyCode::Char('x'), false); // typed into the name, not acted on
+        press(&mut app, KeyCode::Esc, false);
+
+        assert!(app.settings_screen.naming_crate().is_none());
+        assert!(app.settings_screen.is_open(), "back to the crate row, not fully closed");
+        assert!(app.known_crates().is_empty(), "nothing was created");
+    }
+
+    #[test]
+    fn u_registers_the_loaded_track_with_the_active_crate() {
+        // `app()`'s track comes from `Track::from_samples`, which leaves
+        // `id` empty (only `load` fingerprints a real file) — registering
+        // needs a real id, so this test builds its own deck/track, same as
+        // `w_saves_to_disk_immediately_not_just_on_track_switch_or_quit`.
+        let dir = std::env::temp_dir().join(format!("odj-crate-register-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Set").unwrap();
+        let id = "deadbeef00000000000000000000beef".to_string();
+        let mut loaded = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
+        loaded.id = id.clone();
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
+        deck.lock().unwrap().load(Arc::new(loaded), &mem, false);
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), memory);
+
+        press(&mut app, KeyCode::Char('u'), false);
+        assert!(app.status().is_some_and(|s| s.contains("Added")), "{:?}", app.status());
+
+        let on_disk = Memory::load_from(Crate::tracks_dir(&crate_dir), odj_core::memory::Settings::default());
+        assert!(on_disk.tracks().iter().any(|t| t.id == id));
+    }
+
+    #[test]
+    fn u_without_an_active_crate_shows_a_status() {
+        let mut app = app();
+        app.memory.settings.active_crate = None;
+        press(&mut app, KeyCode::Char('u'), false);
+        assert!(app.status().is_some_and(|s| s.contains("No crate active")), "{:?}", app.status());
+    }
+
+    #[test]
+    fn open_crate_browser_lists_registered_tracks() {
+        // Same reason as `u_registers_the_loaded_track_with_the_active_crate`
+        // for building a fresh deck/track rather than using `app()`'s.
+        let dir = std::env::temp_dir().join(format!("odj-crate-browser-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Set").unwrap();
+        let mut loaded = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
+        loaded.id = "cafef00d00000000000000000000d00".to_string();
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
+        deck.lock().unwrap().load(Arc::new(loaded), &mem, false);
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), memory);
+
+        press(&mut app, KeyCode::Char('u'), false); // register the loaded track
+        app.open_crate_browser();
+
+        assert!(app.crate_browser.is_open());
+        assert_eq!(app.crate_browser.tracks().len(), 1);
+    }
+
+    /// A track moved to a different subfolder of an already-configured
+    /// music dir — too far for `resolve` alone, which only tries each
+    /// music dir's own root — shows up Missing, then `S` finds and heals
+    /// it via the library index, both in the UI and on disk.
+    #[test]
+    fn s_searches_for_and_heals_a_tracks_moved_path() {
+        let dir = std::env::temp_dir().join(format!("odj-search-missing-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let music = dir.join("music");
+        std::fs::create_dir_all(music.join("old-folder")).unwrap();
+        std::fs::create_dir_all(music.join("new-folder")).unwrap();
+        odj_core::wav::write_wav(&music.join("old-folder/track.wav"), &[0.1, -0.1], 2, 44_100).unwrap();
+        let id = odj_core::track::decode(&music.join("old-folder/track.wav")).unwrap().id;
+
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Set").unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.music_dirs = vec![music.clone()];
+        settings.active_crate = Some(crate_dir.clone());
+        odj_core::memory::save_settings(&settings).unwrap();
+
+        let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings.clone());
+        let mut track = Track::from_samples(music.join("old-folder/track.wav"), "T".into(), None, 44_100, vec![0.0; 4]);
+        track.id = id.clone();
+        crate_memory.register_track(&track).unwrap();
+
+        // Moved far enough that `resolve` (which only tries each
+        // configured music dir's own root) won't find it any more.
+        std::fs::rename(music.join("old-folder/track.wav"), music.join("new-folder/track.wav")).unwrap();
+
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), crate_memory);
+        app.open_crate_browser();
+        assert_eq!(app.crate_browser.tracks().len(), 1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.crate_browser.availability(&id) != Some(Availability::Missing) && std::time::Instant::now() < deadline {
+            app.tick();
+        }
+        assert_eq!(app.crate_browser.availability(&id), Some(Availability::Missing), "moved too far for resolve() alone");
+
+        press(&mut app, KeyCode::Char('s'), false);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.crate_browser.availability(&id) != Some(Availability::Available) && std::time::Instant::now() < deadline {
+            app.tick();
+        }
+        assert_eq!(app.crate_browser.availability(&id), Some(Availability::Available), "found via the index, availability rechecked");
+        assert_eq!(app.crate_browser.tracks()[0].path, music.join("new-folder/track.wav"));
+
+        // Healed on disk too — a fresh read picks it up with no more
+        // searching needed.
+        let healed = Memory::load_from(Crate::tracks_dir(&crate_dir), settings).tracks();
+        assert_eq!(healed[0].path, music.join("new-folder/track.wav"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn s_with_nothing_missing_is_a_no_op() {
+        let mut app = app();
+        app.crate_browser.open = true;
+        app.crate_browser.tracks.clear();
+        press(&mut app, KeyCode::Char('s'), false);
+        assert!(app.status().is_some_and(|s| s.contains("Nothing missing")), "{:?}", app.status());
+    }
+
+    /// The empty-roster placeholder shouldn't tell you to press `U` to
+    /// add "the loaded track" when nothing's actually loaded — that's
+    /// not a real option yet, and following it does nothing.
+    #[test]
+    fn crate_browser_placeholder_matches_whether_a_track_is_loaded() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn screen_text(app: &App) -> String {
+            let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            t.backend().buffer().content.iter().map(|c| c.symbol()).collect()
+        }
+
+        // Nothing loaded.
+        let dir = std::env::temp_dir().join(format!("odj-crate-placeholder-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut unloaded = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+        unloaded.crate_browser.open = true;
+        let text = screen_text(&unloaded);
+        assert!(text.contains("load one from the Folder tab"), "{text}");
+        assert!(!text.contains("U adds the loaded track"), "{text}");
+        // The Crate tab looks like a tab here too: the Folder/Crate row,
+        // and a highlighted `Tab` hint to switch back — same convention
+        // as the pickers (see `both_pickers_show_the_tab_row_and_a_highlighted_tab_hint`).
+        assert!(text.contains(" Folder ") && text.contains(" Crate "), "{text}");
+        assert!(text.contains(" Tab  Folder "), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A track loaded (the shared `app()` helper's deck always has one).
+        let mut app = app();
+        app.crate_browser.open = true;
+        let text = screen_text(&app);
+        assert!(text.contains("U adds the loaded track"), "{text}");
+        assert!(!text.contains("load one from the Folder tab"), "{text}");
+    }
+
+    #[test]
+    fn tab_switches_between_the_folder_and_crate_browse_tabs() {
+        let mut app = app();
+        // The tests share a settings file; a single saved folder and a
+        // single known crate both skip their own "which one" pick step
+        // (tested separately), so this isolates just the tab-flipping.
+        app.memory.settings.music_dirs = vec![app.browser.dir.clone()];
+        let crate_dir = std::env::temp_dir().join(format!("odj-tab-switch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&crate_dir);
+        Crate::create(crate_dir.clone(), "Set").unwrap();
+        app.memory.settings.known_crates = vec![crate_dir.clone()];
+        app.memory.settings.active_crate = None;
+        // `browse_tab`'s own default depends on whichever crate happened
+        // to be active when `App::new` ran (tested separately) — pin it
+        // here so this test only exercises the flipping itself.
+        app.browse_tab = BrowseTab::Folder;
+
+        press(&mut app, KeyCode::Tab, false); // opens the Folder tab
+        assert!(app.browser.open);
+        assert!(!app.crate_browser.is_open());
+
+        press(&mut app, KeyCode::Tab, false); // flips to the Crate tab
+        assert!(!app.browser.open, "the folder tab closes");
+        assert!(app.crate_browser.is_open());
+        assert_eq!(app.active_crate_dir(), Some(&crate_dir), "the sole known crate activates automatically");
+
+        press(&mut app, KeyCode::Tab, false); // flips back to the Folder tab
+        assert!(app.browser.open);
+        assert!(!app.crate_browser.is_open());
+
+        std::fs::remove_dir_all(&crate_dir).unwrap();
+    }
+
+    #[test]
+    fn folder_tab_shows_a_pick_list_with_several_saved_folders() {
+        let mut app = app();
+        let dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        app.memory.settings.music_dirs = dirs.clone();
+
+        app.open_folder_tab();
+        assert_eq!(app.picking_folder(), Some(0));
+        assert!(!app.browser.open, "not browsing yet, still picking which one");
+
+        press(&mut app, KeyCode::Down, false);
+        press(&mut app, KeyCode::Enter, false);
+        assert!(app.picking_folder().is_none());
+        assert!(app.browser.open);
+        assert_eq!(app.browser.dir, dirs[1]);
+    }
+
+    /// Both pickers show a Folder/Crate tab row and a highlighted `Tab`
+    /// hint badge to the other one — the same convention as the help
+    /// overlay's own tabs (`odj_core::tui::tab_span`/`draw_help`).
+    #[test]
+    fn both_pickers_show_the_tab_row_and_a_highlighted_tab_hint() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn screen(app: &App) -> String {
+            let mut t = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            let snapshot = app.deck().snapshot();
+            t.draw(|f| crate::ui::draw(f, app, &snapshot)).unwrap();
+            t.backend().buffer().content.iter().map(|c| c.symbol()).collect()
+        }
+
+        let mut app = app();
+        app.memory.settings.music_dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        app.open_folder_tab();
+        let text = screen(&app);
+        assert!(text.contains(" Folder ") && text.contains(" Crate "), "{text}");
+        assert!(text.contains(" Esc  Close "), "{text}");
+        assert!(text.contains(" Tab  Crate "), "highlighted like the help overlay's Tab hint: {text}");
+
+        let dir = std::env::temp_dir().join(format!("odj-crate-picker-tab-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Crate::create(dir.join("a"), "A").unwrap();
+        Crate::create(dir.join("b"), "B").unwrap();
+        app.memory.settings.known_crates = vec![dir.join("a"), dir.join("b")];
+        // `open_crate_tab` alone, unlike `switch_browse_tab`, doesn't clear
+        // `picking_folder` — only real usage goes through the latter, but
+        // this direct call needs the same cleanup to land on the right screen.
+        app.picking_folder = None;
+        app.open_crate_tab();
+        let text = screen(&app);
+        assert!(text.contains(" Folder ") && text.contains(" Crate "), "{text}");
+        assert!(text.contains(" Tab  Folder "), "highlighted like the help overlay's Tab hint: {text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_while_picking_a_folder_closes_without_opening_the_browser() {
+        let mut app = app();
+        app.memory.settings.music_dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        app.open_folder_tab();
+        press(&mut app, KeyCode::Esc, false);
+        assert!(app.picking_folder().is_none());
+        assert!(!app.browser.open);
+    }
+
+    #[test]
+    fn crate_tab_with_no_known_crates_shows_a_placeholder_not_an_empty_roster() {
+        let mut app = app();
+        app.memory.settings.known_crates.clear();
+        app.memory.settings.active_crate = None;
+
+        app.open_crate_tab();
+
+        assert!(app.crate_browser.is_open());
+        assert_eq!(app.crate_browser.picking(), Some(0), "0 known crates still goes through picking, as a dead end");
+        assert!(app.crate_browser.tracks().is_empty());
+    }
+
+    /// Landing on the Crate tab with exactly one known crate, but it has
+    /// no tracks registered yet, shows the Folder tab instead of a
+    /// "no tracks" dead end — there's nothing useful to do with an empty
+    /// roster but add something, and that starts with finding a track to
+    /// load, same as browsing normally would.
+    #[test]
+    fn an_empty_single_known_crate_falls_back_to_the_folder_tab_at_startup() {
+        let dir = std::env::temp_dir().join(format!("odj-empty-crate-fallback-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Empty Set").unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        settings.known_crates = vec![crate_dir.clone()];
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), memory);
+
+        // The exact sequence `main.rs` runs at startup.
+        app.start_browsing();
+        app.skip_empty_crate_tab_at_startup();
+
+        assert!(!app.crate_browser.is_open(), "no dead-end dialog");
+        assert!(app.browser.open, "browsing normally instead");
+        assert_eq!(app.active_crate_dir(), Some(&crate_dir), "still activated — only the UI falls back");
+        assert!(app.status().is_some_and(|s| s.contains("no tracks yet")), "{:?}", app.status());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression test for the actual bug report: after the startup
+    /// fallback lands on Folder, `Tab` must genuinely show the Crate tab
+    /// (even empty, as a placeholder) rather than silently bouncing back
+    /// to the identical Folder screen with no visible change — which is
+    /// what `skip_empty_crate_tab_at_startup` applied to every `Tab`
+    /// press, not just real startup, looked like.
+    #[test]
+    fn tab_after_the_startup_fallback_genuinely_shows_the_crate_tab() {
+        let dir = std::env::temp_dir().join(format!("odj-empty-crate-tab-bug-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Empty Set").unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        settings.known_crates = vec![crate_dir.clone()];
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), memory);
+
+        app.start_browsing();
+        app.skip_empty_crate_tab_at_startup(); // lands on Folder — the crate's empty
+        assert_eq!(app.browse_tab, BrowseTab::Folder);
+        assert!(app.browser.open);
+
+        press(&mut app, KeyCode::Tab, false); // explicit request: must actually show Crate now
+        assert!(!app.browser.open, "no longer on the folder screen");
+        assert!(app.crate_browser.is_open(), "genuinely showing the Crate tab");
+        assert!(app.crate_browser.tracks().is_empty(), "empty, but shown as such, not hidden");
+        assert_eq!(app.browse_tab, BrowseTab::Crate);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crate_tab_with_several_known_crates_shows_a_pick_list_then_opens_the_chosen_one() {
+        let dir = std::env::temp_dir().join(format!("odj-crate-tab-pick-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        Crate::create(a.clone(), "A").unwrap();
+        Crate::create(b.clone(), "B").unwrap();
+        let mut app = app();
+        app.memory.settings.known_crates = vec![a.clone(), b.clone()];
+        app.memory.settings.active_crate = None;
+
+        app.open_crate_tab();
+        assert_eq!(app.crate_browser.picking(), Some(0));
+
+        press(&mut app, KeyCode::Down, false);
+        press(&mut app, KeyCode::Enter, false);
+
+        assert!(app.crate_browser.picking().is_none());
+        assert_eq!(app.active_crate_dir(), Some(&b));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn app_new_defaults_to_the_crate_tab_when_a_crate_is_already_active() {
+        let dir = std::env::temp_dir().join(format!("odj-crate-tab-default-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Set").unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        settings.known_crates = vec![crate_dir.clone()];
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), memory);
+
+        app.start_browsing();
+        assert!(app.crate_browser.is_open(), "opens straight into the Crate tab, not Folder");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2133,6 +3221,47 @@ mod tests {
         browser.open = true;
         let app = App::new(deck, browser, true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), Memory::load());
         dump_screenshot("browser", &app, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_folder_picker() {
+        let dir = std::env::temp_dir().join(format!("odj-shot-folder-picker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir), true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), Memory::load());
+        app.memory.settings.music_dirs = vec!["/home/dj/Music".into(), "/mnt/usb/Tracks".into()];
+        app.open_folder_tab();
+        dump_screenshot("folder-picker", &app, 120, 40);
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_crate_browser() {
+        let dir = std::env::temp_dir().join(format!("odj-shot-crate-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let crate_dir = dir.join("crate");
+        Crate::create(crate_dir.clone(), "Deep House Essentials").unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.active_crate = Some(crate_dir.clone());
+        let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut loaded = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
+        loaded.id = "deadbeef00000000000000000000beef".into();
+        let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };
+        deck.lock().unwrap().load(Arc::new(loaded), &mem, false);
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct("Built-in Audio · 48000 Hz".into()), memory);
+        press(&mut app, KeyCode::Char('u'), false); // register the loaded track
+        app.open_crate_browser();
+        dump_screenshot("crate-browser", &app, 120, 40);
     }
 
     #[test]

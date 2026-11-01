@@ -72,7 +72,7 @@ pub struct Frame {
 
 /// How frames are actually fetched — a seam so the batching/throttling
 /// logic is testable without a real `ffmpeg` process, mirroring
-/// odj-downloader's `Fetcher` trait.
+/// odj-crates's `Fetcher` trait.
 pub trait VideoSource: Send + Sync {
     /// Up to `BATCH_FRAMES` consecutive frames, `FRAME_INTERVAL` apart,
     /// starting at `pos_secs`. `None` on any failure (missing binary, bad

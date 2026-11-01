@@ -86,7 +86,7 @@ enum DownloadMsg {
 }
 
 /// Downloads `entry`'s files into `dir` on a background thread (progress
-/// relayed over an `mpsc` channel, same shape as odj-downloader's download
+/// relayed over an `mpsc` channel, same shape as odj-crates's download
 /// worker), while the draw loop keeps redrawing a progress screen.
 /// `Esc`/`Ctrl+C` sets a shared cancel flag the thread checks between
 /// files. `Ok(None)` covers both cancellation and failure (already shown).

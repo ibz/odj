@@ -70,6 +70,22 @@ pub fn crates_root() -> PathBuf {
     crate::memory::data_dir().join("crates")
 }
 
+/// Every crate that currently exists under [`crates_root`], by name —
+/// mirrors `odj_sampler::kits::list_kits`'s shape exactly. The filesystem
+/// is authoritative here, not `Settings.known_crates` (a separate,
+/// odj-player-owned "shortcuts I've visited" cache).
+pub fn list_crates() -> Vec<Crate> {
+    let Ok(entries) = fs::read_dir(crates_root()) else { return Vec::new() };
+    let mut crates: Vec<Crate> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|dir| dir.is_dir() && (Crate::manifest_file(dir).is_file() || Crate::tracks_dir(dir).is_dir()))
+        .map(Crate::load)
+        .collect();
+    crates.sort_by_key(|c| c.name.to_lowercase());
+    crates
+}
+
 /// Lowercase, non-alphanumeric runs collapsed to a single `-`, trimmed;
 /// `"crate"` if that leaves nothing (e.g. a name that was only
 /// punctuation) — mirrors `odj_sampler::kits::slugify`.
@@ -192,6 +208,22 @@ mod tests {
     #[test]
     fn crates_root_is_fixed_under_the_data_dir() {
         assert_eq!(crates_root(), crate::memory::data_dir().join("crates"));
+    }
+
+    #[test]
+    fn list_crates_finds_and_sorts_them_skipping_non_crate_dirs() {
+        let dir = std::env::temp_dir().join(format!("odj-crates-list-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        let root = crates_root();
+        Crate::create(root.join("zebra-set"), "Zebra Set").unwrap();
+        Crate::create(root.join("alpha-set"), "Alpha Set").unwrap();
+        fs::create_dir_all(root.join("not-a-crate")).unwrap();
+
+        let found = list_crates();
+        assert_eq!(found.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Alpha Set", "Zebra Set"]);
     }
 
     #[test]

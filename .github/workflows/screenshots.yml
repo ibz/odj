@@ -33,7 +33,7 @@ jobs:
         run: |
           cargo test -p odj-player --bin odj-player -- --ignored screenshot
           cargo test -p odj-sampler --bin odj-sampler -- --ignored screenshot
-          cargo test -p odj-downloader --bin odj-downloader -- --ignored screenshot
+          cargo test -p odj-crates --bin odj-crates -- --ignored screenshot
 
       - name: Install freeze
         run: |

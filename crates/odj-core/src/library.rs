@@ -49,6 +49,31 @@ pub fn siblings(track: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Every audio file under `dir`, any number of levels deep — unlike
+/// [`list`], which only ever shows one level (the browser drills down a
+/// level at a time instead). For "add this whole folder" in one shot;
+/// skips dotfiles, same convention as `list`.
+pub fn list_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            walk(&path, out);
+        } else if is_audio(&path) {
+            out.push(path);
+        }
+    }
+}
+
 /// Fuzzy match of `query` in `text`, ignoring case and spaces in the query: the
 /// query's characters must appear in order. Returns a score (higher is better) and
 /// the matched character positions in `text`, choosing the placement that scores
@@ -284,5 +309,23 @@ mod tests {
         assert_eq!(b.activate(), None);
         assert!(b.dir.ends_with("Beta"));
         assert!(b.query.is_empty());
+    }
+
+    #[test]
+    fn list_recursive_finds_nested_audio_and_skips_dotfiles_and_non_audio() {
+        let dir = std::env::temp_dir().join(format!("odj-list-recursive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        fs::write(dir.join("top.mp3"), b"").unwrap();
+        fs::write(dir.join("notes.txt"), b"").unwrap();
+        fs::write(dir.join("sub/mid.flac"), b"").unwrap();
+        fs::write(dir.join("sub/deeper/bottom.wav"), b"").unwrap();
+        fs::write(dir.join("sub/.hidden.mp3"), b"").unwrap();
+        fs::create_dir_all(dir.join(".hidden-dir")).unwrap();
+        fs::write(dir.join(".hidden-dir/also.mp3"), b"").unwrap();
+
+        let mut found: Vec<String> = list_recursive(&dir).into_iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        found.sort();
+        assert_eq!(found, vec!["bottom.wav", "mid.flac", "top.mp3"]);
     }
 }

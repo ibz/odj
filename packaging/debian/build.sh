@@ -38,7 +38,7 @@ docker run --rm \
     cd /src
     # cargo-deb only builds the package it is given (odj-player); the
     # other two binaries its assets list pulls in (odj-sampler,
-    # odj-downloader) need building ourselves first, then --no-build
+    # odj-crates) need building ourselves first, then --no-build
     # tells it to just package what is already in target/release.
     cargo build --locked --release --workspace
     cargo deb --locked --no-build -p odj-player --deb-version "$DEB_VERSION"

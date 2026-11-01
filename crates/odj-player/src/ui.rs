@@ -525,7 +525,7 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, s: &Snapshot) {
 /// settings, `?` help, `Ctrl+C` quit) pinned right in that fixed order,
 /// plain `DIM`, no badge. **This is the reference layout and naming the
 /// other apps' own footers/hint lines are meant to mirror** (odj-mixer,
-/// odj-sampler, odj-downloader — see their own footer-drawing functions,
+/// odj-sampler, odj-crates — see their own footer-drawing functions,
 /// each with a comment pointing back here): "Settings" not
 /// "Preferences", "quit" not "exit", and the globals always flush right
 /// via a `Layout::horizontal` split (`Fill` in the middle) rather than

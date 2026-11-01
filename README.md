@@ -9,8 +9,8 @@ now mixed and MIDI-mappable in software, no cables to run.
 
 - **odj-player**, a DJ player inspired by Pioneer CDJ decks.
 - **odj-sampler**, which plays the cues stored by odj-player from 16 pads.
-- **odj-downloader**, which searches YouTube and downloads straight into
-  your library.
+- **odj-crates**, which creates and manages crates: download tracks via
+  YouTube search, or add existing files, straight into one.
 - **odj-mixer**, which finds every running deck and the sampler on its own
   and mixes them in, plus any sound-card input — a turntable, synth, drum
   machine or mic — with MIDI-mappable Volume and 3-band EQ.
@@ -36,10 +36,10 @@ now mixed and MIDI-mappable in software, no cables to run.
   turntable, synth, drum machine or mic input too, all mappable to MIDI.
 - **16-pad sampler** — plays your stored cues from 16 pads, organized into
   swappable kits, triggerable from the keyboard or MIDI.
-- **Search, download and play** — search YouTube and download straight
-  into your library with odj-downloader, then play MP3, FLAC, WAV,
-  OGG/Vorbis, AAC/M4A and AIFF — with video, if the track has one and
-  `ffmpeg` is installed.
+- **Crates** — a curated, git-friendly set of tracks: create one and
+  populate it from odj-crates, by downloading via YouTube search or
+  adding existing files, then play MP3, FLAC, WAV, OGG/Vorbis, AAC/M4A
+  and AIFF — with video, if the track has one and `ffmpeg` is installed.
 
 ```
 cargo run --release -p odj-player                 # first run: pick & remember a music folder
@@ -183,6 +183,11 @@ folder instead, since there's nothing to do yet but add something, but
 crate active, odj-player and odj-sampler use the global library in
 `~/.local/share/odj`, same as always.
 
+Creating and populating a crate can also be done entirely from
+odj-crates (below) — create it there, download tracks into it or add
+existing ones, and it shows up here, in odj-player's own crate list,
+right away.
+
 ## odj-sampler
 
 ![Sixteen pads loaded with a kit, one playing](https://raw.githubusercontent.com/ibz/odj/screenshots/sampler-pads.png)
@@ -241,17 +246,39 @@ marks the one connected now, `○` another one that's plugged in, `✕` one
 known only from its saved mappings). The device and each device's learned
 notes are kept in the same shared settings file.
 
-## odj-downloader
+## odj-crates
 
-![Searching, with a few downloads queued](https://raw.githubusercontent.com/ibz/odj/screenshots/downloader.png)
+![A crate's tracks, with a search and a few downloads queued](https://raw.githubusercontent.com/ibz/odj/screenshots/crates-download.png)
 
-Searches YouTube via `yt-dlp` and downloads whatever you queue, one at a
-time, into `~/Downloads` — handy for getting a track straight into a
-folder odj-player already watches. `Tab` moves focus between the search
-box, results and queue; `Enter` runs a search (or, on a result, queues
-it); `↑`/`↓` navigate the focused list; `x`/`Delete` removes a queued
-item; `Esc` clears the query or cancels a search in progress; `Ctrl+C`
-quits.
+Creates and manages crates (see "Crates" above). Starts on the list of
+crates that already exist — `↑`/`↓` to pick one, `Enter` opens it, `N`
+names and creates a new one.
+
+Inside a crate: `↑`/`↓` selects a track, `X`/`Delete` removes it — just
+its metadata, press again to confirm; the audio file is never touched,
+there's no path to one reachable from a crate alone. `D` opens a
+search/download screen (`Tab` moves focus between the search box,
+results and queue; `Enter` runs a search, or on a result, queues it;
+`x`/`Delete` removes a queued item) — downloads still land in
+`~/Downloads` via `yt-dlp`, one at a time, same as always, but the
+finished file is now also registered into the crate, with a note of
+which YouTube URL it came from. A result already in this crate is
+marked (`✓ … (in crate)`) and queuing it again is a no-op; one that
+isn't in the crate but was already downloaded before (this session, an
+earlier one, or for a different crate) is marked too
+(`⬇ … (already downloaded)`) and queuing it just registers that
+existing file straight away, no re-download. `A` instead browses your
+configured
+music folders (same drill-down browser as odj-player's own Folder tab,
+contained the same way — `Esc`/`Left` goes back up a level, to the
+"which folder" picker, and back to the crate at the root) to add a file
+already on disk; `Enter` is pure navigation there — it only drills into
+a folder, never adds anything. `Space` marks any number of entries
+(files and/or folders); `a` adds them — or, with nothing marked, just
+the highlighted entry — showing a progress window while it decodes and
+registers each one in the background (a folder's own files, found
+recursively). `Esc` backs out of either screen to the crate's track
+list, `Esc` again to the crate list. `Ctrl+C` quits.
 
 ## odj-mixer
 
@@ -573,7 +600,7 @@ along their bottom edge, as does the output picker at start.
 A Cargo workspace: `crates/odj-core` holds what the apps share (decoding and
 fingerprinting, the cue library, audio input/output, the file browser, the
 link between decks);
-`crates/odj-player`, `crates/odj-sampler`, `crates/odj-downloader` and
+`crates/odj-player`, `crates/odj-sampler`, `crates/odj-crates` and
 `crates/odj-mixer` are the four binaries.
 
 ## Install on Omarchy / Arch
@@ -585,7 +612,7 @@ makepkg -si
 
 This builds the latest `master`, pulls in `rubberband`, `alsa-lib`, `libpipewire`,
 `yt-dlp` and `tmux`, and installs all four binaries (`odj-player`, `odj-sampler`,
-`odj-downloader`, `odj-mixer`), `odj` (see [above](#odj)), and a launcher
+`odj-crates`, `odj-mixer`), `odj` (see [above](#odj)), and a launcher
 entry (Super+Space → "odj player"), which opens in your default terminal. Run
 `makepkg -si` again to update; `sudo pacman -R odj-git` removes it. Once it's
 on the AUR: `yay -S odj-git`.

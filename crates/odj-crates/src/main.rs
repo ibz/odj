@@ -1,4 +1,6 @@
-//! odj-downloader: fetches tracks via yt-dlp for later use in odj-player.
+//! odj-crates: create and manage odj crates — download new tracks via
+//! yt-dlp, or add existing files/directories from a configured music
+//! folder.
 
 mod app;
 mod queue;
@@ -24,8 +26,10 @@ use search::YtDlp;
 fn main() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "-h" || a == "--help") {
         println!(
-            "usage: odj-downloader\n\n\
-             Search YouTube, queue a result, it downloads into {}.",
+            "usage: odj-crates\n\n\
+             Create and manage odj crates. Drill into one to download new \
+             tracks (still into {}, now also registered into the crate) or \
+             add existing files/directories from a configured music folder.",
             downloads_dir().display()
         );
         return Ok(());
@@ -45,10 +49,9 @@ fn downloads_dir() -> PathBuf {
 /// key-release event, unlike odj-player's jog/search), so unlike
 /// odj-core's `tui::init` this doesn't ask for `REPORT_EVENT_TYPES` — just
 /// disambiguation, so modified keys (e.g. Ctrl+C) parse unambiguously. The
-/// flag says whether the terminal supports the enhancement at all. Kept
-/// local rather than depending on odj-core for this, since odj-core's own
-/// dependencies (symphonia, cpal, pipewire) are unconditional and this tool
-/// never touches audio.
+/// flag says whether the terminal supports the enhancement at all. Kept as
+/// its own small copy rather than calling odj-core's version, which would
+/// request a capability (key releases) nothing here ever reads.
 fn init() -> (DefaultTerminal, bool) {
     let terminal = ratatui::init();
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);

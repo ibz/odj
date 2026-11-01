@@ -41,7 +41,7 @@ package() {
   cd "$_pkgname"
   install -Dm755 target/release/odj-player "$pkgdir/usr/bin/odj-player"
   install -Dm755 target/release/odj-sampler "$pkgdir/usr/bin/odj-sampler"
-  install -Dm755 target/release/odj-downloader "$pkgdir/usr/bin/odj-downloader"
+  install -Dm755 target/release/odj-crates "$pkgdir/usr/bin/odj-crates"
   install -Dm755 target/release/odj-mixer "$pkgdir/usr/bin/odj-mixer"
   install -Dm755 odj.sh "$pkgdir/usr/bin/odj.sh"
   ln -s odj.sh "$pkgdir/usr/bin/odj"

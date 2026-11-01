@@ -1,6 +1,6 @@
 [package]
-name = "odj-downloader"
-description = "Downloads tracks via yt-dlp for later use in odj-player"
+name = "odj-crates"
+description = "Manages odj crates: create them, search/download tracks via yt-dlp, or add existing ones"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,11 +9,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+odj-core.workspace = true
 anyhow.workspace = true
 ratatui.workspace = true
 youtube_dl = "0.10"
 
 [dev-dependencies]
-# Just for its `tui::to_ansi` screenshot-dumping helper, shared with
+# Also brings in its `tui::to_ansi` screenshot-dumping helper, shared with
 # odj-player/odj-sampler's own screenshot tests — see app.rs.
 odj-core = { workspace = true, features = ["test-util"] }

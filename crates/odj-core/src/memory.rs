@@ -552,6 +552,18 @@ impl Memory {
         write_json(&file, &tf)
     }
 
+    /// Removes `id`'s own entry — its cue/loop/grid memory and
+    /// `youtube_url`, nothing else: there is no audio file reachable from
+    /// here to delete, only the path it was last seen at. A no-op if
+    /// there's no entry for `id`.
+    pub fn forget_track(&self, id: &str) -> std::io::Result<()> {
+        match fs::remove_file(self.track_file(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn save_settings(&self) -> std::io::Result<()> {
         save_settings(&self.settings)
     }
@@ -847,6 +859,25 @@ mod tests {
         let m = memory("heal-path-missing");
         assert!(m.heal_path("ab51", Path::new("/music/wherever.mp3")).is_ok());
         assert!(!m.track_file("ab51").exists());
+    }
+
+    #[test]
+    fn forget_track_removes_only_the_metadata_file() {
+        let m = memory("forget-track");
+        let t = track("ab52", "/music/old/place.mp3");
+        m.save_track(&t, &sample()).unwrap();
+        assert!(m.track_file("ab52").exists());
+
+        m.forget_track("ab52").unwrap();
+
+        assert!(!m.track_file("ab52").exists());
+        assert!(m.tracks().is_empty());
+    }
+
+    #[test]
+    fn forget_track_is_a_no_op_without_an_existing_entry() {
+        let m = memory("forget-track-missing");
+        assert!(m.forget_track("ab53").is_ok());
     }
 
     #[test]

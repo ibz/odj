@@ -296,17 +296,29 @@ Continuously detects running odj-player decks and a running
 odj-sampler, and connects every one of them to the main output
 automatically, live — each is already part of the session, so it just
 plays, no extra step needed (none of them send their audio anywhere
-special for this: each plays into its own virtual sink instead of a
-real device, and odj-mixer captures it from there). A sound-card input
-(a turntable's line-in, a mixer channel, a synth or drum machine, a mic)
-is different: there's usually several, not all of them meant to be mixed
-in, so each one instead waits until it's added from Settings (`` ` ``,
-see below) — once added, every Volume/EQ control works identically
-whether a strip is a turntable, a synth, a deck or the sampler. Needs
-PipeWire running (it refuses to start without it): both the virtual sinks
-and routing
-between two different real cards rely on PipeWire's shared graph
-clock, which plain ALSA has no way to provide.
+special for this: with PipeWire running, each plays into its own
+virtual sink instead of a real device and odj-mixer captures it from
+there; without PipeWire, each connects to odj-mixer directly instead,
+over a plain Unix socket — see "Without PipeWire" below). A sound-card
+input (a turntable's line-in, a mixer channel, a synth or drum machine,
+a mic) is different: there's usually several, not all of them meant to
+be mixed in, so each one instead waits until it's added from Settings
+(`` ` ``, see below) — once added, every Volume/EQ control works
+identically whether a strip is a turntable, a synth, a deck or the
+sampler.
+
+**Without PipeWire**: routing between two different real sound cards
+relies on PipeWire's shared graph clock, which plain ALSA has no way to
+provide, so a hardware input can't be added this way without it. A
+deck or odj-sampler still works, though — each connects straight to
+odj-mixer over a Unix socket instead of a virtual sink, shown in the
+channel list with a "(no PipeWire)" tag, so Volume/EQ keep working
+without any hardware-input mixing. (This doesn't by itself make a
+build on a platform with no PipeWire at all, such as macOS, work —
+that also needs a non-PipeWire audio backend and linking
+`librubberband` there, neither done yet — but it removes the one piece
+of odj-mixer's own design that would otherwise need a from-scratch
+redesign rather than a build-flag fix.)
 
 The live screen looks like a real mixer: one channel strip per running
 deck (or the sampler) plus every input that's been added, side by side, each with High,

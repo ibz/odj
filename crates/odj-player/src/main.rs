@@ -10,17 +10,27 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 
 use odj_core::library::{Browser, is_audio};
 use odj_core::memory::Memory;
-use odj_core::{audio, tui};
+use odj_core::{audio, audio_link, tui};
 
 use app::{App, AudioRoute};
 use engine::Deck;
 use sync::SyncLink;
+
+/// Whichever way this deck's audio actually leaves the process right
+/// now — kept alive for as long as it runs; dropping it tears down
+/// whatever it holds (a real device's stream, or the virtual sink/
+/// socket connection behind a mixer-routed one).
+enum Playback {
+    Direct { _stream: cpal::Stream },
+    MixerPipeWire { _stream: cpal::Stream, _sink: audio::NullSink },
+    MixerSocket { _sink: audio_link::SocketSink },
+}
 
 /// What `--deck`'s picker/the virtual-sink path has going by the time
 /// everything else in `start` can proceed the same way regardless of
@@ -30,10 +40,7 @@ struct Setup {
     output: AudioRoute,
     link: io::Result<SyncLink>,
     errors: audio::Errors,
-    _stream: cpal::Stream,
-    /// Only `Some` on the through-odj-mixer path — kept alive for as
-    /// long as this deck runs; dropping it tears the virtual sink down.
-    _sink: Option<audio::NullSink>,
+    _playback: Playback,
 }
 
 fn main() -> Result<()> {
@@ -53,8 +60,10 @@ fn main() -> Result<()> {
                      No Mixer here any more (no Volume/EQ, filters live in odj-mixer now):\n\
                      if odj-mixer is running when this starts, this deck routes its output\n\
                      through it instead of a real device, and odj-mixer applies Volume/EQ\n\
-                     live to that — pick it there, as \"Deck n\". Otherwise this plays\n\
-                     straight to a real output, same as always, with no filters available.\n\n\
+                     live to that — pick it there, as \"Deck n\" — over a virtual PipeWire\n\
+                     sink, or, when PipeWire isn't available, a direct Unix-socket link to\n\
+                     odj-mixer instead. Otherwise this plays straight to a real output, same\n\
+                     as always, with no filters available.\n\n\
                      Tab opens a browse screen with two tabs — Folder (a plain filesystem\n\
                      browser) and Crate (a curated track roster of your own, with its own cue\n\
                      memory and odj-sampler kits, instead of the global library) — Tab again\n\
@@ -173,40 +182,59 @@ fn setup_direct(terminal: &mut DefaultTerminal, deck_number: Option<u8>) -> Resu
     // is running).
     let link = SyncLink::start(deck.clone(), deck_number);
     let route = AudioRoute::Direct(format!("{} · {} Hz", output.name, output.sample_rate()));
-    Ok(Some(Setup { deck, output: route, link, errors: output.errors, _stream: stream, _sink: None }))
+    Ok(Some(Setup { deck, output: route, link, errors: output.errors, _playback: Playback::Direct { _stream: stream } }))
 }
 
-/// Instead of asking for a real output, creates a virtual sink (see
-/// `audio::NullSink`) named for whichever deck number sync claims (no
-/// picker — nothing to ask, there's exactly one sensible target) and
-/// plays into that; odj-mixer discovers it the same way it discovers any
-/// other input, labeled "Deck n", and applies Volume/EQ to what it
-/// captures from it. The sample rate doesn't matter here the way it does
-/// for a real device — PipeWire resamples everything to its own shared
-/// clock regardless (the same property that lets odj-mixer route between
-/// physically different cards at all).
+/// Instead of asking for a real output, routes through odj-mixer
+/// instead — a virtual PipeWire sink (`audio::NullSink`) if it's
+/// running, falling back to connecting straight to odj-mixer's own
+/// `audio_link::Listener` over a Unix socket otherwise (e.g. on a
+/// platform with no PipeWire at all). Named for whichever deck number
+/// sync claims (no picker either way — nothing to ask, there's exactly
+/// one sensible target); odj-mixer discovers it the same way it
+/// discovers any other input, labeled "Deck n", and applies Volume/EQ to
+/// what it captures from it. The sample rate doesn't matter the way it
+/// does for a real device on the PipeWire path — it resamples
+/// everything to its own shared clock regardless (the same property
+/// that lets odj-mixer route between physically different cards at
+/// all) — but does matter on the socket path, which has no such
+/// resampling and requires it to match odj-mixer's own output rate.
 fn setup_through_mixer(deck_number: Option<u8>) -> Result<Setup> {
     const RATE: u32 = 48_000;
     let deck = Arc::new(Mutex::new(Deck::new(RATE)));
     let link = SyncLink::start(deck.clone(), deck_number);
     let n = deck_number.or_else(|| link.as_ref().ok().map(SyncLink::deck)).unwrap_or(1);
-
     let sink_name = audio::deck_sink_name(n);
-    let sink = audio::NullSink::create(&sink_name, &format!("Deck {n}"))?;
 
-    let host = audio::host(); // fresh: `host()` caches its own enumeration, so this must postdate creating the sink
-    let outputs = audio::output_cards(&host)?;
-    let choice = audio::choices(&outputs)
-        .into_iter()
-        .find(|c| outputs[c.card].id() == sink_name)
-        .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
-    let output = audio::Output::open(&host, &outputs, &choice)?;
-    let stream = output.start(deck.clone())?;
-    if let Err(e) = audio::verify_route(&host, &output) {
-        drop(stream);
-        return Err(e);
+    // `host()` itself already tries a real PipeWire connection and falls
+    // back to plain ALSA on its own if that fails (see `audio::is_pipewire`'s
+    // own doc comment) — checking `is_pipewire` on a freshly-made `Host`
+    // is the one reliable way to tell; cpal's own `is_available()` alone
+    // just checks whether a socket file exists on disk, which can be
+    // stale (confirmed: still `true` moments after actually stopping
+    // PipeWire).
+    if audio::is_pipewire(&audio::host()) {
+        let sink = audio::NullSink::create(&sink_name, &format!("Deck {n}"))?;
+        // Fresh: `host()` caches its own enumeration, so this must postdate creating the sink.
+        let host = audio::host();
+        let outputs = audio::output_cards(&host)?;
+        let choice = audio::choices(&outputs)
+            .into_iter()
+            .find(|c| outputs[c.card].id() == sink_name)
+            .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
+        let output = audio::Output::open(&host, &outputs, &choice)?;
+        let stream = output.start(deck.clone())?;
+        if let Err(e) = audio::verify_route(&host, &output) {
+            drop(stream);
+            return Err(e);
+        }
+        Ok(Setup { deck, output: AudioRoute::Mixer, link, errors: output.errors, _playback: Playback::MixerPipeWire { _stream: stream, _sink: sink } })
+    } else {
+        let sink = audio_link::SocketSink::create(&sink_name, RATE, deck.clone())
+            .context("connecting to odj-mixer (it's running without PipeWire — using its direct socket link)")?;
+        let errors = sink.errors.clone();
+        Ok(Setup { deck, output: AudioRoute::Mixer, link, errors, _playback: Playback::MixerSocket { _sink: sink } })
     }
-    Ok(Setup { deck, output: AudioRoute::Mixer, link, errors: output.errors, _stream: stream, _sink: Some(sink) })
 }
 
 #[cfg(test)]

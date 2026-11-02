@@ -1,6 +1,7 @@
 //! Code shared by the odj apps.
 
 pub mod audio;
+pub mod audio_link;
 pub mod control;
 pub mod crates;
 pub mod filter;

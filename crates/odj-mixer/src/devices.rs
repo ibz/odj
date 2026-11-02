@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 
 use odj_core::audio::{self, Card, Choice, Route};
+use odj_core::audio_link::Listener;
 
 const PERIOD: Duration = Duration::from_secs(1);
 
@@ -97,13 +98,22 @@ pub struct Devices {
 
 impl Devices {
     pub fn start(kind: Kind) -> Self {
+        Self::start_with_link(kind, None)
+    }
+
+    /// Like [`start`](Self::start), but for `Kind::Deck` also merges in
+    /// whatever `odj_core::audio_link::Listener` currently has connected
+    /// — the push-discovered, PipeWire-free counterpart to this
+    /// struct's own poll-every-second cpal scan (see `run`'s own doc
+    /// comment). `listener` is ignored for `Kind::Input`/`Kind::Output`.
+    pub fn start_with_link(kind: Kind, listener: Option<Arc<Listener>>) -> Self {
         let entries = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let for_thread = entries.clone();
         let thread = thread::Builder::new()
             .name("odj-devices".into())
-            .spawn(move || run(kind, &for_thread, &stopping))
+            .spawn(move || run(kind, &for_thread, &stopping, listener.as_deref()))
             .expect("spawns the device-scanning thread");
         Self { kind, entries, stop, thread: Some(thread) }
     }
@@ -155,12 +165,12 @@ fn is_virtual_sink(id: &str) -> bool {
     audio::deck_number(id).is_some() || id == audio::sampler_sink_name()
 }
 
-fn run(kind: Kind, entries: &Mutex<Vec<Entry>>, stop: &AtomicBool) {
+fn run(kind: Kind, entries: &Mutex<Vec<Entry>>, stop: &AtomicBool, listener: Option<&Listener>) {
     let word = if kind == Kind::Input { "In" } else { "Out" };
     while !stop.load(Ordering::Relaxed) {
         if let Ok(cards) = scan_cards(kind) {
             let choices = audio::choices(&cards);
-            let fresh: Vec<Entry> = choices
+            let mut fresh: Vec<Entry> = choices
                 .iter()
                 // A deck's or odj-sampler's virtual sink is stereo-only;
                 // its own mono sub-channels (which `choices` also
@@ -178,6 +188,26 @@ fn run(kind: Kind, entries: &Mutex<Vec<Entry>>, stop: &AtomicBool) {
                     available: c.available(&cards),
                 })
                 .collect();
+            // A deck/odj-sampler connected directly over
+            // `odj_core::audio_link` instead of a PipeWire virtual sink
+            // (e.g. no PipeWire at all) — pushed into `listener`'s own
+            // pending registry the instant it connects, so there's
+            // nothing to "scan" here, just list what's already known.
+            if kind == Kind::Deck
+                && let Some(listener) = listener
+            {
+                for (name, _rate) in listener.names() {
+                    if fresh.iter().any(|e| e.key.0 == name) {
+                        continue; // already listed via the PipeWire scan
+                    }
+                    let label = match audio::deck_number(&name) {
+                        Some(n) => format!("Deck {n} · stereo (no PipeWire)"),
+                        None if name == audio::sampler_sink_name() => "Sampler · stereo (no PipeWire)".to_string(),
+                        None => continue, // not a name this scan recognizes
+                    };
+                    fresh.push(Entry { key: (name, Route::Stereo(0, 1)), label, available: true });
+                }
+            }
             *entries.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
         thread::sleep(PERIOD);
@@ -187,6 +217,42 @@ fn run(kind: Kind, entries: &Mutex<Vec<Entry>>, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_with_link_merges_a_listeners_names_into_the_deck_scan() {
+        let dir = std::env::temp_dir().join(format!("odj-devices-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let listener = Arc::new(Listener::start().unwrap());
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("odj/audio/mixer")).unwrap();
+        // Raw handshake bytes: 4-byte magic "odjl", a 32-byte NUL-padded
+        // name, then the sample rate as a u32 LE — see
+        // `odj_core::audio_link`'s own module doc comment for the wire
+        // format (its encoder is private to that crate).
+        let mut hs = [0u8; 4 + 32 + 4];
+        hs[..4].copy_from_slice(b"odjl");
+        hs[4..4 + "odj-deck-2".len()].copy_from_slice(b"odj-deck-2");
+        hs[36..].copy_from_slice(&48_000u32.to_le_bytes());
+        std::io::Write::write_all(&mut client, &hs).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let devices = Devices::start_with_link(Kind::Deck, Some(listener));
+        let found = loop {
+            if let Some(e) = devices.entries().iter().find(|e| e.key.0 == "odj-deck-2") {
+                break Some(e.clone());
+            }
+            assert!(std::time::Instant::now() < deadline, "never showed up");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(found.unwrap().label, "Deck 2 · stereo (no PipeWire)");
+
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn device_key_round_trips_through_its_string_encoding() {

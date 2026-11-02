@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ratatui::DefaultTerminal;
 
 use odj_core::audio;
@@ -70,8 +70,10 @@ fn main() -> Result<()> {
              sampler's, if it's running) Volume/Low/Mid/High that isn't mapped yet on that\n\
              controller. R starts/stops recording the main output to a timestamped WAV file\n\
              under ~/.local/share/odj/recordings/. Press ? for the full list of keys.\n\
-             Needs PipeWire: routing between two cards needs its shared graph clock, which\n\
-             plain ALSA doesn't have.\n\
+             Routing a real sound card's input needs PipeWire's shared graph clock, which\n\
+             plain ALSA doesn't have — without PipeWire, that's unavailable, but a deck or\n\
+             odj-sampler still connects, over a direct Unix-socket link instead of a virtual\n\
+             sink.\n\
              Every error shown on screen is also logged, with when it happened, to {}.",
             log::log_file().display()
         );
@@ -102,20 +104,38 @@ fn main() -> Result<()> {
 fn start(terminal: &mut DefaultTerminal) -> Result<()> {
     let host = audio::host();
     if !audio::is_pipewire(&host) {
-        bail!(
-            "odj-mixer needs PipeWire running — routing between two sound cards relies on \
-             its shared graph clock to keep them in sync; plain ALSA has no way to do that \
-             between two independent hardware clocks."
-        );
+        // Routing a real sound-card input still needs PipeWire's shared
+        // graph clock (see `audio::is_pipewire`'s own doc comment) —
+        // not available here, so that stays off the table for this run.
+        // Every odj-player deck / odj-sampler still works, over
+        // `odj_core::audio_link`'s direct socket transport instead of a
+        // virtual sink (see their own `setup_through_mixer`).
+        log::log("starting without PipeWire — hardware-input routing is unavailable this run");
     }
     drop(host); // only needed for this check — everything else opens its own
 
+    // Bound *before* `control::Control::open("mixer")` below, so
+    // nothing can observe "a mixer is running" before this socket is
+    // actually up to accept it. Logged and continued with `None` on
+    // bind failure rather than failing startup over it — the PipeWire
+    // path still works either way.
+    let socket_listener = match odj_core::audio_link::Listener::start() {
+        Ok(l) => Some(Arc::new(l)),
+        Err(e) => {
+            log::log(&format!("audio-link socket unavailable: {e}"));
+            None
+        }
+    };
+
     let devices_in = Devices::start(Kind::Input);
-    let devices_deck = Devices::start(Kind::Deck);
+    let devices_deck = Devices::start_with_link(Kind::Deck, socket_listener.clone());
     let devices_out = Devices::start(Kind::Output);
 
     let mut settings = odj_core::memory::load_settings();
     let routing: Arc<Mutex<Routing>> = Arc::new(Mutex::new(Routing::default()));
+    if let Some(listener) = &socket_listener {
+        routing.lock().unwrap_or_else(|e| e.into_inner()).set_socket_listener(listener.clone());
+    }
     // Restores the last session's output if one was saved; otherwise
     // falls back to the internal speakers (see
     // `devices::builtin_output`) rather than leaving nothing picked —

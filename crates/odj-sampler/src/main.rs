@@ -19,15 +19,25 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event};
 
-use odj_core::{audio, tui};
+use odj_core::{audio, audio_link, tui};
 
 use app::{App, AudioRoute};
 use engine::Sampler;
 use kit::Kit;
+
+/// Whichever way this sampler's audio actually leaves the process right
+/// now — kept alive for as long as it runs; dropping it tears down
+/// whatever it holds (a real device's stream, or the virtual sink/
+/// socket connection behind a mixer-routed one).
+enum Playback {
+    Direct { _stream: cpal::Stream },
+    MixerPipeWire { _stream: cpal::Stream, _sink: audio::NullSink },
+    MixerSocket { _sink: audio_link::SocketSink },
+}
 
 /// What `setup_direct`/`setup_through_mixer` have going by the time
 /// everything else in `start` can proceed the same way regardless of
@@ -37,10 +47,7 @@ struct Setup {
     output: AudioRoute,
     out_rate: u32,
     errors: audio::Errors,
-    _stream: cpal::Stream,
-    /// Only `Some` on the through-odj-mixer path — kept alive for as
-    /// long as this runs; dropping it tears the virtual sink down.
-    _sink: Option<audio::NullSink>,
+    _playback: Playback,
 }
 
 fn main() -> Result<()> {
@@ -145,47 +152,70 @@ fn setup_direct(terminal: &mut DefaultTerminal) -> Result<Option<Setup>> {
         output: route,
         out_rate: output.sample_rate(),
         errors: output.errors,
-        _stream: stream,
-        _sink: None,
+        _playback: Playback::Direct { _stream: stream },
     }))
 }
 
-/// Instead of asking for a real output, creates a virtual sink (see
-/// `audio::NullSink`) named [`audio::sampler_sink_name`] (no picker, no
-/// number — only one odj-sampler instance is ever expected at a time,
-/// unlike a deck) and plays into that; odj-mixer discovers it the same
-/// way it discovers a deck's own virtual sink, labeled "Sampler", and
-/// mixes in whatever it captures. The sample rate doesn't matter here
-/// the way it does for a real device — PipeWire resamples everything to
-/// its own shared clock regardless (the same property that lets
-/// odj-mixer route between physically different cards at all).
+/// Instead of asking for a real output, routes through odj-mixer instead
+/// — a virtual PipeWire sink (`audio::NullSink`) if it's running,
+/// falling back to connecting straight to odj-mixer's own
+/// `audio_link::Listener` over a Unix socket otherwise (e.g. on a
+/// platform with no PipeWire at all). Named [`audio::sampler_sink_name`]
+/// (no picker, no number either way — only one odj-sampler instance is
+/// ever expected at a time, unlike a deck); odj-mixer discovers it the
+/// same way it discovers a deck's own virtual sink, labeled "Sampler",
+/// and mixes in whatever it captures. The sample rate doesn't matter the
+/// way it does for a real device on the PipeWire path — it resamples
+/// everything to its own shared clock regardless (the same property
+/// that lets odj-mixer route between physically different cards at
+/// all) — but does matter on the socket path, which has no such
+/// resampling and requires it to match odj-mixer's own output rate.
 fn setup_through_mixer() -> Result<Option<Setup>> {
     const RATE: u32 = 48_000;
     let sampler = Arc::new(Mutex::new(Sampler::new()));
-
     let sink_name = audio::sampler_sink_name();
-    let sink = audio::NullSink::create(sink_name, "Sampler")?;
 
-    let host = audio::host(); // fresh: `host()` caches its own enumeration, so this must postdate creating the sink
-    let outputs = audio::output_cards(&host)?;
-    let choice = audio::choices(&outputs)
-        .into_iter()
-        .find(|c| outputs[c.card].id() == sink_name)
-        .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
-    let output = audio::Output::open(&host, &outputs, &choice)?;
-    let stream = output.start(sampler.clone())?;
-    if let Err(e) = audio::verify_route(&host, &output) {
-        drop(stream);
-        return Err(e);
+    // `host()` itself already tries a real PipeWire connection and falls
+    // back to plain ALSA on its own if that fails (see `audio::is_pipewire`'s
+    // own doc comment) — checking `is_pipewire` on a freshly-made `Host`
+    // is the one reliable way to tell; cpal's own `is_available()` alone
+    // just checks whether a socket file exists on disk, which can be
+    // stale (confirmed: still `true` moments after actually stopping
+    // PipeWire).
+    if audio::is_pipewire(&audio::host()) {
+        let sink = audio::NullSink::create(sink_name, "Sampler")?;
+        // Fresh: `host()` caches its own enumeration, so this must postdate creating the sink.
+        let host = audio::host();
+        let outputs = audio::output_cards(&host)?;
+        let choice = audio::choices(&outputs)
+            .into_iter()
+            .find(|c| outputs[c.card].id() == sink_name)
+            .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
+        let output = audio::Output::open(&host, &outputs, &choice)?;
+        let stream = output.start(sampler.clone())?;
+        if let Err(e) = audio::verify_route(&host, &output) {
+            drop(stream);
+            return Err(e);
+        }
+        Ok(Some(Setup {
+            sampler,
+            output: AudioRoute::Mixer,
+            out_rate: RATE,
+            errors: output.errors,
+            _playback: Playback::MixerPipeWire { _stream: stream, _sink: sink },
+        }))
+    } else {
+        let sink = audio_link::SocketSink::create(sink_name, RATE, sampler.clone())
+            .context("connecting to odj-mixer (it's running without PipeWire — using its direct socket link)")?;
+        let errors = sink.errors.clone();
+        Ok(Some(Setup {
+            sampler,
+            output: AudioRoute::Mixer,
+            out_rate: RATE,
+            errors,
+            _playback: Playback::MixerSocket { _sink: sink },
+        }))
     }
-    Ok(Some(Setup {
-        sampler,
-        output: AudioRoute::Mixer,
-        out_rate: RATE,
-        errors: output.errors,
-        _stream: stream,
-        _sink: Some(sink),
-    }))
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) -> Result<()> {

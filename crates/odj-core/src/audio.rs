@@ -14,7 +14,6 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::link;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::platform::PipeWireHost;
 use cpal::{
     BufferSize, Error as CpalError, InputCallbackInfo, InterfaceType, OutputCallbackInfo, Device, DeviceDirection,
     ErrorKind, FromSample, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
@@ -31,7 +30,7 @@ pub trait Source: Send + 'static {
 }
 
 /// Requested buffer size; small enough for cue/hot-cue response to feel immediate.
-const BUFFER_FRAMES: u32 = 512;
+pub(crate) const BUFFER_FRAMES: u32 = 512;
 
 /// Which output channels (0-based) of a card the deck plays on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,12 +152,20 @@ pub fn input_cards(host: &Host) -> Result<Vec<Card>> {
 }
 
 fn cards_in(host: &Host, direction: Direction, kind: &str) -> Result<Vec<Card>> {
-    let pipewire = <PipeWireHost as HostTrait>::is_available();
     let cards = match host.id() {
         HostId::PipeWire => pipewire_cards(host, direction),
         _ => alsa_cards(host, direction),
     };
-    if pipewire && (host.id() != HostId::PipeWire || cards.is_empty()) {
+    // `host.id()` is already the ground truth here: `cpal::default_host()`
+    // (what built `host`) only ever reports `HostId::PipeWire` after
+    // actually managing to connect — it falls back to plain ALSA on its
+    // own otherwise (confirmed by reading cpal's `platform::default_host`
+    // source: it checks `PipeWireHost::is_available()`, which is really
+    // just "does the socket file exist" and can be stale, but then still
+    // tries `PipeWireHost::new()` — a real connection attempt — before
+    // trusting it). So there's nothing further to check beyond "we're
+    // genuinely on it, but it gave us nothing usable".
+    if host.id() == HostId::PipeWire && cards.is_empty() {
         bail!(
             "PipeWire is running but has no usable audio {kind}.\n\
              Check `wpctl status`. If it lists no devices, PipeWire probably can't open the \
@@ -340,7 +347,7 @@ pub fn choices(cards: &[Card]) -> Vec<Choice> {
 pub struct Errors(Arc<Mutex<Option<String>>>);
 
 impl Errors {
-    fn report(&self, msg: String) {
+    pub(crate) fn report(&self, msg: String) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
     }
 

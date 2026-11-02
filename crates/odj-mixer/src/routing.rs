@@ -4,15 +4,18 @@
 //! to the same output; there is no per-input choice.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use cpal::Stream;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
 
 use odj_core::audio::{self, Source};
+use odj_core::audio_link::{self, Listener};
 use odj_core::filter::ThreeBandEq;
 
 use crate::devices::{DeviceKey, Devices};
@@ -142,9 +145,21 @@ struct RoutedOutput {
     rate: u32,
 }
 
+/// Where `RoutedInput`'s captured audio actually comes from.
+enum InputSource {
+    /// A cpal capture stream — a real card, or a PipeWire virtual sink.
+    Device { _stream: Stream },
+    /// A connection accepted by odj-mixer's own `audio_link::Listener`
+    /// — torn down by stopping and joining its reader thread, which
+    /// itself decides (on exit) whether to give the connection back to
+    /// the listener's pending pool or forget it outright; nothing
+    /// further to do here.
+    Socket { stop: Arc<AtomicBool>, thread: Option<JoinHandle<()>> },
+}
+
 struct RoutedInput {
     output: DeviceKey,
-    _stream: Stream,
+    source: InputSource,
 }
 
 #[derive(Default)]
@@ -152,9 +167,17 @@ pub struct Routing {
     inputs: HashMap<DeviceKey, RoutedInput>,
     outputs: HashMap<DeviceKey, RoutedOutput>,
     main_output: Option<DeviceKey>,
+    /// Set once, at startup, if `audio_link::Listener::start()` bound
+    /// successfully — `None` (the default every existing test already
+    /// gets) just means every input is resolved the usual cpal way.
+    socket_listener: Option<Arc<Listener>>,
 }
 
 impl Routing {
+    pub fn set_socket_listener(&mut self, listener: Arc<Listener>) {
+        self.socket_listener = Some(listener);
+    }
+
     pub fn output_of(&self, input: &DeviceKey) -> Option<DeviceKey> {
         self.inputs.get(input).map(|r| r.output.clone())
     }
@@ -287,6 +310,31 @@ impl Routing {
             self.outputs.insert(output.clone(), RoutedOutput { mixed, _stream: stream, errors: out.errors.clone(), rate });
         }
 
+        // A deck/odj-sampler connected directly over `audio_link`
+        // instead of a PipeWire virtual sink — resolved by name against
+        // the live `Listener` registry, not a fresh cpal device scan.
+        // Checked first since such a name never resolves through
+        // `input_devices` at all (it isn't a cpal device).
+        if let Some(listener) = self.socket_listener.clone()
+            && let Some((stream, rate)) = listener.take(&input.0)
+        {
+            let out_rate = self.outputs.get(output).expect("just ensured").rate;
+            if rate != out_rate {
+                listener.give_back(&input.0, stream, rate); // don't strand the connection over a mismatch
+                self.drop_output_if_unused(output);
+                bail!(
+                    "{} is rendering at {rate} Hz but the output is at {out_rate} Hz — this \
+                     direct link doesn't resample, so they must match for now",
+                    input.0
+                );
+            }
+            let (prod, cons) = HeapRb::<f32>::new(RING_STEREO_SAMPLES).split();
+            let (stop, thread) = audio_link::spawn_reader(stream, rate, prod, input.0.clone(), listener);
+            self.outputs.get(output).expect("just ensured").mixed.lock().unwrap_or_else(|e| e.into_inner()).insert(input.clone(), cons, rate);
+            self.inputs.insert(input.clone(), RoutedInput { output: output.clone(), source: InputSource::Socket { stop, thread: Some(thread) } });
+            return Ok(());
+        }
+
         let (cards, choice) = input_devices.resolve(input)?;
         let host = audio::host();
         let inp = audio::Input::open(&host, &cards, &choice)?;
@@ -306,7 +354,7 @@ impl Routing {
         // Already present from the `contains_key` check above, or just
         // inserted — either way this output is now known.
         self.outputs.get(output).expect("just ensured").mixed.lock().unwrap_or_else(|e| e.into_inner()).insert(input.clone(), cons, rate);
-        self.inputs.insert(input.clone(), RoutedInput { output: output.clone(), _stream: stream });
+        self.inputs.insert(input.clone(), RoutedInput { output: output.clone(), source: InputSource::Device { _stream: stream } });
         Ok(())
     }
 
@@ -314,6 +362,12 @@ impl Routing {
         if let Some(r) = self.inputs.remove(input) {
             if let Some(o) = self.outputs.get(&r.output) {
                 o.mixed.lock().unwrap_or_else(|e| e.into_inner()).remove(input);
+            }
+            if let InputSource::Socket { stop, thread } = r.source {
+                stop.store(true, Ordering::Relaxed);
+                if let Some(t) = thread {
+                    let _ = t.join(); // give_back/forget already happened inside the thread
+                }
             }
             self.drop_output_if_unused(&r.output);
         }
@@ -535,5 +589,142 @@ mod tests {
         routing.set_main_output(Some(key("Speakers")));
         // A main output is set, but nothing's actually open for it yet.
         assert_eq!(routing.main_output_rate(), None);
+    }
+
+    #[test]
+    fn clear_route_gives_a_socket_connection_back_rather_than_closing_it() {
+        let dir = std::env::temp_dir().join(format!("odj-routing-link-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let listener = Arc::new(Listener::start().unwrap());
+        // A real handshake, not a bare cloned stream: `names()` reflects
+        // what `accept_loop` registered as "connected", separately from
+        // what's merely "pending" — see `Listener`'s own doc comment.
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("odj/audio/mixer")).unwrap();
+        write_raw_handshake(&mut client, "odj-deck-1", RATE);
+        let (server, rate) = {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Some(r) = listener.take("odj-deck-1") {
+                    found = Some(r);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            found.expect("the handshake was accepted")
+        };
+
+        // Manually wires up a routed socket input, the same shape
+        // `try_set_route`'s own socket branch builds, without needing a
+        // real output device open just to reach it (`clear_route` is a
+        // no-op on the `self.outputs` side when there's no entry there,
+        // same as it already is for any input whose output disappeared).
+        let (prod, _cons) = input(RING_STEREO_SAMPLES);
+        let (stop, thread) = audio_link::spawn_reader(server, rate, prod, "odj-deck-1".to_string(), listener.clone());
+        let mut routing = Routing::default();
+        routing.inputs.insert(
+            key("odj-deck-1"),
+            RoutedInput { output: key("Speakers"), source: InputSource::Socket { stop, thread: Some(thread) } },
+        );
+
+        routing.clear_route(&key("odj-deck-1"));
+        assert!(routing.output_of(&key("odj-deck-1")).is_none());
+        // Still listed as connected (unlike "pending", this never clears
+        // just because something routed it) ...
+        assert_eq!(listener.names(), [("odj-deck-1".to_string(), RATE)]);
+        // ... and the reader thread's own clean-stop path gave the
+        // connection back to the pending pool rather than dropping it —
+        // proof it ran to completion (stopped and joined) rather than
+        // being abandoned.
+        assert!(listener.take("odj-deck-1").is_some(), "given back, so routable again without reconnecting");
+
+        drop(client);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw handshake bytes: 4-byte magic "odjl", a 32-byte NUL-padded
+    /// name, then the sample rate as a u32 LE — see
+    /// `odj_core::audio_link`'s own module doc comment for the wire
+    /// format (its encoder is private to that crate).
+    fn write_raw_handshake(stream: &mut std::os::unix::net::UnixStream, name: &str, sample_rate: u32) {
+        let mut hs = [0u8; 4 + 32 + 4];
+        hs[..4].copy_from_slice(b"odjl");
+        hs[4..4 + name.len()].copy_from_slice(name.as_bytes());
+        hs[36..].copy_from_slice(&sample_rate.to_le_bytes());
+        std::io::Write::write_all(stream, &hs).unwrap();
+    }
+
+    fn any_output_key(devices_out: &Devices) -> DeviceKey {
+        for _ in 0..200 {
+            if let Some(e) = devices_out.entries().iter().find(|e| e.available) {
+                return e.key.clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no output device found on this machine");
+    }
+
+    #[test]
+    #[ignore = "opens a real output on this machine"]
+    fn set_route_prefers_a_pending_socket_connection_over_a_cpal_scan() {
+        let dir = std::env::temp_dir().join(format!("odj-routing-link-prefer-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let listener = Arc::new(Listener::start().unwrap());
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("odj/audio/mixer")).unwrap();
+        write_raw_handshake(&mut client, "odj-deck-1", 48_000);
+
+        let devices_in = Devices::start(crate::devices::Kind::Input);
+        let devices_out = Devices::start(crate::devices::Kind::Output);
+        let output_key = any_output_key(&devices_out);
+
+        let mut routing = Routing::default();
+        routing.set_socket_listener(listener.clone());
+        routing.set_route(&devices_in, &devices_out, &key("odj-deck-1"), Some(&output_key)).unwrap();
+        assert_eq!(routing.output_of(&key("odj-deck-1")), Some(output_key), "took the socket branch, never touched input_devices");
+
+        routing.clear_route(&key("odj-deck-1"));
+        drop(client);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "opens a real output on this machine"]
+    fn set_route_rejects_a_sample_rate_mismatch_and_gives_the_connection_back() {
+        let dir = std::env::temp_dir().join(format!("odj-routing-link-mismatch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        }
+        let listener = Arc::new(Listener::start().unwrap());
+        let mut client = std::os::unix::net::UnixStream::connect(dir.join("odj/audio/mixer")).unwrap();
+        write_raw_handshake(&mut client, "odj-deck-9", 1); // 1 Hz: never a real device's negotiated rate
+
+        let devices_in = Devices::start(crate::devices::Kind::Input);
+        let devices_out = Devices::start(crate::devices::Kind::Output);
+        let output_key = any_output_key(&devices_out);
+
+        let mut routing = Routing::default();
+        routing.set_socket_listener(listener.clone());
+        let err = routing.set_route(&devices_in, &devices_out, &key("odj-deck-9"), Some(&output_key)).unwrap_err();
+        assert!(err.to_string().contains("1 Hz"), "{err}");
+        assert!(routing.output_of(&key("odj-deck-9")).is_none(), "not routed");
+        assert_eq!(listener.names(), [("odj-deck-9".to_string(), 1)], "given back, not stranded");
+
+        drop(client);
+        unsafe {
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

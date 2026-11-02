@@ -18,10 +18,15 @@ blake3.workspace = true
 libc.workspace = true
 cpal.workspace = true
 midir.workspace = true
-pipewire.workspace = true
 ringbuf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 symphonia.workspace = true
 ratatui.workspace = true
 rustfft.workspace = true
+
+# Only on Linux: needs `libpipewire` via pkg-config, which doesn't exist
+# on macOS — see `src/audio.rs`'s own `#[cfg(target_os = "linux")]`
+# gating around every use of this.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire.workspace = true

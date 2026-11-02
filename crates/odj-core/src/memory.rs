@@ -566,12 +566,28 @@ pub fn data_dir() -> PathBuf {
     xdg_dir("XDG_DATA_HOME", ".local/share")
 }
 
+/// `$<var>/odj` if set; otherwise a conventional per-OS fallback under
+/// `$HOME` — `fallback` (an XDG-style path, e.g. `.local/share`) on
+/// Linux and everywhere else, or macOS's own
+/// `Library/Application Support` on macOS specifically (which has no
+/// `XDG_DATA_HOME`/`XDG_CONFIG_HOME` by convention at all, so this
+/// branch is the one that actually applies there in practice; this app
+/// has no meaningful data/config split, so both land in the same place
+/// there rather than inventing one).
 fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
-    std::env::var_os(var)
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(fallback)))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("odj")
+    if let Some(dir) = std::env::var_os(var) {
+        return PathBuf::from(dir).join("odj");
+    }
+    let Some(home) = std::env::var_os("HOME") else { return PathBuf::from(".").join("odj") };
+    let home = PathBuf::from(home);
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/odj")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(fallback).join("odj")
+    }
 }
 
 pub fn read_json<T: serde::de::DeserializeOwned>(file: &Path) -> Option<T> {
@@ -612,6 +628,36 @@ mod tests {
             bpm: None,
             quantize: Some(false),
         }
+    }
+
+    /// Points `XDG_DATA_HOME`/`HOME` at a fresh temp directory for the
+    /// span of one test — tests across the crate share this process's
+    /// environment, so each test needs its own directory rather than a
+    /// shared one two tests running in parallel could collide on.
+    fn isolate_home(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("odj-xdg-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::set_var("HOME", &root);
+        }
+        root
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn data_dir_falls_back_to_the_xdg_dotfolder_under_home() {
+        let root = isolate_home("linux");
+        assert_eq!(data_dir(), root.join(".local/share/odj"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn data_dir_falls_back_to_application_support_on_macos() {
+        let root = isolate_home("macos");
+        assert_eq!(data_dir(), root.join("Library/Application Support/odj"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

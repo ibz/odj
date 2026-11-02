@@ -8,6 +8,8 @@ authors.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 publish = false
+build = "build.rs"
+links = "rubberband"
 
 [dependencies]
 odj-core.workspace = true
@@ -15,6 +17,9 @@ anyhow.workspace = true
 cpal.workspace = true
 ratatui.workspace = true
 tui-big-text = "0.8.10"
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [dev-dependencies]
 odj-core = { workspace = true, features = ["test-util"] }

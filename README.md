@@ -313,12 +313,15 @@ provide, so a hardware input can't be added this way without it. A
 deck or odj-sampler still works, though — each connects straight to
 odj-mixer over a Unix socket instead of a virtual sink, shown in the
 channel list with a "(no PipeWire)" tag, so Volume/EQ keep working
-without any hardware-input mixing. (This doesn't by itself make a
-build on a platform with no PipeWire at all, such as macOS, work —
-that also needs a non-PipeWire audio backend and linking
-`librubberband` there, neither done yet — but it removes the one piece
-of odj-mixer's own design that would otherwise need a from-scratch
-redesign rather than a build-flag fix.)
+without any hardware-input mixing. (This, plus cfg-gating the raw
+`pipewire` crate out of the build and a `pkg-config`-based build script
+for `librubberband`, is what makes the workspace *compile* on a
+platform with no PipeWire at all, such as macOS — but audio device
+enumeration there still falls back to generic cpal calls with no
+CoreAudio-specific device-id parsing written yet, so it builds and runs
+but currently lists no audio devices at all on macOS; that part's
+untested and unwritten, waiting on someone who can actually run it on a
+Mac.)
 
 The live screen looks like a real mixer: one channel strip per running
 deck (or the sampler) plus every input that's been added, side by side, each with High,

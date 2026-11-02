@@ -1632,6 +1632,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "odj-core",
+ "pkg-config",
  "ratatui",
  "tui-big-text",
 ]

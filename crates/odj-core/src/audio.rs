@@ -18,6 +18,7 @@ use cpal::{
     BufferSize, Error as CpalError, InputCallbackInfo, InterfaceType, OutputCallbackInfo, Device, DeviceDirection,
     ErrorKind, FromSample, HostId, Sample, SampleFormat, SizedSample, Stream, StreamConfig,
 };
+#[cfg(target_os = "linux")]
 use pipewire as pw;
 
 pub use cpal::Host;
@@ -152,10 +153,19 @@ pub fn input_cards(host: &Host) -> Result<Vec<Card>> {
 }
 
 fn cards_in(host: &Host, direction: Direction, kind: &str) -> Result<Vec<Card>> {
+    // `HostId::PipeWire` doesn't exist at all on a non-Linux build of
+    // `cpal` (its `HostId` enum is generated per-platform — the macOS
+    // one only ever has `CoreAudio`/`Jack`), so this whole dispatch is
+    // Linux-only; elsewhere there's only ever one path, `alsa_cards`
+    // (see its own doc comment for why that's fine despite the name).
+    #[cfg(target_os = "linux")]
     let cards = match host.id() {
         HostId::PipeWire => pipewire_cards(host, direction),
         _ => alsa_cards(host, direction),
     };
+    #[cfg(not(target_os = "linux"))]
+    let cards = alsa_cards(host, direction);
+
     // `host.id()` is already the ground truth here: `cpal::default_host()`
     // (what built `host`) only ever reports `HostId::PipeWire` after
     // actually managing to connect — it falls back to plain ALSA on its
@@ -165,6 +175,7 @@ fn cards_in(host: &Host, direction: Direction, kind: &str) -> Result<Vec<Card>> 
     // tries `PipeWireHost::new()` — a real connection attempt — before
     // trusting it). So there's nothing further to check beyond "we're
     // genuinely on it, but it gave us nothing usable".
+    #[cfg(target_os = "linux")]
     if host.id() == HostId::PipeWire && cards.is_empty() {
         bail!(
             "PipeWire is running but has no usable audio {kind}.\n\
@@ -173,6 +184,8 @@ fn cards_in(host: &Host, direction: Direction, kind: &str) -> Result<Vec<Card>> 
              then log in again or reboot so PipeWire restarts with that access."
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = kind;
     Ok(cards)
 }
 
@@ -249,7 +262,14 @@ fn pipewire_cards(host: &Host, direction: Direction) -> Vec<Card> {
     cards
 }
 
-/// ALSA hardware cards. Cards that are busy or off-limits are listed as unavailable.
+/// ALSA hardware cards. Cards that are busy or off-limits are listed as
+/// unavailable. Also `cards_in`'s only path at all on a non-Linux build
+/// (see its own doc comment) — nothing here is actually ALSA-specific
+/// beyond parsing device ids in ALSA's own `hw:CARD=`/`plug*` string
+/// convention, so on e.g. CoreAudio this still compiles and runs, just
+/// finds no id matching that convention and returns an empty `Vec`
+/// rather than real devices — real, CoreAudio-aware enumeration is a
+/// separate, not-yet-written thing, not something this function fakes.
 fn alsa_cards(host: &Host, direction: Direction) -> Vec<Card> {
     let found = match direction {
         Direction::Output => host.output_devices(),
@@ -548,7 +568,18 @@ where
 /// two independent hardware clocks would drift apart with no way to
 /// correct it here.
 pub fn is_pipewire(host: &Host) -> bool {
-    host.id() == HostId::PipeWire
+    // `HostId::PipeWire` doesn't exist in `cpal`'s `HostId` type at all
+    // on a non-Linux build (see `cards_in`'s own doc comment) — there's
+    // simply never a PipeWire host to be one off Linux.
+    #[cfg(target_os = "linux")]
+    {
+        host.id() == HostId::PipeWire
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = host;
+        false
+    }
 }
 
 /// A recording device: the input-side counterpart to [`Output`]. Doesn't
@@ -708,18 +739,29 @@ where
 /// wrong route, just of a slow or busy session.
 pub fn verify_route(host: &Host, output: &Output) -> Result<()> {
     let Some(want) = output.target_id.as_deref() else { return Ok(()) };
-    if host.id() != HostId::PipeWire {
-        return Ok(());
+    #[cfg(target_os = "linux")]
+    {
+        if host.id() != HostId::PipeWire {
+            return Ok(());
+        }
+        match pipewire_peer_of_own_stream(true) {
+            PeerCheck::Linked(got) if got == want => Ok(()),
+            PeerCheck::Linked(got) => bail!(
+                "expected to play on {} but PipeWire linked the stream to {got} instead \
+                 (fell back to its default — either the device disappeared, or, for one just \
+                 created, hasn't finished registering with PipeWire yet)",
+                output.name
+            ),
+            PeerCheck::Unconfirmed => Ok(()),
+        }
     }
-    match pipewire_peer_of_own_stream(true) {
-        PeerCheck::Linked(got) if got == want => Ok(()),
-        PeerCheck::Linked(got) => bail!(
-            "expected to play on {} but PipeWire linked the stream to {got} instead \
-             (fell back to its default — either the device disappeared, or, for one just \
-             created, hasn't finished registering with PipeWire yet)",
-            output.name
-        ),
-        PeerCheck::Unconfirmed => Ok(()),
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No PipeWire backend on this platform to misroute to — nothing
+        // further to verify, same as the early return above for a
+        // non-PipeWire host on Linux.
+        let _ = (host, want);
+        Ok(())
     }
 }
 
@@ -728,18 +770,26 @@ pub fn verify_route(host: &Host, output: &Output) -> Result<()> {
 /// *input* side (receiving from a source), not its output side.
 pub fn verify_input_route(host: &Host, input: &Input) -> Result<()> {
     let Some(want) = input.target_id.as_deref() else { return Ok(()) };
-    if host.id() != HostId::PipeWire {
-        return Ok(());
+    #[cfg(target_os = "linux")]
+    {
+        if host.id() != HostId::PipeWire {
+            return Ok(());
+        }
+        match pipewire_peer_of_own_stream(false) {
+            PeerCheck::Linked(got) if got == want => Ok(()),
+            PeerCheck::Linked(got) => bail!(
+                "expected to capture from {} but PipeWire linked the stream to {got} instead \
+                 (fell back to its default — either the device disappeared, or, for one just \
+                 created, hasn't finished registering with PipeWire yet)",
+                input.name
+            ),
+            PeerCheck::Unconfirmed => Ok(()),
+        }
     }
-    match pipewire_peer_of_own_stream(false) {
-        PeerCheck::Linked(got) if got == want => Ok(()),
-        PeerCheck::Linked(got) => bail!(
-            "expected to capture from {} but PipeWire linked the stream to {got} instead \
-             (fell back to its default — either the device disappeared, or, for one just \
-             created, hasn't finished registering with PipeWire yet)",
-            input.name
-        ),
-        PeerCheck::Unconfirmed => Ok(()),
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (host, want);
+        Ok(())
     }
 }
 
@@ -776,11 +826,21 @@ pub fn sampler_sink_name() -> &'static str {
 /// willing to find it there (see its own doc comment for that half).
 /// Lets a deck — or odj-sampler — route its output through odj-mixer
 /// instead of a real device, for odj-mixer to apply its own filters to.
+///
+/// Linux/PipeWire-only — see the `#[cfg(not(target_os = "linux"))]`
+/// stub below, which exists purely so `odj-player`/`odj-sampler`'s own
+/// `setup_through_mixer` (which references this type unconditionally,
+/// choosing it or `odj_core::audio_link::SocketSink` based on
+/// `is_pipewire`) compiles on every platform; `create` on that stub is
+/// never actually reachable, since `is_pipewire` is always `false` off
+/// Linux.
+#[cfg(target_os = "linux")]
 pub struct NullSink {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 impl NullSink {
     /// Creates `name` (see [`deck_sink_name`]/[`sampler_sink_name`]) with
     /// the friendly `description` ("Deck n"/"Sampler"), and keeps it
@@ -804,6 +864,7 @@ impl NullSink {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for NullSink {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -820,6 +881,7 @@ impl Drop for NullSink {
 /// forever — until told to stop, at which point it destroys the sink
 /// and gives the server a moment to process that before this thread (and
 /// the connection with it) goes away.
+#[cfg(target_os = "linux")]
 fn run_null_sink(name: &str, description: &str, ready: mpsc::Sender<Result<()>>, stop: &AtomicBool) {
     pw::init();
     let setup = (|| -> Result<(pw::main_loop::MainLoopRc, pw::core::CoreRc, pw::node::Node)> {
@@ -885,6 +947,20 @@ fn run_null_sink(name: &str, description: &str, ready: mpsc::Sender<Result<()>>,
     mainloop.run();
 }
 
+/// The non-Linux stand-in for [`NullSink`] above — see its own doc
+/// comment for why this needs to exist at all rather than just
+/// disappearing behind `#[cfg]`.
+#[cfg(not(target_os = "linux"))]
+pub struct NullSink;
+
+#[cfg(not(target_os = "linux"))]
+impl NullSink {
+    pub fn create(_name: &str, _description: &str) -> Result<Self> {
+        bail!("PipeWire virtual sinks are only available on Linux")
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 enum PeerCheck {
     /// The stream is linked to exactly this PipeWire node name.
@@ -904,6 +980,7 @@ enum PeerCheck {
 /// dispatching the first sync's replies), so a second sync/wait round trip follows to be
 /// sure their `info` replies have also come back before giving up and reading what was
 /// collected.
+#[cfg(target_os = "linux")]
 fn pipewire_peer_of_own_stream(we_are_output: bool) -> PeerCheck {
     pw::init();
     let Ok(mainloop) = pw::main_loop::MainLoopRc::new(None) else { return PeerCheck::Unconfirmed };
@@ -1056,6 +1133,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "opens and plays silence on this machine's default output"]
     fn verify_route_confirms_the_real_target() {
         let host = host();
@@ -1072,6 +1150,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "opens and plays silence on this machine's default output"]
     fn verify_route_rejects_a_mismatched_target() {
         let host = host();
@@ -1107,6 +1186,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore = "needs a real PipeWire session"]
     fn null_sink_is_visible_as_both_an_output_and_an_input() {
         let name = format!("odj-test-sink-{}", std::process::id());

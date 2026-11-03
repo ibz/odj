@@ -58,6 +58,13 @@ const CONTROLS: usize = 4;
 /// a few seconds rather than staying silently unconnected for the rest
 /// of the session.
 const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(3);
+/// How long a status message stays on screen before [`status_text`]
+/// starts hiding it — plain elapsed time, not "until the next key",
+/// since that cleared a just-shown error the instant the very key that
+/// triggered it (e.g. the `Space` that failed to connect something) was
+/// itself processed, too fast to ever actually read. Matches
+/// odj-player's own `STATUS_TIME`.
+const STATUS_TIME: Duration = Duration::from_secs(4);
 
 /// The help's pages (`?` or `/`, from the live screen only — Settings
 /// has no help of its own) — the live screen's own keys, then
@@ -233,7 +240,7 @@ fn auto_connect(
     active_inputs: &HashSet<String>,
     failed: &mut HashMap<DeviceKey, Instant>,
     retry_after: Duration,
-    status: &mut Option<String>,
+    status: &mut Option<(String, Instant)>,
 ) {
     let mut r = routing.lock().unwrap_or_else(|e| e.into_inner());
     let Some(main) = r.main_output() else { return };
@@ -245,10 +252,27 @@ fn auto_connect(
         if let Err(e) = r.set_route(devices, devices_out, &ch.key, Some(&main)) {
             let msg = format!("Could not connect {}: {e}", ch.label);
             crate::log::log(&msg);
-            *status = Some(msg);
+            set_status(status, msg);
             failed.insert(ch.key.clone(), Instant::now());
         }
     }
+}
+
+/// Shows `msg`, timestamped now — see [`status_text`] for how (and
+/// when) it stops being shown.
+fn set_status(status: &mut Option<(String, Instant)>, msg: impl Into<String>) {
+    *status = Some((msg.into(), Instant::now()));
+}
+
+/// `status`'s message, for as long as it's within [`STATUS_TIME`] of
+/// being set — after that, hidden on its own rather than needing a key
+/// to dismiss it (which cleared it too fast to read when the very key
+/// that triggered it, e.g. a failed `Space` toggle, was itself what
+/// processed next). Every message is also `log::log`ged where it's set,
+/// so one that expired before it could be read is still in
+/// `log::log_file()` afterward.
+fn status_text(status: &Option<(String, Instant)>) -> Option<&str> {
+    status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TIME).map(|(s, _)| s.as_str())
 }
 
 /// Binds `cc` to `target` both live (`targets`) and in `controller`'s
@@ -753,13 +777,9 @@ pub fn run(
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
     let mut recorder = Recorder::default();
-    // Shown via `draw_status_popup` until something replaces it or any
-    // key dismisses it (see the two event-handling blocks below) —
-    // otherwise an error would sit on screen forever once hit. Every
-    // assignment below also calls `log::log`, so a message that's come
-    // and gone before it could be read (or copied) is still in
-    // `log::log_file()` afterward.
-    let mut status: Option<String> = None;
+    // See `set_status`/`status_text` for how long this actually stays
+    // shown for.
+    let mut status: Option<(String, Instant)> = None;
 
     loop {
         let in_entries = devices_in.entries();
@@ -773,13 +793,13 @@ pub fn run(
             failed.retain(|k, _| known.contains(k));
             for e in r.take_errors() {
                 crate::log::log(&e);
-                status = Some(e);
+                set_status(&mut status, e);
             }
             drop(r);
             if let Some(e) = recorder.poll_error(routing) {
                 let msg = format!("Recording stopped: {e}");
                 crate::log::log(&msg);
-                status = Some(msg);
+                set_status(&mut status, msg);
             }
         }
 
@@ -835,7 +855,7 @@ pub fn run(
                     &controller_rows,
                     midi_selected,
                     controller.as_deref(),
-                    status.as_deref(),
+                    status_text(&status),
                 );
             })?;
             if event::poll(Duration::from_millis(100))? {
@@ -843,7 +863,6 @@ pub fn run(
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                status = None; // any key dismisses whatever's shown
                 if let Some((label, rows)) = &drilled {
                     match k.code {
                         KeyCode::Esc => mapping_drill = None,
@@ -852,7 +871,7 @@ pub fn run(
                         KeyCode::Enter if !rows.is_empty() => {
                             let row = &rows[param_selected];
                             match &controller {
-                                None => status = Some("No MIDI controller connected".into()),
+                                None => set_status(&mut status, "No MIDI controller connected"),
                                 Some(name) => {
                                     if let Some(cc) = midi::learn(terminal, learning, &format!("{label} {}", param_label(row.param)))? {
                                         bind_knob(targets, name, cc, row.target.clone());
@@ -891,7 +910,7 @@ pub fn run(
                                 Err(e) => {
                                     let msg = format!("Could not connect {}: {e}", row.label);
                                     crate::log::log(&msg);
-                                    status = Some(msg);
+                                    set_status(&mut status, msg);
                                 }
                             }
                             failed.remove(&row.key);
@@ -920,7 +939,7 @@ pub fn run(
                                 let _ = recorder.stop(routing);
                                 let msg = "Recording stopped: main output changed".to_string();
                                 crate::log::log(&msg);
-                                status = Some(msg);
+                                set_status(&mut status, msg);
                             }
                             routing.lock().unwrap_or_else(|e| e.into_inner()).set_main_output(Some(key.clone()));
                             set_output(&key);
@@ -976,7 +995,7 @@ pub fn run(
 
         terminal.draw(|f| {
             let r = routing.lock().unwrap_or_else(|e| e.into_inner());
-            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status.as_deref(), recorder.elapsed());
+            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status_text(&status), recorder.elapsed());
             if help.is_open() {
                 draw_help(f, &help, HELP);
             }
@@ -987,7 +1006,6 @@ pub fn run(
             if k.kind == KeyEventKind::Release {
                 continue;
             }
-            status = None; // any key dismisses whatever's shown
             // The help takes the keys that turn and scroll it; nothing
             // underneath acts while it's open.
             if help.is_open() {
@@ -1012,7 +1030,7 @@ pub fn run(
                         Ok(path) => format!("Recording to {}", path.display()),
                     };
                     crate::log::log(&msg);
-                    status = Some(msg);
+                    set_status(&mut status, msg);
                 }
                 KeyCode::Left | KeyCode::Right if !channels.is_empty() => {
                     let forward = k.code == KeyCode::Right;
@@ -1428,6 +1446,18 @@ mod tests {
 
     fn entry(id: &str, label: &str) -> Entry {
         Entry { key: (id.to_string(), Route::Stereo(0, 1)), label: label.to_string(), available: true }
+    }
+
+    #[test]
+    fn status_text_shows_a_fresh_message_and_hides_an_expired_one() {
+        let mut status = None;
+        assert_eq!(status_text(&status), None);
+        set_status(&mut status, "something went wrong");
+        assert_eq!(status_text(&status), Some("something went wrong"));
+        // Backdate it past `STATUS_TIME` instead of actually sleeping
+        // that long.
+        status.as_mut().unwrap().1 -= STATUS_TIME;
+        assert_eq!(status_text(&status), None, "expired on its own, not needing a key to clear it");
     }
 
     #[test]

@@ -9,14 +9,17 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-use odj_core::audio::{self, Card, Choice, Route};
+use odj_core::audio::{self, Card, Choice, Route, strip_dedup_suffix};
 use odj_core::audio_link::Listener;
 
 const PERIOD: Duration = Duration::from_secs(1);
 
 /// A card+route pair's stable identity across repeated scans — a plain
 /// index into whichever `Vec<Card>` a scan happened to produce doesn't
-/// survive the next one, but [`Card::id`] does.
+/// survive the next one, but [`Card::id`] does — except for one known
+/// case, PipeWire's own dedup suffix drifting (see
+/// `strip_dedup_suffix`'s own doc comment and [`Devices::resolve`]'s,
+/// which tolerates exactly that one case).
 pub type DeviceKey = (String, Route);
 
 /// `key` encoded as `"<card id>#<route tag>"` — a card id never
@@ -127,15 +130,34 @@ impl Devices {
     /// actually opening a stream on it — not just whatever the background
     /// thread last saw, so a device that only just appeared doesn't need
     /// to wait for the next periodic scan.
+    ///
+    /// Tries an exact id match first; if that fails, retries once with
+    /// PipeWire's own dedup suffix ignored on both sides (see
+    /// `audio::strip_dedup_suffix`'s own doc comment for why one can
+    /// drift out from under an otherwise-unchanged device — confirmed:
+    /// a saved `mixer_active_inputs`/`mixer_output` key can stop
+    /// resolving at all after nothing more than a PipeWire restart).
+    /// That fallback only succeeds if it identifies exactly one card —
+    /// two different ones colliding once the suffix is ignored (e.g.
+    /// two identical interfaces plugged in at once) is genuine
+    /// disambiguation, not drift, so that's left as "no longer
+    /// available" rather than guessing which one was meant.
     pub fn resolve(&self, key: &DeviceKey) -> Result<(Vec<Card>, Choice)> {
         let cards = scan_cards(self.kind)?;
         let choices = audio::choices(&cards);
-        let choice = choices
+        if let Some(choice) = choices.iter().find(|c| cards[c.card].id() == key.0 && c.route == key.1) {
+            return Ok((cards, *choice));
+        }
+        let wanted = strip_dedup_suffix(&key.0);
+        let fuzzy: Vec<Choice> = choices
             .iter()
-            .find(|c| cards[c.card].id() == key.0 && c.route == key.1)
+            .filter(|c| strip_dedup_suffix(cards[c.card].id()) == wanted && c.route == key.1)
             .copied()
-            .ok_or_else(|| anyhow!("that device is no longer available"))?;
-        Ok((cards, choice))
+            .collect();
+        if fuzzy.len() == 1 {
+            return Ok((cards, fuzzy[0]));
+        }
+        Err(anyhow!("that device is no longer available"))
     }
 }
 

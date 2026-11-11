@@ -48,7 +48,8 @@ pub struct Card {
     /// Stable handle for this card: the PipeWire node name, or the ALSA `hw:CARD=` id.
     /// Used to re-resolve the card at open time, since this whole snapshot can be stale by
     /// then — a USB card that was unplugged and replugged gets a new PipeWire node (and can
-    /// land on a new ALSA card index too), even though this `id` stays the same.
+    /// land on a new ALSA card index too), even though this `id` stays the same. Not
+    /// *perfectly* stable, though: see [`strip_dedup_suffix`] for the one known exception.
     id: String,
     pub name: String,
     pub channels: u16,
@@ -74,6 +75,29 @@ impl Card {
     pub fn id(&self) -> &str {
         &self.id
     }
+}
+
+/// Strips a trailing, bare-numeric `.N` from `id`, if it has one —
+/// `None` of this file's own code ever adds one; it's PipeWire itself
+/// that sometimes does, on a node name it would otherwise have to
+/// register twice (confirmed empirically: a USB interface's per-channel
+/// ALSA UCM-profile sub-devices, e.g. `..._Mic2__source`, show up with
+/// a trailing `.53`-style suffix in one session and without one in
+/// another, depending on what else WirePlumber had already registered
+/// when it created them) — and that suffix isn't stable across a
+/// PipeWire restart, so a [`Card::id`] saved with one baked in (e.g.
+/// [`odj-mixer`](../../odj-mixer/index.html)'s own
+/// `Settings.mixer_active_inputs`) can stop exactly matching a later
+/// scan's id for the very same physical device. [`odj-mixer`]'s own
+/// `Devices::resolve` uses this as a fallback when an exact match
+/// fails, not as the primary comparison — stripping it unconditionally
+/// would risk conflating two genuinely different nodes that only
+/// differ by this suffix (e.g. two identical interfaces plugged in at
+/// once), which is a real disambiguation, not drift.
+pub fn strip_dedup_suffix(id: &str) -> &str {
+    let Some(dot) = id.rfind('.') else { return id };
+    let tail = &id[dot + 1..];
+    if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) { &id[..dot] } else { id }
 }
 
 /// One entry of the output/input picker.
@@ -1113,6 +1137,23 @@ mod tests {
     fn extract_frame_mono_reads_one_channel_into_both_sides() {
         let frame = [1.0f32, -0.75, 2.0, 3.0];
         assert_eq!(extract_frame(&frame, Route::Mono(1)), (-0.75, -0.75));
+    }
+
+    #[test]
+    fn strip_dedup_suffix_drops_a_trailing_bare_number() {
+        let id = "alsa_input.usb-BEHRINGER_UMC404HD_192k-00.HiFi__Mic2__source";
+        assert_eq!(strip_dedup_suffix(&format!("{id}.53")), id);
+        assert_eq!(strip_dedup_suffix(id), id, "nothing to strip: unchanged");
+    }
+
+    #[test]
+    fn strip_dedup_suffix_leaves_a_non_numeric_tail_alone() {
+        // The part after the last `.` has to be *only* digits — a real
+        // dotted name ending in a word (or a mix) is never PipeWire's
+        // own dedup suffix, so it's left exactly as it was.
+        assert_eq!(strip_dedup_suffix("Audio.Sink"), "Audio.Sink");
+        assert_eq!(strip_dedup_suffix("foo.1a"), "foo.1a");
+        assert_eq!(strip_dedup_suffix("no-dot-here"), "no-dot-here");
     }
 
     struct Silence;

@@ -44,6 +44,11 @@ pub struct TrackMemory {
     pub bpm: Option<f64>,
     /// Quantize turned on or off for this track, overriding the default.
     pub quantize: Option<bool>,
+    /// Pitch fader offset, in percent, as the track was last played — so a
+    /// track comes back at the tempo it was mixed at. Absent means centred:
+    /// a deck at 0% stores nothing, so merely loading a track never gives
+    /// it a library entry it wouldn't otherwise have.
+    pub tempo: Option<f64>,
 }
 
 impl TrackMemory {
@@ -93,6 +98,7 @@ fn merge(base: &TrackMemory, mine: &TrackMemory, theirs: &TrackMemory) -> TrackM
         grid: scalar(base.grid, mine.grid, theirs.grid),
         bpm: scalar(base.bpm, mine.bpm, theirs.bpm),
         quantize: scalar(base.quantize, mine.quantize, theirs.quantize),
+        tempo: scalar(base.tempo, mine.tempo, theirs.tempo),
     }
 }
 
@@ -302,6 +308,10 @@ struct TrackFile {
     bpm: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quantize: Option<bool>,
+    /// Pitch fader offset, in percent; only written for a track last played
+    /// off-centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tempo: Option<f64>,
     /// Hot cues and memory points, by position.
     #[serde(default)]
     cues: Vec<CueEntry>,
@@ -345,6 +355,7 @@ impl TrackFile {
             grid: mem.grid,
             bpm: mem.bpm,
             quantize: mem.quantize,
+            tempo: mem.tempo,
             cues,
             current_loop: mem.loop_in.map(|pos| Cue { pos, loop_out: mem.loop_out }),
             youtube_url: None,
@@ -356,6 +367,7 @@ impl TrackFile {
             grid: self.grid,
             bpm: self.bpm,
             quantize: self.quantize,
+            tempo: self.tempo,
             loop_in: self.current_loop.map(|l| l.pos),
             loop_out: self.current_loop.and_then(|l| l.loop_out),
             ..TrackMemory::default()
@@ -521,6 +533,7 @@ impl Memory {
             grid: None,
             bpm: None,
             quantize: None,
+            tempo: None,
             cues: Vec::new(),
             current_loop: None,
             youtube_url: None,
@@ -627,6 +640,7 @@ mod tests {
             grid: Some(BeatGrid { bpm: 124.5, anchor: 1_234.5 }),
             bpm: None,
             quantize: Some(false),
+            tempo: Some(-3.5),
         }
     }
 
@@ -741,6 +755,18 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["grid"], serde_json::json!({"bpm": 126.0, "anchor": 42.0}));
         assert!(v.get("bpm").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_centred_pitch_fader_writes_no_tempo_at_all() {
+        let t = track("ab98", "/a");
+        let off_centre = TrackFile::new(&t, &TrackMemory { tempo: Some(2.5), ..TrackMemory::default() });
+        let json = serde_json::to_string(&off_centre).unwrap();
+        assert!(json.contains(r#""tempo":2.5"#), "{json}");
+
+        let centred = TrackFile::new(&t, &TrackMemory { tempo: None, ..TrackMemory::default() });
+        let json = serde_json::to_string(&centred).unwrap();
+        assert!(!json.contains("tempo"), "{json}");
     }
 
     #[test]

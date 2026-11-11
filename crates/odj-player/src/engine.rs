@@ -450,7 +450,19 @@ impl Deck {
         self.unfollow();
         self.xfade = None;
         self.stretch_primed = false;
+        // The pitch fader goes back to where this track was last played,
+        // centring for one with nothing stored. Clamped to the widest range
+        // so the loop below always terminates, then widening the range if
+        // the stored tempo outreaches the current one — same as leaving sync
+        // on a tempo the range can't hold.
+        let widest = TempoRange::Wide.percent();
+        self.tempo = mem.tempo.unwrap_or(0.0).clamp(-widest, widest);
+        while self.tempo.abs() > self.range.percent() {
+            self.range = self.range.next();
+        }
         let old = self.track.replace(track);
+        // After the fader, so a synced deck still takes its leader's tempo
+        // rather than the stored one.
         self.match_leader();
         old
     }
@@ -464,6 +476,10 @@ impl Deck {
             grid: self.grid_override,
             bpm: None,
             quantize: self.quantize_override,
+            // Nothing for a centred fader, so a track that has no cues
+            // either stays absent from the library rather than gaining an
+            // entry just for having been loaded.
+            tempo: (self.tempo != 0.0).then_some(self.tempo),
         }
     }
 
@@ -2277,6 +2293,49 @@ mod tests {
         assert_eq!(d.range, TempoRange::R16);
         assert!(!d.quantize());
         assert!(d.move_tempo(1.0));
+    }
+
+    #[test]
+    fn the_pitch_fader_comes_back_where_the_track_was_last_played() {
+        let mut d = deck();
+        assert_eq!(d.tempo, 0.0);
+        assert_eq!(d.memory().tempo, None, "a centred fader stores nothing");
+        d.move_tempo(50.0); // +2.5%, at R10's 0.05 step
+        assert!((d.tempo - 2.5).abs() < 1e-9);
+        assert_eq!(d.memory().tempo, Some(2.5));
+
+        let saved = d.memory();
+        let track = Arc::clone(d.track.as_ref().unwrap());
+        d.load(Arc::clone(&track), &saved, false);
+        assert!((d.tempo - 2.5).abs() < 1e-9, "back to where it was left");
+
+        // A track with nothing stored centres the fader rather than
+        // inheriting the one before it.
+        d.load(track, &TrackMemory::default(), false);
+        assert_eq!(d.tempo, 0.0);
+    }
+
+    #[test]
+    fn a_stored_tempo_the_range_cant_hold_widens_the_range() {
+        let mut d = deck();
+        assert_eq!(d.range, TempoRange::R10);
+        let track = Arc::clone(d.track.as_ref().unwrap());
+        d.load(track, &TrackMemory { tempo: Some(12.5), ..TrackMemory::default() }, false);
+        assert!((d.tempo - 12.5).abs() < 1e-9);
+        assert_eq!(d.range, TempoRange::R16, "widened to hold it, not clamped down to ±10");
+    }
+
+    #[test]
+    fn a_synced_deck_takes_its_leaders_tempo_over_the_stored_one() {
+        let mut d = deck();
+        let mut t = 100.0;
+        d.toggle_sync();
+        follow(&mut d, &mut t, 0.02, &master(135.0, 0.0));
+        assert!((d.tempo - 12.5).abs() < 1e-9);
+
+        let track = Arc::clone(d.track.as_ref().unwrap());
+        d.load(track, &TrackMemory { tempo: Some(-5.0), ..TrackMemory::default() }, false);
+        assert!((d.tempo - 12.5).abs() < 1e-9, "the leader wins, not the stored -5%");
     }
 
     #[test]

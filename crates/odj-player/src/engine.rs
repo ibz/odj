@@ -881,8 +881,14 @@ impl Deck {
     /// the next beat when quantizing; paused, it becomes the cue point and the
     /// deck waits there. A stored loop loops.
     pub fn call_memory(&mut self, which: MemoryCall) -> Option<usize> {
-        // From a jump still waiting for its beat, so presses add up.
-        let from = self.pending.map_or(self.pos, |p| p.to);
+        // From a jump still waiting for its beat, so presses add up. Failing
+        // that, while looping, the loop's own start rather than wherever the
+        // playhead currently is bouncing around inside it — otherwise, once
+        // played forward even one frame into a stored loop, that loop's own
+        // memory would itself count as "before" (for Left) the current
+        // position, landing back on it instead of walking past it to the
+        // one before, taking a second press to actually get there.
+        let from = self.pending.map_or_else(|| if self.looping { self.loop_in.unwrap_or(self.pos) } else { self.pos }, |p| p.to);
         let i = match which {
             // Strictly before: excludes one already sat on (within a
             // frame), so a repeat press steps to the next one back
@@ -2617,6 +2623,39 @@ mod tests {
         assert_eq!(d.memories.len(), 1);
 
         assert_eq!(d.call_memory(MemoryCall::Left), Some(1), "finds A directly, doesn't skip past it");
+        assert_eq!(d.pos, 0.0);
+    }
+
+    #[test]
+    fn j_skips_straight_past_the_loop_its_currently_playing_to_the_memory_before_it() {
+        let mut d = deck();
+        d.store_memory(); // memory 1: a cue at 0 s
+        d.step_paused(75.0);
+        d.cue_down(true); // cue now at 1 s
+        d.play_pause();
+        run(&mut d, SR as usize); // 2 s
+        d.loop_in();
+        run(&mut d, 24_000);
+        d.loop_out(); // engages the loop, snapping back to its own start
+        d.store_memory(); // memory 2: the stored loop, at 2 s
+        d.reloop_exit(); // leaves it, carrying on forward from here
+        run(&mut d, 50_000); // well past both memories now, same as `memory_cues_store_call_and_delete`'s own setup
+
+        // Re-enters memory 2's own loop — the "play the loop at the 2nd
+        // memory" step — and lets it actually run forward inside it for
+        // a while, same as looping there for real, not just the instant
+        // of landing (which is what used to make the loop's own memory
+        // "count" as before the current position, shadowing the one
+        // before it).
+        assert_eq!(d.call_memory(MemoryCall::Left), Some(2));
+        assert!(d.looping);
+        run(&mut d, 10_000);
+
+        assert_eq!(
+            d.call_memory(MemoryCall::Left),
+            Some(1),
+            "skips straight to the memory before, rather than back to the one it's currently looping on"
+        );
         assert_eq!(d.pos, 0.0);
     }
 

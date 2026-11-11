@@ -119,11 +119,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     draw_info(f, info, app, s);
     draw_footer(f, footer, app, s);
 
-    // `Tab`'s four-tab browse dialog (`draw_folder_picker`/`draw_browser`/
-    // `draw_crate_browser`/`draw_crates_tab`/`draw_music_folders_tab`) is
-    // the canonical, one and only place in odj-player to browse for a
-    // file to load or to activate a crate — see `BrowseTab`'s own doc
-    // comment in `app.rs`.
+    // `Tab`'s five-tab browse dialog (`draw_folder_picker`/`draw_browser`/
+    // `draw_crate_browser`/`draw_recent_browser`/`draw_crates_tab`/
+    // `draw_music_folders_tab`) is the canonical, one and only place in
+    // odj-player to browse for a file to load or to activate a crate —
+    // see `BrowseTab`'s own doc comment in `app.rs`.
     if let Some(i) = app.picking_folder() {
         draw_folder_picker(f, app, i);
     } else if app.browser.open {
@@ -132,6 +132,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_settings(f, app);
     } else if app.crate_browser.is_open() {
         draw_crate_browser(f, app);
+    } else if app.recent_browser.is_open() {
+        draw_recent_browser(f, app);
     } else if app.crates_tab_open() {
         draw_crates_tab(f, app);
     } else if app.music_folders_open() {
@@ -736,23 +738,26 @@ fn draw_settings(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The next tab `Tab` would cycle to, in `Crate contents → Folder →
-/// Crates → Music folders → Crate contents` order.
+/// The next tab `Tab` would cycle to, in `Recent → Crate contents →
+/// Folder → Crates → Music folders → Recent` order.
 fn next_browse_tab_label(current: &str) -> &'static str {
     match current {
+        "Recent" => "Crate contents",
         "Crate contents" => "Folder",
         "Folder" => "Crates",
         "Crates" => "Music folders",
-        _ => "Crate contents",
+        _ => "Recent",
     }
 }
 
-/// The four browse tabs, split left (Crate contents/Folder) and right
-/// (Crates/Music folders) — same content-left/globals-right convention
-/// every footer in this codebase already uses; `current` is styled
-/// black-on-amber among the rest (see `odj_core::tui::tab_span`).
+/// The five browse tabs, split left (Recent/Crate contents/Folder) and
+/// right (Crates/Music folders) — same content-left/globals-right
+/// convention every footer in this codebase already uses; `current` is
+/// styled black-on-amber among the rest (see `odj_core::tui::tab_span`).
 fn browse_tabs_row(current: &str) -> (Line<'static>, Line<'static>) {
     let left = Line::from(vec![
+        tab_span("Recent", current == "Recent"),
+        Span::raw("  "),
         tab_span("Crate contents", current == "Crate contents"),
         Span::raw("  "),
         tab_span("Folder", current == "Folder"),
@@ -896,6 +901,31 @@ fn draw_crate_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// `Settings.recent_tracks`, newest first: title/artist, same fuzzy
+/// filter and row styling as the Crate contents tab, but no availability
+/// marker or crate tags — a recent track isn't tied to one.
+fn draw_recent_browser(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 70, 70);
+    let list_area = draw_tabbed_list(f, area, "Recent", "Recent", "Enter/→ load", app.recent_browser.query());
+    let width = list_area.width.saturating_sub(2); // the highlight symbol's own width
+    let visible: Vec<_> = app.recent_browser.visible().collect();
+    let items: Vec<ListItem> = if visible.is_empty() {
+        let msg = if app.recent_browser.is_empty() { "(nothing opened yet)" } else { "(no matches)" };
+        vec![ListItem::new(msg).fg(DIM)]
+    } else {
+        visible
+            .into_iter()
+            .map(|(t, matched)| {
+                let prefix = crate::app::recent_search_text(t);
+                ListItem::new(tagged_row_line(&prefix, matched, "", Color::Reset, &[], width))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(app.recent_browser.selected()));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
 /// Every crate that exists, `Space` toggling its membership in the
 /// shared active set. The canonical way to activate a crate — odj-player
 /// has no other screen that writes to `Settings.active_crates` (odj-
@@ -954,7 +984,7 @@ pub const HELP: &[Page] = &[
             ("R", "Reverse"),
             ("F", "Sync to the master deck"),
             ("B / N", "Previous / next track in folder"),
-            ("Tab", "Browse: crate contents, folders, active crates, music folders"),
+            ("Tab", "Browse: recent, crate contents, folders, active crates, music folders"),
             ("`", "Settings: auto-cue"),
         ],
     ),

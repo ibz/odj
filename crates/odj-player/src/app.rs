@@ -12,7 +12,7 @@ use odj_core::crates::{Availability, AvailabilityChecker, Crate};
 use odj_core::library::{Browser, fuzzy_match, siblings};
 use odj_core::library_index::{IndexRefresher, LibraryIndex, RefreshProgress};
 use odj_core::link;
-use odj_core::memory::{LibraryTrack, Memory, TrackMemory};
+use odj_core::memory::{LibraryTrack, Memory, RecentTrack, TrackMemory};
 use odj_core::track::Track;
 use odj_core::tui::Help;
 
@@ -89,20 +89,22 @@ pub enum AudioRoute {
     Direct(String),
 }
 
-/// Which of the four browse tabs is current — opened by `Tab`, either
-/// from the deck or at startup; `Tab`/`Shift+Tab` cycle through all four
+/// Which of the five browse tabs is current — opened by `Tab`, either
+/// from the deck or at startup; `Tab`/`Shift+Tab` cycle through all five
 /// (in this order) while any is open. Not saved to disk; `App::new` just
 /// picks `CrateContents` when there's already an active crate to show,
 /// else `Folder`.
 ///
 /// This one dialog is the canonical way to do both of its two jobs —
 /// there's no other path in odj-player to browse for a file to load
-/// (`CrateContents`/`Folder`) or to activate a crate (`Crates`). Mirrored
-/// in odj-sampler's own `Tab`-opened kit browser, which merges kits the
-/// same way `CrateContents` merges tracks and shares this same
+/// (`CrateContents`/`Folder`/`Recent`) or to activate a crate (`Crates`).
+/// Mirrored in odj-sampler's own `Tab`-opened kit browser, which merges
+/// kits the same way `CrateContents` merges tracks and shares this same
 /// `Settings.active_crates` toggle on its own "Crates" tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowseTab {
+    /// `self.recent_browser`: `Settings.recent_tracks`, newest first.
+    Recent,
     /// `self.crate_browser`: every active crate's tracks, merged and
     /// tagged by which crate(s) each came from. Shown as "Crate contents".
     CrateContents,
@@ -118,16 +120,18 @@ enum BrowseTab {
 impl BrowseTab {
     fn next(self) -> Self {
         match self {
+            BrowseTab::Recent => BrowseTab::CrateContents,
             BrowseTab::CrateContents => BrowseTab::Folder,
             BrowseTab::Folder => BrowseTab::Crates,
             BrowseTab::Crates => BrowseTab::MusicFolders,
-            BrowseTab::MusicFolders => BrowseTab::CrateContents,
+            BrowseTab::MusicFolders => BrowseTab::Recent,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            BrowseTab::CrateContents => BrowseTab::MusicFolders,
+            BrowseTab::Recent => BrowseTab::MusicFolders,
+            BrowseTab::CrateContents => BrowseTab::Recent,
             BrowseTab::Folder => BrowseTab::CrateContents,
             BrowseTab::Crates => BrowseTab::Folder,
             BrowseTab::MusicFolders => BrowseTab::Crates,
@@ -140,9 +144,19 @@ impl BrowseTab {
 /// own prefix so a match's highlighted positions land on the right
 /// characters.
 pub(crate) fn track_search_text(t: &LibraryTrack) -> String {
-    match &t.artist {
-        Some(a) => format!("{} — {a}", t.title),
-        None => t.title.clone(),
+    title_artist_search_text(&t.title, &t.artist)
+}
+
+/// Same as `track_search_text`, for a `RecentTrack` — same shape, no
+/// shared type between the two to hang one function off of.
+pub(crate) fn recent_search_text(t: &RecentTrack) -> String {
+    title_artist_search_text(&t.title, &t.artist)
+}
+
+fn title_artist_search_text(title: &str, artist: &Option<String>) -> String {
+    match artist {
+        Some(a) => format!("{title} — {a}"),
+        None => title.to_string(),
     }
 }
 
@@ -322,6 +336,92 @@ impl CrateBrowser {
     }
 }
 
+/// `Settings.recent_tracks`, newest first, with the same typed filter as
+/// the other browse tabs — see `CrateBrowser`, which this mirrors in
+/// everything but tags/availability (recent tracks aren't tied to a
+/// crate, so there's nothing to tag, and no cheap way to tell "missing"
+/// from "moved" without decoding).
+#[derive(Default)]
+pub struct RecentBrowser {
+    open: bool,
+    selected: usize,
+    tracks: Vec<RecentTrack>,
+    query: String,
+    visible: Vec<(usize, Vec<usize>)>,
+}
+
+impl RecentBrowser {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn visible(&self) -> impl Iterator<Item = (&RecentTrack, &[usize])> {
+        self.visible.iter().map(move |(i, pos)| (&self.tracks[*i], pos.as_slice()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty()
+    }
+
+    pub fn selected_track(&self) -> Option<&RecentTrack> {
+        self.visible.get(self.selected).map(|&(i, _)| &self.tracks[i])
+    }
+
+    /// Replaces the roster (landing on the tab) and re-applies whatever
+    /// filter is already typed. `tracks` is taken newest-first — the
+    /// caller reverses `Settings.recent_tracks`, which is kept oldest-first.
+    fn set_tracks(&mut self, tracks: Vec<RecentTrack>) {
+        self.tracks = tracks;
+        self.filter();
+    }
+
+    /// Re-ranks `visible` by `query` against each track's title/artist —
+    /// same fuzzy-match-as-you-type behavior as `CrateBrowser::filter`.
+    fn filter(&mut self) {
+        let mut matches: Vec<(i32, usize, Vec<usize>)> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| fuzzy_match(&self.query, &recent_search_text(t)).map(|(score, pos)| (score, i, pos)))
+            .collect();
+        matches.sort_by_key(|m| std::cmp::Reverse(m.0));
+        self.visible = matches.into_iter().map(|(_, i, pos)| (i, pos)).collect();
+        self.selected = 0;
+    }
+
+    fn type_char(&mut self, c: char) {
+        self.query.push(c);
+        self.filter();
+    }
+
+    /// Deletes the last typed character; false when there was nothing to delete.
+    fn backspace(&mut self) -> bool {
+        let deleted = self.query.pop().is_some();
+        if deleted {
+            self.filter();
+        }
+        deleted
+    }
+
+    /// Clears the filter; false when there was none.
+    fn clear_query(&mut self) -> bool {
+        if self.query.is_empty() {
+            return false;
+        }
+        self.query.clear();
+        self.filter();
+        true
+    }
+}
+
 /// The Crates tab: every crate that exists (see
 /// `odj_core::crates::list_crates`), `Space` toggling its membership in
 /// the shared `Settings.active_crates`.
@@ -353,6 +453,7 @@ pub struct App {
     pub help: Help,
     pub settings_screen: SettingsScreen,
     pub crate_browser: CrateBrowser,
+    pub recent_browser: RecentBrowser,
     pub crates_tab: CratesTab,
     crates_tab_open: bool,
     /// The Music folders tab's own selection — moved here from Settings.
@@ -414,6 +515,7 @@ impl App {
             help: Help::default(),
             settings_screen: SettingsScreen::default(),
             crate_browser: CrateBrowser::default(),
+            recent_browser: RecentBrowser::default(),
             crates_tab: CratesTab::default(),
             crates_tab_open: false,
             music_folders_selected: 0,
@@ -633,6 +735,49 @@ impl App {
         true
     }
 
+    // --- Recent --------------------------------------------------------------
+
+    /// Landing on the Recent tab: `Settings.recent_tracks` is kept
+    /// oldest-first (see `Settings::remember_recent`); reversed here so
+    /// it's shown newest-first.
+    fn open_recent_browser(&mut self) {
+        let tracks: Vec<RecentTrack> = self.memory.settings.recent_tracks.iter().rev().cloned().collect();
+        self.recent_browser.query.clear();
+        self.recent_browser.set_tracks(tracks);
+        self.recent_browser.open = true;
+    }
+
+    fn close_recent_browser(&mut self) {
+        self.recent_browser.open = false;
+    }
+
+    /// Typed characters filter the list live, same as the Crate contents tab.
+    fn recent_browser_key(&mut self, key: &KeyEvent) -> bool {
+        if !self.recent_browser.open {
+            return false;
+        }
+        let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let len = self.recent_browser.visible().count();
+        match key.code {
+            KeyCode::Char(c) if typing => self.recent_browser.type_char(c),
+            KeyCode::Up => self.recent_browser.selected = self.recent_browser.selected.saturating_sub(1),
+            KeyCode::Down if len > 0 => self.recent_browser.selected = (self.recent_browser.selected + 1).min(len - 1),
+            KeyCode::Backspace => {
+                self.recent_browser.backspace();
+            }
+            KeyCode::Enter | KeyCode::Right => {
+                if let Some(track) = self.recent_browser.selected_track() {
+                    let path = track.path.clone();
+                    self.close_recent_browser();
+                    self.load(path);
+                }
+            }
+            KeyCode::Esc if !self.recent_browser.clear_query() => self.close_recent_browser(),
+            _ => {}
+        }
+        true
+    }
+
     /// `Ctrl+S` in the crate browser: with at least one row currently
     /// `Missing`, starts a search of every configured music folder (see
     /// `CrateBrowser::start_search`) — a no-op (with a status explaining
@@ -692,6 +837,7 @@ impl App {
         match self.browse_tab {
             BrowseTab::CrateContents => self.open_crate_browser(),
             BrowseTab::Folder => self.open_folder_tab(),
+            BrowseTab::Recent => self.open_recent_browser(),
             BrowseTab::Crates => self.open_crates_tab(),
             BrowseTab::MusicFolders => self.open_music_folders_tab(),
         }
@@ -719,6 +865,7 @@ impl App {
         self.browser.open = false;
         self.picking_folder = None;
         self.close_crate_browser();
+        self.close_recent_browser();
         self.crates_tab_open = false;
         self.music_folders_open = false;
         self.browse_tab = if shift { self.browse_tab.prev() } else { self.browse_tab.next() };
@@ -908,6 +1055,10 @@ impl App {
                 // `remember()` diffs against it to merge rather than
                 // overwrite; see `Memory::save_track_merged`.
                 self.memory_baseline = mem.clone();
+                self.memory.settings.remember_recent(track.path.clone(), track.title.clone(), track.artist.clone());
+                if let Err(e) = self.memory.save_settings() {
+                    self.set_status(format!("Could not save recent tracks: {e}"));
+                }
                 let msg = match track.bpm() {
                     Some(bpm) => format!("Loaded {} ({bpm:.1} BPM)", track.title),
                     None => format!("Loaded {} (no BPM found)", track.title),
@@ -1090,6 +1241,7 @@ impl App {
             let plain_browser = self.browser.open && !self.picking_music_dir;
             let browsing = plain_browser
                 || self.crate_browser.is_open()
+                || self.recent_browser.is_open()
                 || self.picking_folder.is_some()
                 || self.crates_tab_open
                 || self.music_folders_open;
@@ -1103,6 +1255,8 @@ impl App {
                 self.browser_key(&key);
             } else if self.crate_browser.is_open() {
                 self.crate_browser_key(&key);
+            } else if self.recent_browser.is_open() {
+                self.recent_browser_key(&key);
             } else if self.crates_tab_open {
                 self.crates_tab_key(code);
             } else if self.music_folders_open {
@@ -2563,6 +2717,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Waits for a load started with `app.load(...)` to finish (success or
+    /// failure, same as the deadline loops elsewhere in this module).
+    fn wait_for_load(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.loading().is_some() && std::time::Instant::now() < deadline {
+            app.tick();
+        }
+    }
+
+    #[test]
+    fn a_loaded_track_lands_at_the_top_of_recent() {
+        let dir = std::env::temp_dir().join(format!("odj-recent-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let (a, b) = (dir.join("a.wav"), dir.join("b.wav"));
+        odj_core::wav::write_wav(&a, &[0.1, -0.1], 2, 44_100).unwrap();
+        odj_core::wav::write_wav(&b, &[0.2, -0.2], 2, 44_100).unwrap();
+
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+
+        app.load(a.clone());
+        wait_for_load(&mut app);
+        app.load(b.clone());
+        wait_for_load(&mut app);
+
+        app.open_recent_browser();
+        let rows: Vec<PathBuf> = app.recent_browser.visible().map(|(t, _)| t.path.clone()).collect();
+        assert_eq!(rows, [b.canonicalize().unwrap(), a.canonicalize().unwrap()], "newest first");
+
+        // Reopening the older one moves it back to the top rather than
+        // leaving a stale duplicate behind.
+        app.close_recent_browser();
+        app.load(a.clone());
+        wait_for_load(&mut app);
+        app.open_recent_browser();
+        let rows: Vec<PathBuf> = app.recent_browser.visible().map(|(t, _)| t.path.clone()).collect();
+        assert_eq!(rows, [a.canonicalize().unwrap(), b.canonicalize().unwrap()]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn enter_in_the_recent_tab_loads_the_selected_track() {
+        let dir = std::env::temp_dir().join(format!("odj-recent-enter-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let path = dir.join("song.wav");
+        odj_core::wav::write_wav(&path, &[0.1, -0.1], 2, 44_100).unwrap();
+        let path = path.canonicalize().unwrap();
+        let mut settings = odj_core::memory::load_settings();
+        settings.recent_tracks = vec![RecentTrack { path: path.clone(), title: "Song".into(), artist: None }];
+        odj_core::memory::save_settings(&settings).unwrap();
+
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+        app.open_recent_browser();
+        assert_eq!(app.recent_browser.visible().count(), 1);
+
+        press(&mut app, KeyCode::Enter, false);
+        assert!(!app.recent_browser.is_open(), "closes the tab, same as the crate browser's own Enter");
+        wait_for_load(&mut app);
+        assert_eq!(app.deck().track.as_ref().map(|t| t.path.clone()), Some(path));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A track moved to a different subfolder of an already-configured
     /// music dir — too far for `resolve` alone, which only tries each
     /// music dir's own root — shows up Missing, then `S` finds and heals
@@ -2667,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_through_all_four_browse_tabs() {
+    fn tab_cycles_through_all_five_browse_tabs() {
         let mut app = app();
         // The tests share a settings file; a single saved folder and a
         // single active crate both skip their own "which one" pick step
@@ -2695,13 +2924,17 @@ mod tests {
         assert!(!app.crates_tab_open());
         assert!(app.music_folders_open());
 
-        press(&mut app, KeyCode::Tab, false); // -> back to Crate contents
+        press(&mut app, KeyCode::Tab, false); // -> Recent
         assert!(!app.music_folders_open());
+        assert!(app.recent_browser.is_open());
+
+        press(&mut app, KeyCode::Tab, false); // -> back to Crate contents
+        assert!(!app.recent_browser.is_open());
         assert!(app.crate_browser.is_open());
 
-        press(&mut app, KeyCode::Tab, true); // Shift+Tab: backwards, to Music folders
+        press(&mut app, KeyCode::Tab, true); // Shift+Tab: backwards, to Recent
         assert!(!app.crate_browser.is_open());
-        assert!(app.music_folders_open());
+        assert!(app.recent_browser.is_open());
 
         std::fs::remove_dir_all(&crate_dir).unwrap();
     }
@@ -2723,9 +2956,9 @@ mod tests {
         assert_eq!(app.browser.dir, dirs[1]);
     }
 
-    /// Every browse tab shows the same Crate contents/Folder/Crates/Music folders
-    /// row and a highlighted `Tab` hint badge to the next one — the same
-    /// convention as the help overlay's own tabs
+    /// Every browse tab shows the same Crate contents/Folder/Recent/Crates/
+    /// Music folders row and a highlighted `Tab` hint badge to the next
+    /// one — the same convention as the help overlay's own tabs
     /// (`odj_core::tui::tab_span`/`draw_help`).
     #[test]
     fn every_browse_tab_shows_the_tab_row_and_a_highlighted_tab_hint() {
@@ -2743,7 +2976,14 @@ mod tests {
         app.memory.settings.music_dirs = vec![PathBuf::from("/a"), PathBuf::from("/b")];
         app.open_folder_tab();
         let text = screen(&app);
-        assert!(text.contains(" Crate contents ") && text.contains(" Folder ") && text.contains(" Crates ") && text.contains(" Music folders "), "{text}");
+        assert!(
+            text.contains(" Crate contents ")
+                && text.contains(" Folder ")
+                && text.contains(" Recent ")
+                && text.contains(" Crates ")
+                && text.contains(" Music folders "),
+            "{text}"
+        );
         assert!(text.contains(" Esc  Close "), "{text}");
         assert!(text.contains(" Tab  Crates "), "highlighted like the help overlay's Tab hint: {text}");
 
@@ -2829,6 +3069,7 @@ mod tests {
         // Crate contents genuinely empty, not silently suppressed a second time.
         press(&mut app, KeyCode::Tab, false); // -> Crates
         press(&mut app, KeyCode::Tab, false); // -> Music folders
+        press(&mut app, KeyCode::Tab, false); // -> Recent
         press(&mut app, KeyCode::Tab, false); // -> Crate contents
         assert!(!app.browser.open, "no longer on the folder screen");
         assert!(app.crate_browser.is_open(), "genuinely showing the Crate contents tab");

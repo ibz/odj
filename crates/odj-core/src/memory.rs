@@ -20,6 +20,8 @@ use crate::track::Track;
 const VERSION: u32 = 1;
 /// Most memory points kept per track.
 pub const MAX_MEMORIES: usize = 100;
+/// Most recently-opened tracks kept in `Settings.recent_tracks`.
+pub const MAX_RECENT: usize = 50;
 
 /// A cue point, or a loop when it has an out point. Positions are frames at the
 /// track's sample rate.
@@ -133,6 +135,15 @@ pub struct LibraryTrack {
     pub youtube_url: Option<String>,
 }
 
+/// A track opened recently, enough to show it and reopen it without
+/// decoding again; see `Settings.recent_tracks`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecentTrack {
+    pub path: PathBuf,
+    pub title: String,
+    pub artist: Option<String>,
+}
+
 /// Settings shared by odj-player, odj-sampler and odj-mixer, one file
 /// between them — each app only ever touches the field(s) it owns,
 /// always through a full read-modify-write of this whole struct (see
@@ -205,6 +216,23 @@ pub struct Settings {
     /// "active crates" tab is visible in the other right away.
     #[serde(default)]
     pub active_crates: Vec<PathBuf>,
+    /// Tracks opened recently, oldest first — capped at [`MAX_RECENT`],
+    /// the oldest dropped once it's exceeded. Shown newest-first by the
+    /// Recent tab; odj-player.
+    #[serde(default)]
+    pub recent_tracks: Vec<RecentTrack>,
+}
+
+impl Settings {
+    /// Records a track just opened: any existing entry for the same path
+    /// is dropped first, so reopening one moves it to the top instead of
+    /// leaving a stale duplicate behind.
+    pub fn remember_recent(&mut self, path: PathBuf, title: String, artist: Option<String>) {
+        self.recent_tracks.retain(|t| t.path != path);
+        self.recent_tracks.push(RecentTrack { path, title, artist });
+        let excess = self.recent_tracks.len().saturating_sub(MAX_RECENT);
+        self.recent_tracks.drain(..excess);
+    }
 }
 
 impl Default for Settings {
@@ -222,6 +250,7 @@ impl Default for Settings {
             mixer_active_inputs: HashSet::new(),
             mixer_output: None,
             active_crates: Vec::new(),
+            recent_tracks: Vec::new(),
         }
     }
 }
@@ -942,6 +971,27 @@ mod tests {
     fn forget_track_is_a_no_op_without_an_existing_entry() {
         let m = memory("forget-track-missing");
         assert!(m.forget_track("ab53").is_ok());
+    }
+
+    #[test]
+    fn remember_recent_reopening_moves_it_to_the_top_instead_of_duplicating() {
+        let mut s = Settings::default();
+        s.remember_recent(PathBuf::from("/a.mp3"), "A".into(), None);
+        s.remember_recent(PathBuf::from("/b.mp3"), "B".into(), Some("Artist".into()));
+        s.remember_recent(PathBuf::from("/a.mp3"), "A".into(), None);
+        let paths: Vec<&Path> = s.recent_tracks.iter().map(|t| t.path.as_path()).collect();
+        assert_eq!(paths, [Path::new("/b.mp3"), Path::new("/a.mp3")], "b, then a moved back to the top on reopening");
+    }
+
+    #[test]
+    fn remember_recent_drops_the_oldest_past_the_cap() {
+        let mut s = Settings::default();
+        for i in 0..MAX_RECENT + 5 {
+            s.remember_recent(PathBuf::from(format!("/{i}.mp3")), format!("T{i}"), None);
+        }
+        assert_eq!(s.recent_tracks.len(), MAX_RECENT);
+        assert_eq!(s.recent_tracks[0].path, PathBuf::from("/5.mp3"), "the first 5 fell off the oldest end");
+        assert_eq!(s.recent_tracks.last().unwrap().path, PathBuf::from(format!("/{}.mp3", MAX_RECENT + 4)));
     }
 
     #[test]

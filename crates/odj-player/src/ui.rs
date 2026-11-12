@@ -1010,7 +1010,7 @@ pub const HELP: &[Page] = &[
             ("O while looping", "Loop out adjust: , / . move the out point (Shift: ×10), O to finish"),
             ("R while looping", "Play the loop backwards, R again for forwards"),
             ("L", "Auto loop of the loop size / exit the loop"),
-            ("Shift+P", "Jump to the auto loop (last one set by I/O/L), even after visiting another memory"),
+            ("Shift+P", "Jump to the start of the loop you're in — or, not looping, back to the auto loop (I/O/L), even after visiting another memory"),
             ("Shift+L", "Promote the auto loop to a real memory"),
             ("[ / ]", "Halve / double the roll or loop, else the next beat loop's size"),
             ("Shift+[ / ]", "Same, but from the in point: extends or shrinks the loop to the left"),

@@ -1030,13 +1030,23 @@ impl Deck {
         }
     }
 
-    /// Jumps back into the auto loop (see `auto_loop`), even if a
-    /// memory or another loop has been visited since, which
-    /// `reloop_exit`/`P` can't do (it only reuses whichever loop
-    /// `loop_in`/`loop_out` currently hold). `false` if there's been no
-    /// auto loop since the track loaded.
+    /// Restarts whatever loop is current: while looping, jumps back to
+    /// its own start (memory, hot cue or auto loop alike — whichever
+    /// `loop_in`/`loop_out` currently hold, same as `reloop_exit`/`P`'s
+    /// own re-enter, but without exiting first). Not looping, falls back
+    /// to the auto loop (see `auto_loop`), even if a memory or another
+    /// loop has been visited since — which a memory has no need for
+    /// (`J`/`K`/its hot cue gets you back), but the auto loop otherwise
+    /// has no name to call it back by. `false` if there's nothing to
+    /// jump to either way.
     pub fn reloop_auto(&mut self) -> bool {
-        let Some((start, end)) = self.auto_loop else { return false };
+        let (start, end) = if self.looping {
+            let (Some(start), Some(end)) = (self.loop_in, self.loop_out) else { return false };
+            (start, end)
+        } else {
+            let Some(pair) = self.auto_loop else { return false };
+            pair
+        };
         if self.playing {
             self.jump_in_phase(start, Some(end), None);
         } else {
@@ -2876,9 +2886,40 @@ mod tests {
         d.memories.push(Cue { pos: 96_000.0, loop_out: Some(120_000.0) });
         d.call_memory(MemoryCall::Right); // visit it — loop_in/loop_out now point there
         assert_ne!((d.loop_in, d.loop_out), (Some(0.0), Some(24_000.0)), "reloop_exit's dormant loop moved on");
+        // Leave the visited memory's loop too — not currently looping on
+        // anything now, which is what lets `reloop_auto` fall all the way
+        // back to the auto loop; see `reloop_auto_restarts_whichever_loop_is_current`
+        // for what it does instead while still inside that detour.
+        d.reloop_exit();
 
         assert!(d.reloop_auto());
         assert_eq!((d.loop_in, d.loop_out), (Some(0.0), Some(24_000.0)), "reloop_auto still finds the original");
+    }
+
+    #[test]
+    fn reloop_auto_restarts_whichever_loop_is_current() {
+        let mut d = deck();
+        d.play_pause();
+        d.loop_in(); // 0 s
+        run(&mut d, 24_000);
+        d.loop_out(); // 0.5 s — the auto loop
+
+        run(&mut d, 10_000); // play forward inside it
+        assert!(d.reloop_auto());
+        assert_eq!(d.pos, 0.0, "back to the auto loop's own start");
+        assert!(d.looping);
+
+        // A memory loop, jumped into and played forward, restarts the
+        // same way — the same key for both, unlike `reloop_exit`/`P`,
+        // which would just exit it.
+        d.memories.push(Cue { pos: 96_000.0, loop_out: Some(120_000.0) });
+        d.call_memory(MemoryCall::Right);
+        assert!(d.looping);
+        run(&mut d, 10_000);
+
+        assert!(d.reloop_auto());
+        assert_eq!(d.pos, 96_000.0, "back to the memory loop's own start, same shortcut as the auto loop");
+        assert!(d.looping, "still looping, not exited");
     }
 
     #[test]

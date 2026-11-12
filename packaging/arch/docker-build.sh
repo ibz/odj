@@ -8,7 +8,15 @@ set -euo pipefail
 # rubberband/alsa-lib/libpipewire/yt-dlp/tmux aren't needed to *build* odj,
 # but makepkg checks runtime `depends` are satisfied before packaging, so
 # they still need to be present in this container.
-pacman -Sy --noconfirm --needed base-devel git rust clang rubberband alsa-lib libpipewire yt-dlp tmux >/dev/null
+#
+# -Syu, not -Sy: Arch doesn't support partial upgrades, and the
+# archlinux:base-devel image is a snapshot of whatever the repos looked
+# like when it was last pushed. A bare -Sy refreshes the package lists to
+# today's repos without upgrading the already-installed base packages,
+# so a new install can end up wanting a glibc/gcc-libs newer than what's
+# on disk — pacman refuses with "could not satisfy dependencies" rather
+# than risk it. -u upgrades the base image's own packages first.
+pacman -Syu --noconfirm --needed base-devel git rust clang rubberband alsa-lib libpipewire yt-dlp tmux >/dev/null
 
 useradd -m builder
 cp -r /src /home/builder/odj-src

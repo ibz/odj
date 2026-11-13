@@ -262,7 +262,12 @@ notes are kept in the same shared settings file.
 
 Creates and manages crates (see "Crates" above). Starts on the list of
 crates that already exist — `↑`/`↓` to pick one, `Enter` opens it, `N`
-names and creates a new one.
+names and creates a new one, `X`/`Delete` deletes it — press again to
+confirm, since unlike removing a single track's metadata, this deletes
+the whole directory: track memory, kits, everything (never the audio
+files its tracks pointed at, which live elsewhere), and there's no
+trash to recover it from. Also drops it from odj-player's/odj-sampler's
+active-crates setting if it was there.
 
 Inside a crate: `↑`/`↓` selects a track, `X`/`Delete` removes it — just
 its metadata, press again to confirm; the audio file is never touched,

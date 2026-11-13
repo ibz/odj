@@ -49,11 +49,23 @@ impl Focus {
 pub struct CrateList {
     pub rows: Vec<Crate>,
     pub selected: usize,
+    /// Armed by a first `X`/Delete on this crate's directory; a second
+    /// one within `DELETE_CONFIRM` actually deletes it — same two-press
+    /// pattern as `CrateDetail`'s own track delete, but for something far
+    /// less recoverable (the whole crate, kits included), hence requiring
+    /// it here too rather than going straight through.
+    pending_delete: Option<(PathBuf, Instant)>,
 }
 
 impl CrateList {
     fn load() -> Self {
-        Self { rows: crates::list_crates(), selected: 0 }
+        Self { rows: crates::list_crates(), selected: 0, pending_delete: None }
+    }
+
+    /// The crate dir a second `X`/Delete would actually delete right now,
+    /// if any — for the UI to show "press again" only where it applies.
+    pub fn armed(&self) -> Option<&Path> {
+        self.pending_delete.as_ref().filter(|(_, at)| at.elapsed() < DELETE_CONFIRM).map(|(dir, _)| dir.as_path())
     }
 }
 
@@ -592,6 +604,11 @@ impl App {
     // --- Crate list ----------------------------------------------------------
 
     fn crate_list_key(&mut self, key: KeyEvent) {
+        if !matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
+            && let Screen::Crates(list) = &mut self.screen
+        {
+            list.pending_delete = None;
+        }
         let Screen::Crates(list) = &self.screen else { return };
         let count = list.rows.len();
         match key.code {
@@ -609,7 +626,40 @@ impl App {
                 self.screen = Screen::Crate(CrateDetail::load(dir));
             }
             KeyCode::Char('n') => self.screen = Screen::NamingCrate(String::new()),
+            KeyCode::Char('x') | KeyCode::Delete if count > 0 => self.delete_selected_crate(),
             _ => {}
+        }
+    }
+
+    /// `X`/Delete on the selected crate: first press arms it, a second
+    /// one on the *same* crate within `DELETE_CONFIRM` deletes the whole
+    /// directory (`Crate::delete`) — track memory, kits, everything,
+    /// though never the audio files its tracks pointed at, which live
+    /// elsewhere. Also drops it from `Settings.active_crates` if it was
+    /// there, so odj-player/odj-sampler don't keep listing a now-missing
+    /// crate as active.
+    fn delete_selected_crate(&mut self) {
+        let Screen::Crates(list) = &mut self.screen else { return };
+        let Some(c) = list.rows.get(list.selected) else { return };
+        let (dir, name) = (c.dir.clone(), c.name.clone());
+        let armed = list.pending_delete.as_ref().is_some_and(|(pd, at)| *pd == dir && at.elapsed() < DELETE_CONFIRM);
+        if !armed {
+            list.pending_delete = Some((dir, Instant::now()));
+            self.set_status(format!("Press X/Delete again to permanently delete \"{name}\" and everything in it"));
+            return;
+        }
+        list.pending_delete = None;
+        match Crate::delete(&dir) {
+            Ok(()) => {
+                let mut settings = memory::load_settings();
+                if let Some(i) = settings.active_crates.iter().position(|d| *d == dir) {
+                    settings.active_crates.remove(i);
+                    let _ = memory::save_settings(&settings);
+                }
+                self.screen = Screen::Crates(CrateList::load());
+                self.set_status(format!("Deleted \"{name}\""));
+            }
+            Err(e) => self.set_status(format!("Could not delete \"{name}\": {e}")),
         }
     }
 
@@ -1270,6 +1320,68 @@ mod tests {
             assert!(c.tracks().is_empty(), "second press removes it");
 
             assert!(file.is_file(), "the audio file itself was never touched");
+        });
+    }
+
+    #[test]
+    fn deleting_a_crate_needs_two_presses_and_removes_it_from_the_list() {
+        with_temp_dirs("delete-crate", |dir| {
+            let mut app = app(Arc::new(FakeFetcher::new(Vec::new())), dir.join("downloads"));
+            let crate_dir = create_crate(&mut app, "Doomed Set");
+            press(&mut app, KeyCode::Esc); // back to the list
+
+            press(&mut app, KeyCode::Char('x'));
+            let Screen::Crates(list) = &app.screen else { unreachable!() };
+            assert_eq!(list.rows.len(), 1, "first press only arms it");
+            assert!(list.armed() == Some(crate_dir.as_path()));
+            assert!(app.status().is_some_and(|s| s.contains("Doomed Set")), "{:?}", app.status());
+
+            press(&mut app, KeyCode::Char('x'));
+            let Screen::Crates(list) = &app.screen else { unreachable!() };
+            assert!(list.rows.is_empty(), "second press deletes it");
+            assert!(!crate_dir.exists(), "the whole directory is gone");
+            assert!(crates::list_crates().is_empty());
+        });
+    }
+
+    #[test]
+    fn moving_the_selection_disarms_a_pending_crate_delete() {
+        with_temp_dirs("delete-crate-disarm", |dir| {
+            let mut app = app(Arc::new(FakeFetcher::new(Vec::new())), dir.join("downloads"));
+            create_crate(&mut app, "Set A");
+            press(&mut app, KeyCode::Esc);
+            create_crate(&mut app, "Set B");
+            press(&mut app, KeyCode::Esc);
+
+            press(&mut app, KeyCode::Char('x')); // arms whichever is selected
+            let Screen::Crates(list) = &app.screen else { unreachable!() };
+            assert!(list.armed().is_some());
+
+            press(&mut app, KeyCode::Up); // moving disarms it, same as the track list
+            let Screen::Crates(list) = &app.screen else { unreachable!() };
+            assert!(list.armed().is_none());
+
+            press(&mut app, KeyCode::Char('x'));
+            let Screen::Crates(list) = &app.screen else { unreachable!() };
+            assert_eq!(list.rows.len(), 2, "still just armed, not deleted — the disarm reset the count");
+        });
+    }
+
+    #[test]
+    fn deleting_an_active_crate_drops_it_from_settings_too() {
+        with_temp_dirs("delete-crate-active", |dir| {
+            let mut app = app(Arc::new(FakeFetcher::new(Vec::new())), dir.join("downloads"));
+            let crate_dir = create_crate(&mut app, "Set");
+            press(&mut app, KeyCode::Esc);
+
+            let mut settings = memory::load_settings();
+            settings.active_crates = vec![crate_dir.clone()];
+            memory::save_settings(&settings).unwrap();
+
+            press(&mut app, KeyCode::Char('x'));
+            press(&mut app, KeyCode::Char('x'));
+
+            assert!(!memory::load_settings().active_crates.contains(&crate_dir), "no dangling reference left behind");
         });
     }
 

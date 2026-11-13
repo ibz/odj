@@ -62,6 +62,19 @@ impl Crate {
         write_json(&Self::manifest_file(&dir), &Manifest { version: MANIFEST_VERSION, name: name.to_string() })?;
         Ok(Self { dir, name: name.to_string() })
     }
+
+    /// Deletes the whole crate directory — its track memory, its kits
+    /// (including any kit `.wav` files), everything. The underlying audio
+    /// files this crate's tracks pointed at are never touched; they live
+    /// elsewhere. Irreversible: there's no trash, this is a plain
+    /// `rm -r`. A no-op if `dir` doesn't exist.
+    pub fn delete(dir: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The one folder every crate lives under — fixed, not user-configurable,
@@ -208,6 +221,23 @@ mod tests {
     #[test]
     fn crates_root_is_fixed_under_the_data_dir() {
         assert_eq!(crates_root(), crate::memory::data_dir().join("crates"));
+    }
+
+    #[test]
+    fn delete_removes_the_whole_crate_directory() {
+        let dir = temp_dir("delete");
+        Crate::create(dir.clone(), "Doomed Set").unwrap();
+        fs::write(Crate::kits_dir(&dir).join("kept.wav"), [0u8; 4]).unwrap();
+        assert!(dir.is_dir());
+
+        Crate::delete(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn delete_is_a_no_op_without_an_existing_directory() {
+        let dir = temp_dir("delete-missing");
+        assert!(Crate::delete(&dir).is_ok());
     }
 
     #[test]

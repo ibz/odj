@@ -58,12 +58,18 @@ fn draw_crates(f: &mut Frame, app: &App) {
     let items: Vec<ListItem> = if list.rows.is_empty() {
         vec![ListItem::new("(no crates yet — press N to create one)").fg(DIM)]
     } else {
-        list.rows.iter().map(|c| ListItem::new(c.name.clone())).collect()
+        list.rows
+            .iter()
+            .map(|c| {
+                let confirm = if list.armed() == Some(c.dir.as_path()) { " — press again to permanently delete" } else { "" };
+                ListItem::new(format!("{}{confirm}", c.name))
+            })
+            .collect()
     };
     let l = List::new(items).block(list_block("Crates")).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected((!list.rows.is_empty()).then_some(list.selected));
     f.render_stateful_widget(l, body, &mut state);
-    draw_footer(f, footer, app, &[("Enter", "open"), ("N", "new crate")]);
+    draw_footer(f, footer, app, &[("Enter", "open"), ("N", "new crate"), ("X/Del", "delete crate")]);
 }
 
 fn draw_naming_crate(f: &mut Frame, app: &App) {

@@ -119,11 +119,11 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     draw_info(f, info, app, s);
     draw_footer(f, footer, app, s);
 
-    // `Tab`'s five-tab browse dialog (`draw_folder_picker`/`draw_browser`/
-    // `draw_crate_browser`/`draw_recent_browser`/`draw_crates_tab`/
-    // `draw_music_folders_tab`) is the canonical, one and only place in
-    // odj-player to browse for a file to load or to activate a crate —
-    // see `BrowseTab`'s own doc comment in `app.rs`.
+    // `Tab`'s six-tab browse dialog (`draw_folder_picker`/`draw_browser`/
+    // `draw_crate_browser`/`draw_recent_browser`/`draw_known_tracks_browser`/
+    // `draw_crates_tab`/`draw_music_folders_tab`) is the canonical, one
+    // and only place in odj-player to browse for a file to load or to
+    // activate a crate — see `BrowseTab`'s own doc comment in `app.rs`.
     if let Some(i) = app.picking_folder() {
         draw_folder_picker(f, app, i);
     } else if app.browser.open {
@@ -134,6 +134,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_crate_browser(f, app);
     } else if app.recent_browser.is_open() {
         draw_recent_browser(f, app);
+    } else if app.known_tracks_browser.is_open() {
+        draw_known_tracks_browser(f, app);
     } else if app.crates_tab_open() {
         draw_crates_tab(f, app);
     } else if app.music_folders_open() {
@@ -738,11 +740,12 @@ fn draw_settings(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
-/// The next tab `Tab` would cycle to, in `Recent → Crate contents →
-/// Folder → Crates → Music folders → Recent` order.
+/// The next tab `Tab` would cycle to, in `Recent → Known tracks → Crate
+/// contents → Folder → Crates → Music folders → Recent` order.
 fn next_browse_tab_label(current: &str) -> &'static str {
     match current {
-        "Recent" => "Crate contents",
+        "Recent" => "Known tracks",
+        "Known tracks" => "Crate contents",
         "Crate contents" => "Folder",
         "Folder" => "Crates",
         "Crates" => "Music folders",
@@ -750,13 +753,16 @@ fn next_browse_tab_label(current: &str) -> &'static str {
     }
 }
 
-/// The five browse tabs, split left (Recent/Crate contents/Folder) and
-/// right (Crates/Music folders) — same content-left/globals-right
-/// convention every footer in this codebase already uses; `current` is
-/// styled black-on-amber among the rest (see `odj_core::tui::tab_span`).
+/// The six browse tabs, split left (Recent/Known tracks/Crate contents/
+/// Folder) and right (Crates/Music folders) — same content-left/
+/// globals-right convention every footer in this codebase already uses;
+/// `current` is styled black-on-amber among the rest (see
+/// `odj_core::tui::tab_span`).
 fn browse_tabs_row(current: &str) -> (Line<'static>, Line<'static>) {
     let left = Line::from(vec![
         tab_span("Recent", current == "Recent"),
+        Span::raw("  "),
+        tab_span("Known tracks", current == "Known tracks"),
         Span::raw("  "),
         tab_span("Crate contents", current == "Crate contents"),
         Span::raw("  "),
@@ -809,7 +815,9 @@ fn draw_tabbed_list(f: &mut Frame, area: Rect, title: &str, current: &str, middl
 /// The Folder tab's own "which saved folder" step — shown instead of
 /// `draw_browser` while there's more than one saved.
 fn draw_folder_picker(f: &mut Frame, app: &App, selected: usize) {
-    let area = centered(f.area(), 60, 50);
+    // 70%, not 60% — same width as the other browse-tab screens; the six-
+    // tab row no longer fits a narrower one (see `browse_tabs_row`).
+    let area = centered(f.area(), 70, 50);
     let list_area = draw_tabbed_list(f, area, "Pick a music folder", "Folder", "Enter/→ open", "");
     let items: Vec<ListItem> = app.music_dirs().iter().map(|d| ListItem::new(d.display().to_string())).collect();
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
@@ -926,12 +934,41 @@ fn draw_recent_browser(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
+/// Every track the global library has any memory for, sorted by title:
+/// same fuzzy filter and row styling as the other tabs, no availability
+/// marker or crate tags — this isn't about any one crate. `X`/Delete
+/// forgets a track's cues/loops/grid entirely; the armed row shows it.
+fn draw_known_tracks_browser(f: &mut Frame, app: &App) {
+    let area = centered(f.area(), 70, 70);
+    let list_area =
+        draw_tabbed_list(f, area, "Known tracks", "Known tracks", "Enter/→ load  X/Del forget", app.known_tracks_browser.query());
+    let width = list_area.width.saturating_sub(2); // the highlight symbol's own width
+    let visible: Vec<_> = app.known_tracks_browser.visible().collect();
+    let items: Vec<ListItem> = if visible.is_empty() {
+        let msg = if app.known_tracks_browser.is_empty() { "(no tracks have any memory yet)" } else { "(no matches)" };
+        vec![ListItem::new(msg).fg(DIM)]
+    } else {
+        visible
+            .into_iter()
+            .map(|(t, matched)| {
+                let suffix = if app.known_tracks_browser.armed() == Some(t.id.as_str()) { " — press again to forget" } else { "" };
+                let prefix = crate::app::library_track_search_text(t);
+                ListItem::new(tagged_row_line(&prefix, matched, suffix, Color::Reset, &[], width))
+            })
+            .collect()
+    };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(app.known_tracks_browser.selected()));
+    f.render_stateful_widget(list, list_area, &mut state);
+}
+
 /// Every crate that exists, `Space` toggling its membership in the
 /// shared active set. The canonical way to activate a crate — odj-player
 /// has no other screen that writes to `Settings.active_crates` (odj-
 /// sampler's own "Crates" tab shares and toggles the very same setting).
 fn draw_crates_tab(f: &mut Frame, app: &App) {
-    let area = centered(f.area(), 60, 50);
+    // 70%, not 60% — see `draw_folder_picker`'s own note.
+    let area = centered(f.area(), 70, 50);
     let list_area = draw_tabbed_list(f, area, "Crates", "Crates", "Space toggle active", "");
     let rows = app.crates_tab.rows();
     let active = app.active_crates();
@@ -954,7 +991,8 @@ fn draw_crates_tab(f: &mut Frame, app: &App) {
 /// removes one; `N` browses anywhere to add a brand new one (`Ctrl+U`
 /// there to confirm). No drilling into an existing folder from here.
 fn draw_music_folders_tab(f: &mut Frame, app: &App) {
-    let area = centered(f.area(), 60, 50);
+    // 70%, not 60% — see `draw_folder_picker`'s own note.
+    let area = centered(f.area(), 70, 50);
     let list_area = draw_tabbed_list(f, area, "Music folders", "Music folders", "X/Del remove  N add new", "");
     let dirs = app.music_dirs();
     let items: Vec<ListItem> = if dirs.is_empty() {
@@ -984,7 +1022,7 @@ pub const HELP: &[Page] = &[
             ("R", "Reverse"),
             ("F", "Sync to the master deck"),
             ("B / N", "Previous / next track in folder"),
-            ("Tab", "Browse: recent, crate contents, folders, active crates, music folders"),
+            ("Tab", "Browse: recent, known tracks, crate contents, folders, active crates, music folders"),
             ("`", "Settings: auto-cue"),
         ],
     ),

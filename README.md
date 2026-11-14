@@ -503,7 +503,7 @@ along their bottom edge, as does the output picker at start.
 | `R` | Reverse |
 | `F` | Sync to the master deck |
 | `B / N` | Previous / next track in folder |
-| `Tab` | Browse: recent, crate contents, folders, active crates, music folders |
+| `Tab` | Browse: recent, known tracks, crate contents, folders, active crates, music folders |
 | `` ` `` | Settings: auto-cue |
 
 #### Cues

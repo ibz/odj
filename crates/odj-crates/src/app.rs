@@ -641,7 +641,7 @@ impl App {
     fn delete_selected_crate(&mut self) {
         let Screen::Crates(list) = &mut self.screen else { return };
         let Some(c) = list.rows.get(list.selected) else { return };
-        let (dir, name) = (c.dir.clone(), c.name.clone());
+        let (dir, name, slug) = (c.dir.clone(), c.name.clone(), c.slug());
         let armed = list.pending_delete.as_ref().is_some_and(|(pd, at)| *pd == dir && at.elapsed() < DELETE_CONFIRM);
         if !armed {
             list.pending_delete = Some((dir, Instant::now()));
@@ -652,7 +652,7 @@ impl App {
         match Crate::delete(&dir) {
             Ok(()) => {
                 let mut settings = memory::load_settings();
-                if let Some(i) = settings.active_crates.iter().position(|d| *d == dir) {
+                if let Some(i) = settings.active_crates.iter().position(|s| *s == slug) {
                     settings.active_crates.remove(i);
                     let _ = memory::save_settings(&settings);
                 }
@@ -1374,14 +1374,15 @@ mod tests {
             let crate_dir = create_crate(&mut app, "Set");
             press(&mut app, KeyCode::Esc);
 
+            let slug = crate_dir.file_name().unwrap().to_string_lossy().into_owned();
             let mut settings = memory::load_settings();
-            settings.active_crates = vec![crate_dir.clone()];
+            settings.active_crates = vec![slug.clone()];
             memory::save_settings(&settings).unwrap();
 
             press(&mut app, KeyCode::Char('x'));
             press(&mut app, KeyCode::Char('x'));
 
-            assert!(!memory::load_settings().active_crates.contains(&crate_dir), "no dangling reference left behind");
+            assert!(!memory::load_settings().active_crates.contains(&slug), "no dangling reference left behind");
         });
     }
 

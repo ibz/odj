@@ -583,7 +583,7 @@ fn draw_active_crates(f: &mut Frame, state: &crate::app::ActiveCratesState) {
             .rows
             .iter()
             .map(|c| {
-                let active = active_crates.iter().any(|d| d == &c.dir);
+                let active = active_crates.iter().any(|s| *s == c.slug());
                 let marker = if active { "[x] " } else { "[ ] " };
                 ListItem::new(format!("{marker}{}", c.name))
             })

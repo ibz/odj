@@ -45,6 +45,14 @@ impl Crate {
         dir.join("kits")
     }
 
+    /// This crate's directory name under [`crates_root`] — what
+    /// `Settings.active_crates` stores, resolved back with
+    /// `crates_root().join(slug)`. Not `name`, which is a separate,
+    /// freely-editable display label.
+    pub fn slug(&self) -> String {
+        self.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
     /// `name` falls back to the directory's own name when there's no
     /// manifest yet (a directory the user `git init`'d and populated by
     /// hand before ever opening it here).
@@ -216,6 +224,14 @@ mod tests {
         let loaded = Crate::load(dir.clone());
         assert_eq!(loaded.name, "My Set");
         assert_eq!(loaded.dir, dir);
+    }
+
+    #[test]
+    fn slug_is_the_directory_name_not_the_display_name() {
+        let dir = temp_dir("slug");
+        let c = Crate::create(dir.clone(), "My Set").unwrap();
+        assert_eq!(c.slug(), dir.file_name().unwrap().to_string_lossy());
+        assert_ne!(c.slug(), c.name, "the slug is the directory name, not the editable display name");
     }
 
     #[test]

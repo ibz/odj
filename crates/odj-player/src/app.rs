@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use odj_core::crates::{Availability, AvailabilityChecker, Crate};
+use odj_core::crates::{self, Availability, AvailabilityChecker, Crate};
 use odj_core::library::{Browser, fuzzy_match, siblings};
 use odj_core::library_index::{IndexRefresher, LibraryIndex, RefreshProgress};
 use odj_core::link;
@@ -679,9 +679,9 @@ impl App {
         let active_crates = self.memory.settings.active_crates.clone();
         let mut tracks: Vec<LibraryTrack> = Vec::new();
         let mut tags: HashMap<String, Vec<String>> = HashMap::new();
-        for dir in &active_crates {
-            let crate_memory = Memory::load_from(Crate::tracks_dir(dir), self.memory.settings.clone());
-            let slug = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        for slug in &active_crates {
+            let dir = crates::crates_root().join(slug);
+            let crate_memory = Memory::load_from(Crate::tracks_dir(&dir), self.memory.settings.clone());
             for t in crate_memory.tracks() {
                 tags.entry(t.id.clone()).or_default().push(slug.clone());
                 if !tracks.iter().any(|existing| existing.id == t.id) {
@@ -741,7 +741,8 @@ impl App {
     /// oldest-first (see `Settings::remember_recent`); reversed here so
     /// it's shown newest-first.
     fn open_recent_browser(&mut self) {
-        let tracks: Vec<RecentTrack> = self.memory.settings.recent_tracks.iter().rev().cloned().collect();
+        let mut tracks = self.memory.settings.resolved_recent_tracks();
+        tracks.reverse();
         self.recent_browser.query.clear();
         self.recent_browser.set_tracks(tracks);
         self.recent_browser.open = true;
@@ -816,8 +817,9 @@ impl App {
         let mut healed = 0;
         for id in still_missing {
             let Some(new_path) = found.iter().find_map(|(dir, index)| index.find(dir, &id)) else { continue };
-            for crate_dir in &active_crates {
-                let crate_memory = Memory::load_from(Crate::tracks_dir(crate_dir), self.memory.settings.clone());
+            for slug in &active_crates {
+                let crate_dir = crates::crates_root().join(slug);
+                let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), self.memory.settings.clone());
                 let _ = crate_memory.heal_path(&id, &new_path);
             }
             self.crate_browser.update_track_path(&id, new_path.clone());
@@ -904,13 +906,13 @@ impl App {
                 self.crates_tab.selected = (self.crates_tab.selected + 1).min(last);
             }
             KeyCode::Char(' ') => {
-                let Some(dir) = self.crates_tab.rows.get(self.crates_tab.selected).map(|c| c.dir.clone()) else { return };
+                let Some(slug) = self.crates_tab.rows.get(self.crates_tab.selected).map(Crate::slug) else { return };
                 let active = &mut self.memory.settings.active_crates;
-                match active.iter().position(|d| *d == dir) {
+                match active.iter().position(|s| *s == slug) {
                     Some(i) => {
                         active.remove(i);
                     }
-                    None => active.push(dir),
+                    None => active.push(slug),
                 }
                 if let Err(e) = self.memory.save_settings() {
                     self.set_status(format!("Could not save settings: {e}"));
@@ -944,7 +946,7 @@ impl App {
         self.music_folders_selected
     }
 
-    pub fn active_crates(&self) -> &[PathBuf] {
+    pub fn active_crates(&self) -> &[String] {
         &self.memory.settings.active_crates
     }
 
@@ -2574,8 +2576,8 @@ mod tests {
         app.open_crates_tab();
 
         press(&mut app, KeyCode::Char(' '), false);
-        assert_eq!(app.active_crates(), [crate_dir.clone()].as_slice());
-        assert_eq!(odj_core::memory::load_settings().active_crates, vec![crate_dir.clone()], "saved immediately");
+        assert_eq!(app.active_crates(), ["set".to_string()].as_slice());
+        assert_eq!(odj_core::memory::load_settings().active_crates, vec!["set".to_string()], "saved immediately, by name");
 
         press(&mut app, KeyCode::Char(' '), false); // toggles back off
         assert!(app.active_crates().is_empty());
@@ -2590,10 +2592,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
         let mut track = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
@@ -2617,10 +2619,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
         let mut alpha = Track::from_samples("a.wav".into(), "Alpha".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
@@ -2662,10 +2664,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings);
         let mut track = Track::from_samples("s.wav".into(), "Song".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
@@ -2691,11 +2693,11 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let (a, b) = (dir.join("a-set"), dir.join("b-set"));
+        let (a, b) = (crates::crates_root().join("a-set"), crates::crates_root().join("b-set"));
         Crate::create(a.clone(), "A Set").unwrap();
         Crate::create(b.clone(), "B Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![a.clone(), b.clone()];
+        settings.active_crates = vec!["a-set".to_string(), "b-set".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
 
         let mut shared = Track::from_samples("t.wav".into(), "Shared".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
@@ -2764,6 +2766,49 @@ mod tests {
     }
 
     #[test]
+    fn recent_tracks_are_stored_relative_to_their_music_dir() {
+        let dir = std::env::temp_dir().join(format!("odj-recent-relative-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let music = dir.join("music");
+        std::fs::create_dir_all(music.join("sub")).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        let mut settings = odj_core::memory::load_settings();
+        settings.music_dirs = vec![music.clone()];
+        odj_core::memory::save_settings(&settings).unwrap();
+
+        let path = music.join("sub/track.wav");
+        odj_core::wav::write_wav(&path, &[0.1, -0.1], 2, 44_100).unwrap();
+
+        let deck = Arc::new(Mutex::new(Deck::new(48_000)));
+        let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
+        app.load(path.clone());
+        wait_for_load(&mut app);
+
+        // On disk, relative to the music dir — not the absolute path.
+        assert_eq!(
+            odj_core::memory::load_settings().recent_tracks[0].path,
+            PathBuf::from("sub/track.wav"),
+            "survives the music dir moving to a different mount point, same as a library track's own path"
+        );
+
+        // Reading it back through the Recent tab resolves it to the
+        // absolute path again, using the same music dir — and it's
+        // actually loadable from there.
+        app.open_recent_browser();
+        let row_path = app.recent_browser.visible().next().unwrap().0.path.clone();
+        assert_eq!(row_path, path.canonicalize().unwrap());
+        app.close_recent_browser();
+        app.load(row_path);
+        wait_for_load(&mut app);
+        assert!(app.status().is_some_and(|s| s.starts_with("Loaded")), "{:?}", app.status());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn enter_in_the_recent_tab_loads_the_selected_track() {
         let dir = std::env::temp_dir().join(format!("odj-recent-enter-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2810,11 +2855,11 @@ mod tests {
         odj_core::wav::write_wav(&music.join("old-folder/track.wav"), &[0.1, -0.1], 2, 44_100).unwrap();
         let id = odj_core::track::decode(&music.join("old-folder/track.wav")).unwrap().id;
 
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
         settings.music_dirs = vec![music.clone()];
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
 
         let crate_memory = Memory::load_from(Crate::tracks_dir(&crate_dir), settings.clone());
@@ -2903,10 +2948,10 @@ mod tests {
         // (the Folder tab's is tested separately; the Crate contents tab has none
         // any more), so this isolates just the cycling.
         app.memory.settings.music_dirs = vec![app.browser.dir.clone()];
-        let crate_dir = std::env::temp_dir().join(format!("odj-tab-switch-test-{}", std::process::id()));
+        let crate_dir = crates::crates_root().join("tab-switch-set");
         let _ = std::fs::remove_dir_all(&crate_dir);
         Crate::create(crate_dir.clone(), "Set").unwrap();
-        app.memory.settings.active_crates = vec![crate_dir.clone()];
+        app.memory.settings.active_crates = vec!["tab-switch-set".to_string()];
         app.browse_tab = BrowseTab::CrateContents;
 
         press(&mut app, KeyCode::Tab, false); // opens the Crate contents tab
@@ -3019,10 +3064,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Empty Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -3033,7 +3078,7 @@ mod tests {
 
         assert!(!app.crate_browser.is_open(), "no dead-end dialog");
         assert!(app.browser.open, "browsing normally instead");
-        assert_eq!(app.active_crates(), [crate_dir.clone()].as_slice(), "still active — only the UI falls back");
+        assert_eq!(app.active_crates(), ["crate".to_string()].as_slice(), "still active — only the UI falls back");
         assert!(app.status().is_some_and(|s| s.contains("No crates active yet")), "{:?}", app.status());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3052,10 +3097,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Empty Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -3087,10 +3132,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Set").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -3238,10 +3283,10 @@ mod tests {
             std::env::set_var("XDG_DATA_HOME", &dir);
             std::env::set_var("XDG_CONFIG_HOME", &dir);
         }
-        let crate_dir = dir.join("crate");
+        let crate_dir = crates::crates_root().join("crate");
         Crate::create(crate_dir.clone(), "Deep House Essentials").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir.clone()];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
         let mut track = Track::from_samples("t.wav".into(), "t".into(), None, 48_000, click_track(120.0, 10.0, 48_000));
         track.id = "deadbeef00000000000000000000beef".into();
@@ -3268,7 +3313,7 @@ mod tests {
         Crate::create(root.join("deep-house"), "Deep House Essentials").unwrap();
         Crate::create(root.join("techno-night"), "Techno Night").unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![root.join("deep-house")];
+        settings.active_crates = vec!["deep-house".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
 
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));

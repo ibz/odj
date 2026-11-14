@@ -161,7 +161,10 @@ pub struct Settings {
     /// Folders the browser can jump into; the first that still exists is
     /// where it opens when no folder is given on the command line. odj-player.
     pub music_dirs: Vec<PathBuf>,
-    /// The active kit's directory name under `kits/`. odj-sampler.
+    /// The active kit, by directory name (or `@embedded:<id>` for a
+    /// built-in one) — resolved against the global kits folder or an
+    /// active crate's own `kits/`, see odj-sampler's own
+    /// `settings::load_active_kit`. odj-sampler.
     pub kit: Option<String>,
     /// The MIDI input odj-sampler last used, by its stable name (see
     /// `odj_core::midi::stable_name` — not its connection-order port id,
@@ -205,20 +208,29 @@ pub struct Settings {
     /// means it hasn't been picked yet (from Settings' own Outputs
     /// tab), and nothing plays until it is. odj-mixer.
     pub mixer_output: Option<String>,
-    /// Crates currently active — a pure, merged, read-only *browsing*
-    /// set: odj-player's own Files tab and odj-sampler's own kit picker
-    /// both merge tracks/kits across every one of these (see
-    /// `crate::crates::Crate`, `crate::crates::list_crates`), tagging
-    /// each row by which crate(s) it came from. Never a write target:
-    /// `Memory::load`'s `tracks/` and odj-sampler's `kits_dir()` always
-    /// use the global library regardless of what's active here. Shared
-    /// by odj-player and odj-sampler — toggling a crate in either app's
-    /// "active crates" tab is visible in the other right away.
+    /// Crates currently active, by directory name under
+    /// `crate::crates::crates_root()` (see `Crate::slug`) — not a full
+    /// path, so moving `$HOME` or syncing settings.json to a different
+    /// machine doesn't orphan it; a crate, unlike a kit, only ever lives
+    /// under that one fixed root, so the name alone is always enough to
+    /// find it again, no multi-root search needed. A pure, merged,
+    /// read-only *browsing* set: odj-player's own Files tab and
+    /// odj-sampler's own kit picker both merge tracks/kits across every
+    /// one of these (see `crate::crates::Crate`, `crate::crates::list_crates`),
+    /// tagging each row by which crate(s) it came from. Never a write
+    /// target: `Memory::load`'s `tracks/` and odj-sampler's `kits_dir()`
+    /// always use the global library regardless of what's active here.
+    /// Shared by odj-player and odj-sampler — toggling a crate in either
+    /// app's "active crates" tab is visible in the other right away.
     #[serde(default)]
-    pub active_crates: Vec<PathBuf>,
+    pub active_crates: Vec<String>,
     /// Tracks opened recently, oldest first — capped at [`MAX_RECENT`],
-    /// the oldest dropped once it's exceeded. Shown newest-first by the
-    /// Recent tab; odj-player.
+    /// the oldest dropped once it's exceeded. Each `path` relative to
+    /// whichever of `music_dirs` contains it, same convention (and same
+    /// `relativize`/`resolve`) a library track's own path uses, so this
+    /// survives a drive moving to a different mount point too — see
+    /// [`resolved_recent_tracks`](Settings::resolved_recent_tracks).
+    /// Shown newest-first by the Recent tab; odj-player.
     #[serde(default)]
     pub recent_tracks: Vec<RecentTrack>,
 }
@@ -226,12 +238,24 @@ pub struct Settings {
 impl Settings {
     /// Records a track just opened: any existing entry for the same path
     /// is dropped first, so reopening one moves it to the top instead of
-    /// leaving a stale duplicate behind.
+    /// leaving a stale duplicate behind. `path` is relativized against
+    /// `music_dirs` before storing, same as a library track's own path.
     pub fn remember_recent(&mut self, path: PathBuf, title: String, artist: Option<String>) {
+        let path = relativize(&path, &self.music_dirs);
         self.recent_tracks.retain(|t| t.path != path);
         self.recent_tracks.push(RecentTrack { path, title, artist });
         let excess = self.recent_tracks.len().saturating_sub(MAX_RECENT);
         self.recent_tracks.drain(..excess);
+    }
+
+    /// `recent_tracks`, oldest first (same order they're stored in), each
+    /// path resolved back to where it should be found given the current
+    /// `music_dirs` — the Recent tab shows these in reverse, newest first.
+    pub fn resolved_recent_tracks(&self) -> Vec<RecentTrack> {
+        self.recent_tracks
+            .iter()
+            .map(|t| RecentTrack { path: resolve(&t.path, &self.music_dirs), ..t.clone() })
+            .collect()
     }
 }
 
@@ -995,6 +1019,35 @@ mod tests {
     }
 
     #[test]
+    fn remember_recent_stores_a_path_relative_to_its_music_dir() {
+        let mut s = Settings { music_dirs: vec![PathBuf::from("/music")], ..Settings::default() };
+        s.remember_recent(PathBuf::from("/music/sub/track.mp3"), "T".into(), None);
+        assert_eq!(s.recent_tracks[0].path, PathBuf::from("sub/track.mp3"));
+
+        // ...and reading it back resolves it to the absolute path again,
+        // using the same music dir.
+        assert_eq!(s.resolved_recent_tracks()[0].path, PathBuf::from("/music/sub/track.mp3"));
+    }
+
+    #[test]
+    fn remember_recent_keeps_a_path_outside_every_music_dir_absolute() {
+        let mut s = Settings { music_dirs: vec![PathBuf::from("/music")], ..Settings::default() };
+        s.remember_recent(PathBuf::from("/elsewhere/track.mp3"), "T".into(), None);
+        assert_eq!(s.recent_tracks[0].path, PathBuf::from("/elsewhere/track.mp3"), "left absolute, not relativized to an unrelated dir");
+        assert_eq!(s.resolved_recent_tracks()[0].path, PathBuf::from("/elsewhere/track.mp3"));
+    }
+
+    #[test]
+    fn remember_recent_reopening_moves_it_to_the_top_even_stored_relative() {
+        let mut s = Settings { music_dirs: vec![PathBuf::from("/music")], ..Settings::default() };
+        s.remember_recent(PathBuf::from("/music/a.mp3"), "A".into(), None);
+        s.remember_recent(PathBuf::from("/music/b.mp3"), "B".into(), None);
+        s.remember_recent(PathBuf::from("/music/a.mp3"), "A".into(), None);
+        let paths: Vec<&Path> = s.recent_tracks.iter().map(|t| t.path.as_path()).collect();
+        assert_eq!(paths, [Path::new("b.mp3"), Path::new("a.mp3")], "b, then a moved back to the top on reopening, deduped by the relative path");
+    }
+
+    #[test]
     fn tracks_lists_each_ones_youtube_url() {
         let m = memory("tracks-youtube-url");
         let t = track("ab66", "/a");
@@ -1013,7 +1066,7 @@ mod tests {
         }
         let crate_dir = dir.join("my-crate");
         crate::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
-        let settings = Settings { active_crates: vec![crate_dir], ..Settings::default() };
+        let settings = Settings { active_crates: vec!["my-crate".to_string()], ..Settings::default() };
         save_settings(&settings).unwrap();
 
         let m = Memory::load();

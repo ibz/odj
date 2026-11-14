@@ -940,7 +940,7 @@ fn draw_crates_tab(f: &mut Frame, app: &App) {
     } else {
         rows.iter()
             .map(|c| {
-                let marker = if active.iter().any(|d| d == &c.dir) { "[x] " } else { "[ ] " };
+                let marker = if active.iter().any(|s| *s == c.slug()) { "[x] " } else { "[ ] " };
                 ListItem::new(format!("{marker}{}", c.name))
             })
             .collect()

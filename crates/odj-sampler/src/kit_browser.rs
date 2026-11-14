@@ -103,18 +103,18 @@ pub fn build_rows(include_remote: bool) -> Vec<KitRow> {
 /// each tagged with that crate's directory-name slug — parallel to the
 /// returned rows, `None` for the global kits folder or a built-in kit.
 /// The in-app `Screen::KitBrowser`'s own row list.
-pub fn build_rows_tagged(active_crates: &[PathBuf]) -> (Vec<KitRow>, Vec<Option<String>>) {
+pub fn build_rows_tagged(active_crates: &[String]) -> (Vec<KitRow>, Vec<Option<String>>) {
     let mut rows: Vec<KitRow> = Vec::new();
     let mut tags: Vec<Option<String>> = Vec::new();
     for (dir, name) in kits::list_kits() {
         rows.push(KitRow::Existing(dir, name));
         tags.push(None);
     }
-    for crate_dir in active_crates {
-        let tag = crate_dir.file_name().map(|n| n.to_string_lossy().into_owned());
-        for (dir, name) in kits::list_kits_in(&odj_core::crates::Crate::kits_dir(crate_dir)) {
+    for slug in active_crates {
+        let crate_dir = odj_core::crates::crates_root().join(slug);
+        for (dir, name) in kits::list_kits_in(&odj_core::crates::Crate::kits_dir(&crate_dir)) {
             rows.push(KitRow::Existing(dir, name));
-            tags.push(tag.clone());
+            tags.push(Some(slug.clone()));
         }
     }
     rows.extend(embedded_kits().iter().map(KitRow::Embedded));

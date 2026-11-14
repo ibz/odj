@@ -159,7 +159,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&crate_dir);
             odj_core::crates::Crate::create(crate_dir.clone(), "Set").unwrap();
             let mut settings = odj_core::memory::load_settings();
-            settings.active_crates = vec![crate_dir.clone()];
+            settings.active_crates = vec!["whatever".to_string()];
             odj_core::memory::save_settings(&settings).unwrap();
 
             assert_eq!(kits_dir(), data_dir().join("kits"), "a new kit always lands in the global folder");

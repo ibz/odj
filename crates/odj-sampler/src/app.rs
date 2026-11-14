@@ -765,12 +765,12 @@ impl App {
             KeyCode::Up => state.selected = state.selected.saturating_sub(1),
             KeyCode::Down => state.selected = (state.selected + 1).min(state.rows.len().saturating_sub(1)),
             KeyCode::Char(' ') if !state.rows.is_empty() => {
-                let dir = state.rows[state.selected].dir.clone();
+                let slug = state.rows[state.selected].slug();
                 let mut settings = odj_core::memory::load_settings();
-                if !settings.active_crates.iter().any(|d| d == &dir) {
-                    settings.active_crates.push(dir);
+                if !settings.active_crates.contains(&slug) {
+                    settings.active_crates.push(slug);
                 } else {
-                    settings.active_crates.retain(|d| d != &dir);
+                    settings.active_crates.retain(|s| *s != slug);
                 }
                 let _ = odj_core::memory::save_settings(&settings);
             }
@@ -1794,13 +1794,13 @@ mod tests {
         } // SAFETY: see other tests in this module.
 
         let global_kit = kits::create_kit("Global Kit").unwrap();
-        let crate_dir = dir.join("crate");
+        let crate_dir = odj_core::crates::crates_root().join("crate");
         odj_core::crates::Crate::create(crate_dir.clone(), "Techno Night").unwrap();
         let crate_kit_dir = odj_core::crates::Crate::kits_dir(&crate_dir).join("their-kit");
         std::fs::create_dir_all(&crate_kit_dir).unwrap();
         Kit::new("Their Kit".into(), Default::default()).save(&crate_kit_dir.join("kit.json")).unwrap();
         let mut settings = odj_core::memory::load_settings();
-        settings.active_crates = vec![crate_dir];
+        settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
 
         let mut a = App::new(Arc::new(Mutex::new(Sampler::new())), 48_000, Some(global_kit.clone()), Kit::load(&global_kit.join("kit.json")), true, AudioRoute::Mixer);
@@ -1844,7 +1844,7 @@ mod tests {
         a.screen = Screen::ActiveCrates(ActiveCratesState { rows: odj_core::crates::list_crates(), selected: 0 });
         let press = |code| KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE };
         a.handle_key(press(KeyCode::Char(' ')));
-        assert_eq!(odj_core::memory::load_settings().active_crates, vec![crate_dir.clone()]);
+        assert_eq!(odj_core::memory::load_settings().active_crates, vec!["set".to_string()], "saved by name");
 
         a.handle_key(press(KeyCode::Char(' '))); // toggles back off
         assert!(odj_core::memory::load_settings().active_crates.is_empty());
@@ -1985,7 +1985,7 @@ mod tests {
         assert_eq!(a.kit_dir, Some(kit_b.clone()), "fell back to the other kit");
         assert_eq!(a.kit_name, "Kit B");
         assert_eq!(a.status(), Some("Deleted \"Kit A\" — switched to \"Kit B\""));
-        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), kit_b.to_string_lossy());
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), kit_b.file_name().unwrap().to_string_lossy());
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");
@@ -2071,7 +2071,7 @@ mod tests {
         let kit = Kit::load(&dir.join("kit.json"));
         assert_eq!(kit.name, "Trap");
         assert_eq!(kit.pads[2].props.mode, Mode::Gate, "the change that triggered the prompt was kept, not lost");
-        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), dir.to_string_lossy());
+        assert_eq!(odj_core::memory::load_settings().kit.unwrap(), dir.file_name().unwrap().to_string_lossy());
 
         unsafe {
             std::env::remove_var("XDG_DATA_HOME");

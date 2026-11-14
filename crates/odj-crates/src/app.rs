@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use odj_core::crates::{self, Availability, AvailabilityChecker, Crate};
+use odj_core::crates::{self, Availability, AvailabilityChecker, Crate, CrateTrack};
 use odj_core::library::{self, Browser};
-use odj_core::memory::{self, LibraryTrack, Memory};
-use odj_core::track::{self, Track};
+use odj_core::memory;
+use odj_core::track;
 
 use crate::queue::{DownloadWorker, QueueItem, Status};
 use crate::search::{self, Fetcher, SearchResult, search_in_background};
@@ -77,7 +77,7 @@ impl CrateList {
 pub struct CrateDetail {
     pub dir: PathBuf,
     pub name: String,
-    tracks: Vec<LibraryTrack>,
+    tracks: Vec<CrateTrack>,
     checker: AvailabilityChecker,
     availability: HashMap<String, Availability>,
     pub selected: usize,
@@ -89,8 +89,8 @@ pub struct CrateDetail {
 impl CrateDetail {
     fn load(dir: PathBuf) -> Self {
         let name = Crate::load(dir.clone()).name;
-        let memory = Memory::load_from(Crate::tracks_dir(&dir), memory::load_settings());
-        let tracks = memory.tracks();
+        let music_dirs = memory::load_settings().music_dirs;
+        let tracks = crates::list_tracks(&Crate::tracks_dir(&dir), &music_dirs);
         let checker = AvailabilityChecker::new();
         for t in &tracks {
             checker.check(t.id.clone(), t.path.clone());
@@ -98,7 +98,7 @@ impl CrateDetail {
         Self { dir, name, tracks, checker, availability: HashMap::new(), selected: 0, pending_delete: None }
     }
 
-    pub fn tracks(&self) -> &[LibraryTrack] {
+    pub fn tracks(&self) -> &[CrateTrack] {
         &self.tracks
     }
 
@@ -204,11 +204,12 @@ impl BatchAdder {
                 }
             }
             let total = files.len();
-            let memory = Memory::load_from(Crate::tracks_dir(&crate_dir), memory::load_settings());
+            let tracks_dir = Crate::tracks_dir(&crate_dir);
+            let music_dirs = memory::load_settings().music_dirs;
             let (mut added, mut failed) = (0, 0);
             for (i, path) in files.iter().enumerate() {
                 let _ = tx.send(AddProgress::Scanning { current: i + 1, total });
-                match register_file(&memory, path) {
+                match register_file(&tracks_dir, &music_dirs, path) {
                     Ok(()) => added += 1,
                     Err(_) => failed += 1,
                 }
@@ -223,35 +224,19 @@ impl BatchAdder {
     }
 }
 
-/// Decodes `path` and registers it into `memory` — just enough of a
-/// `Track` for `Memory::register_track` (`id`/`path`/`title`/`artist`/
-/// `sample_rate`), skipping `Track::from_samples`'s key/grid/waveform
-/// analysis entirely: `register_track` throws all of that away anyway,
-/// and running it per file would make "add a whole folder" far slower
-/// than it needs to be.
-fn register_file(memory: &Memory, path: &Path) -> anyhow::Result<()> {
+/// Decodes `path` and registers it into the roster at `tracks_dir` —
+/// skipping `Track::from_samples`'s key/grid/waveform analysis entirely,
+/// since a crate roster entry never carries any of that (see
+/// `odj_core::crates::CrateTrack`), and running it per file would make
+/// "add a whole folder" far slower than it needs to be.
+fn register_file(tracks_dir: &Path, music_dirs: &[PathBuf], path: &Path) -> anyhow::Result<()> {
     let d = track::decode(path)?;
-    let t = track_for_registering(path, d);
-    memory.register_track(&t)?;
+    crates::register_track(tracks_dir, music_dirs, &crate_track_for(path, d))?;
     Ok(())
 }
 
-fn track_for_registering(path: &Path, d: track::Decoded) -> Track {
-    Track {
-        id: d.id,
-        path: path.to_path_buf(),
-        title: d.title,
-        artist: d.artist,
-        sample_rate: d.sample_rate,
-        samples: Vec::new(),
-        wave: Vec::new(),
-        wave_scale: 0.0,
-        grid: None,
-        steady: false,
-        key: None,
-        first_sound: 0.0,
-        has_video: d.has_video,
-    }
+fn crate_track_for(path: &Path, d: track::Decoded) -> CrateTrack {
+    CrateTrack { id: d.id, path: path.to_path_buf(), title: d.title, artist: d.artist, sample_rate: d.sample_rate, youtube_url: None }
 }
 
 /// Search/queue/download, nested under whichever crate opened it — the
@@ -406,13 +391,13 @@ impl Download {
             Ok(d) => d,
             Err(e) => return format!("Downloaded {title}, but could not read it: {e}"),
         };
-        let id = d.id.clone();
-        let t = track_for_registering(path, d);
-        let memory = Memory::load_from(Crate::tracks_dir(&self.crate_dir), memory::load_settings());
-        if let Err(e) = memory.register_track(&t) {
+        let t = crate_track_for(path, d);
+        let tracks_dir = Crate::tracks_dir(&self.crate_dir);
+        let music_dirs = memory::load_settings().music_dirs;
+        if let Err(e) = crates::register_track(&tracks_dir, &music_dirs, &t) {
             return format!("Downloaded {title}, but could not register it: {e}");
         }
-        let _ = memory.set_youtube_url(&id, &t.title, t.artist.as_deref(), path, t.sample_rate, Some(url.to_string()));
+        let _ = crates::set_youtube_url(&tracks_dir, &music_dirs, &t, Some(url.to_string()));
         self.crate_youtube_urls.insert(url.to_string());
         format!("Added \"{title}\" to the crate")
     }
@@ -756,8 +741,7 @@ impl App {
         }
         c.pending_delete = None;
         let dir = c.dir.clone();
-        let memory = Memory::load_from(Crate::tracks_dir(&dir), memory::load_settings());
-        let result = memory.forget_track(&id);
+        let result = crates::forget_track(&Crate::tracks_dir(&dir), &id);
         let Screen::Crate(c) = &mut self.screen else { return };
         match result {
             Ok(()) => {

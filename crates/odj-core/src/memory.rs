@@ -130,9 +130,6 @@ pub struct LibraryTrack {
     pub artist: Option<String>,
     pub sample_rate: u32,
     pub memory: TrackMemory,
-    /// Where to download the audio from if it's missing; see
-    /// `TrackFile.youtube_url`.
-    pub youtube_url: Option<String>,
 }
 
 /// A track opened recently, enough to show it and reopen it without
@@ -310,7 +307,7 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
 /// under one of them. Left absolute, unchanged, if none of them contain
 /// it (e.g. a file loaded directly from the command line) — `resolve`
 /// handles both cases transparently on the way back.
-fn relativize(path: &Path, music_dirs: &[PathBuf]) -> PathBuf {
+pub(crate) fn relativize(path: &Path, music_dirs: &[PathBuf]) -> PathBuf {
     for dir in music_dirs {
         if let Ok(rel) = path.strip_prefix(dir) {
             return rel.to_path_buf();
@@ -329,7 +326,7 @@ fn relativize(path: &Path, music_dirs: &[PathBuf]) -> PathBuf {
 /// first candidate anyway (or the bare relative path if there's no music
 /// folder at all), so callers checking `is_file()`/decoding it still get
 /// a sensible "not found" rather than nothing to even try.
-fn resolve(path: &Path, music_dirs: &[PathBuf]) -> PathBuf {
+pub(crate) fn resolve(path: &Path, music_dirs: &[PathBuf]) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
     }
@@ -347,8 +344,7 @@ struct TrackFile {
     id: String,
     /// Where the track was last loaded from — relative to a music folder
     /// when it's under one (see `relativize`/`resolve`), so the whole
-    /// library stays usable across a moved drive or mount point, or
-    /// (for a crate's own tracks) a different machine entirely.
+    /// library stays usable across a moved drive or mount point.
     path: PathBuf,
     title: String,
     artist: Option<String>,
@@ -372,14 +368,6 @@ struct TrackFile {
     /// still waiting for its OUT point.
     #[serde(default, rename = "loop")]
     current_loop: Option<Cue>,
-    /// Where to download the audio from if it's missing — set only via
-    /// `Memory::set_youtube_url`, never through `TrackMemory`/`Deck`: a
-    /// live deck always rebuilds its `TrackMemory` field-by-field with no
-    /// such field, so putting it there would get silently wiped by the
-    /// very next ordinary cue save (`merge`'s scalar rule sees `mine
-    /// (None) != base (Some(url))` and `mine` wins).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    youtube_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -411,7 +399,6 @@ impl TrackFile {
             tempo: mem.tempo,
             cues,
             current_loop: mem.loop_in.map(|pos| Cue { pos, loop_out: mem.loop_out }),
-            youtube_url: None,
         }
     }
 
@@ -446,19 +433,12 @@ pub struct Memory {
 }
 
 impl Memory {
-    /// Always the global library's `tracks/` — active crates are a pure
-    /// browsing set now (see `Settings.active_crates`), never a write
-    /// target. A specific crate's own memory is read explicitly via
-    /// `load_from(Crate::tracks_dir(dir), settings)` wherever that's
-    /// needed (odj-player's Files tab, odj-sampler's kit picker).
+    /// Always the global library's `tracks/` — the only DJ memory
+    /// (cues/loops/grid/tempo) there is; a crate's own roster never
+    /// carries any (see `odj_core::crates::CrateTrack`), so there's no
+    /// equivalent "memory for this crate" to load.
     pub fn load() -> Self {
-        Self::load_from(data_dir().join("tracks"), load_settings())
-    }
-
-    /// `load()`'s sibling for a caller that already has both — tests, or a
-    /// crate just activated/created this session.
-    pub fn load_from(tracks_dir: PathBuf, settings: Settings) -> Self {
-        Self { tracks_dir, settings }
+        Self { tracks_dir: data_dir().join("tracks"), settings: load_settings() }
     }
 
     fn track_file(&self, id: &str) -> PathBuf {
@@ -490,14 +470,11 @@ impl Memory {
                 title: file.title,
                 artist: file.artist,
                 sample_rate: file.sample_rate,
-                youtube_url: file.youtube_url,
             })
             .collect()
     }
 
     /// Writes the track's file; skipped for a track that never had cues.
-    /// Preserves whatever `youtube_url` is already on disk — an ordinary
-    /// cue save never touches it (see `TrackFile.youtube_url`).
     pub fn save_track(&self, track: &Track, mem: &TrackMemory) -> std::io::Result<()> {
         if track.id.is_empty() {
             return Ok(());
@@ -506,11 +483,9 @@ impl Memory {
         if mem.is_empty() && !file.exists() {
             return Ok(());
         }
-        let youtube_url = read_json::<TrackFile>(&file).and_then(|f| f.youtube_url);
         fs::create_dir_all(file.parent().expect("track files live in a shard folder"))?;
         let mut tf = TrackFile::new(track, mem);
         tf.path = relativize(&tf.path, &self.settings.music_dirs);
-        tf.youtube_url = youtube_url;
         write_json(&file, &tf)
     }
 
@@ -519,16 +494,13 @@ impl Memory {
     /// the same track loaded, which saved its own changes in the
     /// meantime, doesn't have them silently discarded. `base` is this
     /// deck's own memory as it was when loaded (before any of *its*
-    /// changes); see `merge`. Preserves `youtube_url` the same way
-    /// `save_track` does.
+    /// changes); see `merge`.
     pub fn save_track_merged(&self, track: &Track, base: &TrackMemory, mine: &TrackMemory) -> std::io::Result<()> {
         if track.id.is_empty() {
             return Ok(());
         }
         let file = self.track_file(&track.id);
-        let on_disk = read_json::<TrackFile>(&file);
-        let theirs = on_disk.as_ref().map(|f| f.memory()).unwrap_or_default();
-        let youtube_url = on_disk.and_then(|f| f.youtube_url);
+        let theirs = read_json::<TrackFile>(&file).map(|f| f.memory()).unwrap_or_default();
         let merged = merge(base, mine, &theirs);
         if merged.is_empty() && !file.exists() {
             return Ok(());
@@ -536,63 +508,6 @@ impl Memory {
         fs::create_dir_all(file.parent().expect("track files live in a shard folder"))?;
         let mut tf = TrackFile::new(track, &merged);
         tf.path = relativize(&tf.path, &self.settings.music_dirs);
-        tf.youtube_url = youtube_url;
-        write_json(&file, &tf)
-    }
-
-    /// Registers `track` with empty memory if it has no entry yet — a
-    /// no-op (not even a file touch) if it already does. For "add this
-    /// track to the crate" before you've ever cued it up.
-    pub fn register_track(&self, track: &Track) -> std::io::Result<()> {
-        if track.id.is_empty() {
-            return Ok(());
-        }
-        let file = self.track_file(&track.id);
-        if file.exists() {
-            return Ok(());
-        }
-        fs::create_dir_all(file.parent().expect("track files live in a shard folder"))?;
-        let mut tf = TrackFile::new(track, &TrackMemory::default());
-        tf.path = relativize(&tf.path, &self.settings.music_dirs);
-        write_json(&file, &tf)
-    }
-
-    pub fn youtube_url(&self, id: &str) -> Option<String> {
-        read_json::<TrackFile>(&self.track_file(id)).and_then(|f| f.youtube_url)
-    }
-
-    /// Sets/clears the YouTube URL for `id`, creating a minimal entry from
-    /// the given display fields if there's none yet (tagging a `Missing`
-    /// row that's never been loaded this session) — never decodes the
-    /// audio itself. Everything else about an existing entry is left
-    /// untouched.
-    pub fn set_youtube_url(
-        &self,
-        id: &str,
-        title: &str,
-        artist: Option<&str>,
-        path: &Path,
-        sample_rate: u32,
-        url: Option<String>,
-    ) -> std::io::Result<()> {
-        let file = self.track_file(id);
-        let mut tf = read_json::<TrackFile>(&file).unwrap_or_else(|| TrackFile {
-            version: VERSION,
-            id: id.into(),
-            path: relativize(path, &self.settings.music_dirs),
-            title: title.into(),
-            artist: artist.map(str::to_string),
-            sample_rate,
-            grid: None,
-            bpm: None,
-            quantize: None,
-            tempo: None,
-            cues: Vec::new(),
-            current_loop: None,
-            youtube_url: None,
-        });
-        tf.youtube_url = url;
-        fs::create_dir_all(file.parent().expect("track files live in a shard folder"))?;
         write_json(&file, &tf)
     }
 
@@ -600,26 +515,13 @@ impl Memory {
     /// `library_index::LibraryIndex` fallback finds a track `resolve`
     /// couldn't on its own (moved to a different subfolder of a music
     /// dir, say) — so every later lookup hits the cheap path again
-    /// instead of needing the index a second time. Same single-field-only
-    /// spirit as `set_youtube_url`; a no-op if there's no existing entry
-    /// for `id` (nothing to heal).
+    /// instead of needing the index a second time. A no-op if there's no
+    /// existing entry for `id` (nothing to heal).
     pub fn heal_path(&self, id: &str, new_path: &Path) -> std::io::Result<()> {
         let file = self.track_file(id);
         let Some(mut tf) = read_json::<TrackFile>(&file) else { return Ok(()) };
         tf.path = relativize(new_path, &self.settings.music_dirs);
         write_json(&file, &tf)
-    }
-
-    /// Removes `id`'s own entry — its cue/loop/grid memory and
-    /// `youtube_url`, nothing else: there is no audio file reachable from
-    /// here to delete, only the path it was last seen at. A no-op if
-    /// there's no entry for `id`.
-    pub fn forget_track(&self, id: &str) -> std::io::Result<()> {
-        match fs::remove_file(self.track_file(id)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 
     pub fn save_settings(&self) -> std::io::Result<()> {
@@ -915,49 +817,6 @@ mod tests {
     }
 
     #[test]
-    fn register_track_is_a_no_op_once_an_entry_exists() {
-        let mut m = memory("register");
-        let t = track("ab33", "/a");
-        m.register_track(&t).unwrap();
-        assert!(m.track_file("ab33").exists());
-        assert_eq!(m.get(&t), TrackMemory::default());
-
-        // An existing entry is left untouched, not reset to empty.
-        m.save_track(&t, &sample()).unwrap();
-        m.register_track(&t).unwrap();
-        assert_eq!(m.get(&t), sample());
-    }
-
-    #[test]
-    fn youtube_url_survives_an_unrelated_cue_save() {
-        let mut m = memory("youtube-url");
-        let t = track("ab44", "/music/a.mp3");
-        let base = sample();
-        m.save_track(&t, &base).unwrap();
-        m.set_youtube_url("ab44", "T", None, &t.path, 44_100, Some("https://youtu.be/x".into())).unwrap();
-        assert_eq!(m.youtube_url("ab44"), Some("https://youtu.be/x".into()));
-
-        // An unrelated cue-only change, saved the normal merged way,
-        // shouldn't clear the URL (the exact bug `TrackFile.youtube_url`'s
-        // doc comment describes).
-        let mut mine = base.clone();
-        mine.quantize = Some(true);
-        m.save_track_merged(&t, &base, &mine).unwrap();
-        assert_eq!(m.youtube_url("ab44"), Some("https://youtu.be/x".into()));
-        assert_eq!(m.get(&t).quantize, Some(true));
-    }
-
-    #[test]
-    fn set_youtube_url_creates_a_minimal_entry_for_a_track_never_loaded_this_session() {
-        let m = memory("youtube-url-new");
-        m.set_youtube_url("ab45", "Some Title", Some("Some Artist"), Path::new("/music/missing.mp3"), 44_100, Some("https://youtu.be/z".into())).unwrap();
-        assert_eq!(m.youtube_url("ab45"), Some("https://youtu.be/z".into()));
-        let tracks = m.tracks();
-        assert_eq!(tracks.len(), 1);
-        assert_eq!(tracks[0].title, "Some Title");
-    }
-
-    #[test]
     fn heal_path_updates_only_the_path() {
         let mut m = memory("heal-path");
         m.settings.music_dirs = vec![PathBuf::from("/music")];
@@ -976,25 +835,6 @@ mod tests {
         let m = memory("heal-path-missing");
         assert!(m.heal_path("ab51", Path::new("/music/wherever.mp3")).is_ok());
         assert!(!m.track_file("ab51").exists());
-    }
-
-    #[test]
-    fn forget_track_removes_only_the_metadata_file() {
-        let m = memory("forget-track");
-        let t = track("ab52", "/music/old/place.mp3");
-        m.save_track(&t, &sample()).unwrap();
-        assert!(m.track_file("ab52").exists());
-
-        m.forget_track("ab52").unwrap();
-
-        assert!(!m.track_file("ab52").exists());
-        assert!(m.tracks().is_empty());
-    }
-
-    #[test]
-    fn forget_track_is_a_no_op_without_an_existing_entry() {
-        let m = memory("forget-track-missing");
-        assert!(m.forget_track("ab53").is_ok());
     }
 
     #[test]
@@ -1045,15 +885,6 @@ mod tests {
         s.remember_recent(PathBuf::from("/music/a.mp3"), "A".into(), None);
         let paths: Vec<&Path> = s.recent_tracks.iter().map(|t| t.path.as_path()).collect();
         assert_eq!(paths, [Path::new("b.mp3"), Path::new("a.mp3")], "b, then a moved back to the top on reopening, deduped by the relative path");
-    }
-
-    #[test]
-    fn tracks_lists_each_ones_youtube_url() {
-        let m = memory("tracks-youtube-url");
-        let t = track("ab66", "/a");
-        m.save_track(&t, &sample()).unwrap();
-        m.set_youtube_url("ab66", "T", None, &t.path, 44_100, Some("https://youtu.be/y".into())).unwrap();
-        assert_eq!(m.tracks()[0].youtube_url, Some("https://youtu.be/y".into()));
     }
 
     #[test]

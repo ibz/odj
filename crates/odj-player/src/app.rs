@@ -791,7 +791,7 @@ impl App {
         let mut tags: HashMap<String, Vec<String>> = HashMap::new();
         for slug in &active_crates {
             let dir = crates::crates_root().join(slug);
-            for t in crates::list_tracks(&Crate::tracks_dir(&dir), music_dirs) {
+            for t in crates::list_tracks(&Crate::tracks_file(&dir), music_dirs) {
                 tags.entry(t.id.clone()).or_default().push(slug.clone());
                 if !tracks.iter().any(|existing| existing.id == t.id) {
                     tracks.push(t);
@@ -1018,7 +1018,7 @@ impl App {
             let Some(new_path) = found.iter().find_map(|(dir, index)| index.find(dir, &id)) else { continue };
             for slug in &active_crates {
                 let crate_dir = crates::crates_root().join(slug);
-                let _ = crates::heal_path(&Crate::tracks_dir(&crate_dir), &music_dirs, &id, &new_path);
+                let _ = crates::heal_path(&Crate::tracks_file(&crate_dir), &music_dirs, &id, &new_path);
             }
             self.crate_browser.update_track_path(&id, new_path.clone());
             self.crate_browser.checker.check(id, new_path);
@@ -2805,10 +2805,9 @@ mod tests {
             path: PathBuf::from("t.wav"),
             title: "t".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
-        crates::register_track(&Crate::tracks_dir(&crate_dir), &settings.music_dirs, &track).unwrap();
+        crates::register_track(&Crate::tracks_file(&crate_dir), &settings.music_dirs, &track).unwrap();
 
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -2832,13 +2831,12 @@ mod tests {
         let mut settings = odj_core::memory::load_settings();
         settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
-        let tracks_dir = Crate::tracks_dir(&crate_dir);
+        let tracks_dir = Crate::tracks_file(&crate_dir);
         let alpha = CrateTrack {
             id: "cafef00d00000000000000000000d00".to_string(),
             path: PathBuf::from("a.wav"),
             title: "Alpha".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
         crates::register_track(&tracks_dir, &settings.music_dirs, &alpha).unwrap();
@@ -2847,7 +2845,6 @@ mod tests {
             path: PathBuf::from("b.wav"),
             title: "Beta".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
         crates::register_track(&tracks_dir, &settings.music_dirs, &beta).unwrap();
@@ -2894,10 +2891,9 @@ mod tests {
             path: PathBuf::from("s.wav"),
             title: "Song".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
-        crates::register_track(&Crate::tracks_dir(&crate_dir), &settings.music_dirs, &track).unwrap();
+        crates::register_track(&Crate::tracks_file(&crate_dir), &settings.music_dirs, &track).unwrap();
 
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -2930,21 +2926,19 @@ mod tests {
             path: PathBuf::from("t.wav"),
             title: "Shared".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
-        crates::register_track(&Crate::tracks_dir(&a), &settings.music_dirs, &shared).unwrap();
-        crates::register_track(&Crate::tracks_dir(&b), &settings.music_dirs, &shared).unwrap();
+        crates::register_track(&Crate::tracks_file(&a), &settings.music_dirs, &shared).unwrap();
+        crates::register_track(&Crate::tracks_file(&b), &settings.music_dirs, &shared).unwrap();
 
         let only_a = CrateTrack {
             id: "ab00000000000000000000000000beef".to_string(),
             path: PathBuf::from("u.wav"),
             title: "Only A".to_string(),
             artist: None,
-            sample_rate: 48_000,
             youtube_url: None,
         };
-        crates::register_track(&Crate::tracks_dir(&a), &settings.music_dirs, &only_a).unwrap();
+        crates::register_track(&Crate::tracks_file(&a), &settings.music_dirs, &only_a).unwrap();
 
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mut app = App::new(deck, Browser::new(dir.clone()), true, AudioRoute::Direct(String::new()), Memory::load());
@@ -3211,13 +3205,12 @@ mod tests {
         settings.active_crates = vec!["crate".to_string()];
         odj_core::memory::save_settings(&settings).unwrap();
 
-        let tracks_dir = Crate::tracks_dir(&crate_dir);
+        let tracks_dir = Crate::tracks_file(&crate_dir);
         let track = CrateTrack {
             id: id.clone(),
             path: music.join("old-folder/track.wav"),
             title: "T".to_string(),
             artist: None,
-            sample_rate: 44_100,
             youtube_url: None,
         };
         crates::register_track(&tracks_dir, &settings.music_dirs, &track).unwrap();
@@ -3655,10 +3648,9 @@ mod tests {
             path: track.path.clone(),
             title: track.title.clone(),
             artist: track.artist.clone(),
-            sample_rate: track.sample_rate,
             youtube_url: None,
         };
-        crates::register_track(&Crate::tracks_dir(&crate_dir), &settings.music_dirs, &crate_track).unwrap();
+        crates::register_track(&Crate::tracks_file(&crate_dir), &settings.music_dirs, &crate_track).unwrap();
 
         let deck = Arc::new(Mutex::new(Deck::new(48_000)));
         let mem = TrackMemory { quantize: Some(false), ..TrackMemory::default() };

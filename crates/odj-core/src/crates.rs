@@ -1,12 +1,16 @@
 //! A "crate": a user-managed directory — typically also a git repo the user
 //! inits, commits and pushes entirely by hand — bundling a curated track
-//! roster ([`Crate::tracks_dir`], [`CrateTrack`]) and odj-sampler kits
+//! roster ([`Crate::tracks_file`], [`CrateTrack`]) and odj-sampler kits
 //! ([`Crate::kits_dir`]), including kit `.wav` files. The track audio itself
 //! never lives here, and neither does its DJ memory (cues, loops, grid,
 //! tempo) — that's always the global library's job (see
 //! `odj_core::memory::Memory`); a crate only ever records which tracks
 //! belong to it, keyed by the track's content id so renames/moves/retags
-//! never lose it. This module never touches git itself.
+//! never lose it. Unlike the global library (which shards one file per
+//! track, see `Memory`'s own doc comment), a crate's whole roster is one
+//! small, human-diffable `tracks.json` — a crate is a curated handful to
+//! a few hundred tracks, not tens of thousands, so there's no need for
+//! per-track files. This module never touches git itself.
 
 use std::fs;
 use std::io;
@@ -38,8 +42,10 @@ impl Crate {
         dir.join("crate.json")
     }
 
-    pub fn tracks_dir(dir: &Path) -> PathBuf {
-        dir.join("tracks")
+    /// Where this crate's whole track roster lives — one file, see
+    /// [`CrateTrack`] and the functions below.
+    pub fn tracks_file(dir: &Path) -> PathBuf {
+        dir.join("tracks.json")
     }
 
     pub fn kits_dir(dir: &Path) -> PathBuf {
@@ -64,9 +70,11 @@ impl Crate {
         Self { dir, name }
     }
 
-    /// Creates `tracks/`, `kits/` and `crate.json` under `dir`. Never runs git.
+    /// Creates `kits/` and `crate.json` under `dir`; `tracks.json` isn't
+    /// written until the first track is actually added (see
+    /// `register_track`) — an empty roster needs no file, same spirit as
+    /// the global library never writing a cue-less track. Never runs git.
     pub fn create(dir: PathBuf, name: &str) -> io::Result<Self> {
-        fs::create_dir_all(Self::tracks_dir(&dir))?;
         fs::create_dir_all(Self::kits_dir(&dir))?;
         write_json(&Self::manifest_file(&dir), &Manifest { version: MANIFEST_VERSION, name: name.to_string() })?;
         Ok(Self { dir, name: name.to_string() })
@@ -86,7 +94,7 @@ impl Crate {
     }
 }
 
-const TRACK_VERSION: u32 = 1;
+const TRACKS_FILE_VERSION: u32 = 1;
 
 /// One track referenced from a crate's own roster — just enough to find,
 /// show and play it. Never DJ memory (cues, loops, grid, tempo); that
@@ -104,87 +112,101 @@ pub struct CrateTrack {
     pub path: PathBuf,
     pub title: String,
     pub artist: Option<String>,
-    pub sample_rate: u32,
     /// Where to download the audio from if it's missing; see
     /// [`set_youtube_url`].
     pub youtube_url: Option<String>,
 }
 
-/// A crate roster entry's file, as `tracks/<id[..2]>/<id>.json` stores it
-/// (see [`track_entry_file`]) — mirrors `odj_core::memory`'s own
-/// `TrackFile`, minus everything about DJ memory a crate never carries.
-#[derive(Debug, Serialize, Deserialize)]
-struct TrackEntry {
+/// A crate's whole roster, as `tracks.json` stores it (see
+/// [`Crate::tracks_file`]) — a single small file, not sharded like the
+/// global library's own `TrackFile`: a crate is a curated handful to a
+/// few hundred tracks, so there's no need for per-track files, and one
+/// file is a far more reviewable `git diff` for something hand-managed.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TracksFile {
     version: u32,
+    #[serde(default)]
+    tracks: Vec<TrackEntry>,
+}
+
+/// One roster entry — `id`/`path` are this track's identity and where to
+/// find it; `youtube_url` isn't under `properties` since it's really
+/// about *how this copy got here* rather than a property of the track
+/// itself (two crates could reasonably record different URLs, or none,
+/// for the exact same audio). Everything purely descriptive lives in
+/// `properties` instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TrackEntry {
     id: String,
     path: PathBuf,
-    title: String,
-    artist: Option<String>,
-    sample_rate: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     youtube_url: Option<String>,
+    properties: Properties,
 }
 
-/// Sharded the same way the global library's own tracks are (see
-/// `odj_core::memory::Memory`'s private `track_file`), by the track's
-/// content id, so a crate's roster scales past a flat directory and
-/// survives the track's title/path changing.
-fn track_entry_file(tracks_dir: &Path, id: &str) -> PathBuf {
-    tracks_dir.join(&id[..2]).join(format!("{id}.json"))
+/// Purely descriptive metadata about a track — deliberately not
+/// `odj_core::memory`'s own `TrackMemory`/DJ memory, which a crate never
+/// carries (see `CrateTrack`'s own doc comment).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Properties {
+    title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artist: Option<String>,
 }
 
-/// Every track in `tracks_dir` (a crate's own, see [`Crate::tracks_dir`]),
-/// each path resolved against `music_dirs` — mirrors
-/// `odj_core::memory::Memory::tracks`, unreadable files skipped the same way.
-pub fn list_tracks(tracks_dir: &Path, music_dirs: &[PathBuf]) -> Vec<CrateTrack> {
-    let Ok(shards) = fs::read_dir(tracks_dir) else { return Vec::new() };
-    shards
-        .flatten()
-        .filter_map(|shard| fs::read_dir(shard.path()).ok())
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|file| file.extension().is_some_and(|e| e == "json"))
-        .filter_map(|file| read_json::<TrackEntry>(&file))
+fn read_tracks_file(file: &Path) -> TracksFile {
+    read_json(file).unwrap_or_default()
+}
+
+fn write_tracks_file(file: &Path, tracks: TracksFile) -> io::Result<()> {
+    fs::create_dir_all(file.parent().expect("a crate's tracks.json lives directly under its own directory"))?;
+    write_json(file, &tracks)
+}
+
+fn entry_for(track: &CrateTrack, music_dirs: &[PathBuf]) -> TrackEntry {
+    TrackEntry {
+        id: track.id.clone(),
+        path: relativize(&track.path, music_dirs),
+        youtube_url: track.youtube_url.clone(),
+        properties: Properties { title: track.title.clone(), artist: track.artist.clone() },
+    }
+}
+
+/// Every track in `tracks_file` (a crate's own, see
+/// [`Crate::tracks_file`]), each path resolved against `music_dirs` —
+/// mirrors `odj_core::memory::Memory::tracks`. `tracks_file` not
+/// existing yet (an empty roster) is just an empty list, not an error.
+pub fn list_tracks(tracks_file: &Path, music_dirs: &[PathBuf]) -> Vec<CrateTrack> {
+    read_tracks_file(tracks_file)
+        .tracks
+        .into_iter()
         .map(|e| CrateTrack {
             id: e.id,
             path: resolve(&e.path, music_dirs),
-            title: e.title,
-            artist: e.artist,
-            sample_rate: e.sample_rate,
+            title: e.properties.title,
+            artist: e.properties.artist,
             youtube_url: e.youtube_url,
         })
         .collect()
 }
 
-/// Adds `track` to the roster if its id isn't there yet — a no-op (not
-/// even a file touch) if it already is, same as
-/// `odj_core::memory::Memory::register_track`.
-pub fn register_track(tracks_dir: &Path, music_dirs: &[PathBuf], track: &CrateTrack) -> io::Result<()> {
+/// Adds `track` to the roster if its id isn't there yet — a no-op if it
+/// already is, same as `odj_core::memory::Memory::register_track`.
+pub fn register_track(tracks_file: &Path, music_dirs: &[PathBuf], track: &CrateTrack) -> io::Result<()> {
     if track.id.is_empty() {
         return Ok(());
     }
-    let file = track_entry_file(tracks_dir, &track.id);
-    if file.exists() {
+    let mut file = read_tracks_file(tracks_file);
+    if file.tracks.iter().any(|e| e.id == track.id) {
         return Ok(());
     }
-    fs::create_dir_all(file.parent().expect("roster entries live in a shard folder"))?;
-    write_json(
-        &file,
-        &TrackEntry {
-            version: TRACK_VERSION,
-            id: track.id.clone(),
-            path: relativize(&track.path, music_dirs),
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            sample_rate: track.sample_rate,
-            youtube_url: None,
-        },
-    )
+    file.version = TRACKS_FILE_VERSION;
+    file.tracks.push(entry_for(track, music_dirs));
+    write_tracks_file(tracks_file, file)
 }
 
-pub fn youtube_url(tracks_dir: &Path, id: &str) -> Option<String> {
-    read_json::<TrackEntry>(&track_entry_file(tracks_dir, id)).and_then(|e| e.youtube_url)
+pub fn youtube_url(tracks_file: &Path, id: &str) -> Option<String> {
+    read_tracks_file(tracks_file).tracks.into_iter().find(|e| e.id == id).and_then(|e| e.youtube_url)
 }
 
 /// Sets/clears the YouTube URL for `id`, creating a minimal entry from
@@ -193,41 +215,41 @@ pub fn youtube_url(tracks_dir: &Path, id: &str) -> Option<String> {
 /// itself. Everything else about an existing entry is left untouched
 /// (an existing entry's own title/path/etc. win over `track`'s, which
 /// may just be a search result's best guess).
-pub fn set_youtube_url(tracks_dir: &Path, music_dirs: &[PathBuf], track: &CrateTrack, url: Option<String>) -> io::Result<()> {
-    let file = track_entry_file(tracks_dir, &track.id);
-    let mut entry = read_json::<TrackEntry>(&file).unwrap_or_else(|| TrackEntry {
-        version: TRACK_VERSION,
-        id: track.id.clone(),
-        path: relativize(&track.path, music_dirs),
-        title: track.title.clone(),
-        artist: track.artist.clone(),
-        sample_rate: track.sample_rate,
-        youtube_url: None,
-    });
-    entry.youtube_url = url;
-    fs::create_dir_all(file.parent().expect("roster entries live in a shard folder"))?;
-    write_json(&file, &entry)
+pub fn set_youtube_url(tracks_file: &Path, music_dirs: &[PathBuf], track: &CrateTrack, url: Option<String>) -> io::Result<()> {
+    let mut file = read_tracks_file(tracks_file);
+    match file.tracks.iter_mut().find(|e| e.id == track.id) {
+        Some(entry) => entry.youtube_url = url,
+        None => {
+            let mut entry = entry_for(track, music_dirs);
+            entry.youtube_url = url;
+            file.tracks.push(entry);
+        }
+    }
+    file.version = TRACKS_FILE_VERSION;
+    write_tracks_file(tracks_file, file)
 }
 
 /// Rewrites just `path` for `id` — the self-healing step once a
 /// `library_index::LibraryIndex` fallback finds a track `resolve`
 /// couldn't on its own. A no-op if there's no existing entry for `id`.
-pub fn heal_path(tracks_dir: &Path, music_dirs: &[PathBuf], id: &str, new_path: &Path) -> io::Result<()> {
-    let file = track_entry_file(tracks_dir, id);
-    let Some(mut entry) = read_json::<TrackEntry>(&file) else { return Ok(()) };
+pub fn heal_path(tracks_file: &Path, music_dirs: &[PathBuf], id: &str, new_path: &Path) -> io::Result<()> {
+    let mut file = read_tracks_file(tracks_file);
+    let Some(entry) = file.tracks.iter_mut().find(|e| e.id == id) else { return Ok(()) };
     entry.path = relativize(new_path, music_dirs);
-    write_json(&file, &entry)
+    write_tracks_file(tracks_file, file)
 }
 
 /// Removes `id`'s own roster entry. There is no audio file reachable
 /// from here to delete, only the path it was last seen at. A no-op if
 /// there's no entry for `id`.
-pub fn forget_track(tracks_dir: &Path, id: &str) -> io::Result<()> {
-    match fs::remove_file(track_entry_file(tracks_dir, id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+pub fn forget_track(tracks_file: &Path, id: &str) -> io::Result<()> {
+    let mut file = read_tracks_file(tracks_file);
+    let before = file.tracks.len();
+    file.tracks.retain(|e| e.id != id);
+    if file.tracks.len() == before {
+        return Ok(());
     }
+    write_tracks_file(tracks_file, file)
 }
 
 /// The one folder every crate lives under — fixed, not user-configurable,
@@ -245,7 +267,7 @@ pub fn list_crates() -> Vec<Crate> {
     let mut crates: Vec<Crate> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|dir| dir.is_dir() && (Crate::manifest_file(dir).is_file() || Crate::tracks_dir(dir).is_dir()))
+        .filter(|dir| dir.is_dir() && (Crate::manifest_file(dir).is_file() || Crate::tracks_file(dir).is_file()))
         .map(Crate::load)
         .collect();
     crates.sort_by_key(|c| c.name.to_lowercase());
@@ -364,7 +386,7 @@ mod tests {
     fn create_round_trips_through_load() {
         let dir = temp_dir("create");
         Crate::create(dir.clone(), "My Set").unwrap();
-        assert!(Crate::tracks_dir(&dir).is_dir());
+        assert!(!Crate::tracks_file(&dir).exists(), "no tracks.json until a track is actually added");
         assert!(Crate::kits_dir(&dir).is_dir());
         let loaded = Crate::load(dir.clone());
         assert_eq!(loaded.name, "My Set");
@@ -402,115 +424,137 @@ mod tests {
     }
 
     fn crate_track(id: &str, path: &str) -> CrateTrack {
-        CrateTrack { id: id.into(), path: path.into(), title: "T".into(), artist: None, sample_rate: 44_100, youtube_url: None }
+        CrateTrack { id: id.into(), path: path.into(), title: "T".into(), artist: None, youtube_url: None }
     }
 
     #[test]
     fn register_track_round_trips_through_list_tracks() {
-        let dir = temp_dir("register-roundtrip");
-        register_track(&dir, &[], &crate_track("ab00", "/music/a.flac")).unwrap();
-        let tracks = list_tracks(&dir, &[]);
+        let file = temp_dir("register-roundtrip").join("tracks.json");
+        register_track(&file, &[], &crate_track("ab00", "/music/a.flac")).unwrap();
+        let tracks = list_tracks(&file, &[]);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].id, "ab00");
         assert_eq!(tracks[0].path, PathBuf::from("/music/a.flac"));
-        assert_eq!(tracks[0].sample_rate, 44_100);
+    }
+
+    #[test]
+    fn several_tracks_land_in_one_file_shaped_as_id_path_properties() {
+        let dir = temp_dir("single-file");
+        let file = Crate::tracks_file(&dir);
+        register_track(&file, &[], &crate_track("ab00", "/a.flac")).unwrap();
+        register_track(&file, &[], &crate_track("ab01", "/b.flac")).unwrap();
+        set_youtube_url(&file, &[], &crate_track("ab01", "/b.flac"), Some("https://youtu.be/x".into())).unwrap();
+
+        // One file for the whole roster, not a directory of them — and
+        // no old-style `tracks/` shard folder alongside it either.
+        assert!(file.is_file());
+        assert!(!dir.join("tracks").exists());
+
+        let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(json["tracks"].as_array().unwrap().len(), 2);
+        let first = &json["tracks"][0];
+        assert_eq!(first["id"], "ab00");
+        assert_eq!(first["path"], "/a.flac");
+        assert_eq!(first["properties"]["title"], "T");
+        assert!(first.get("youtube_url").is_none(), "omitted, not null, when absent: {json}");
+        assert_eq!(json["tracks"][1]["youtube_url"], "https://youtu.be/x");
     }
 
     #[test]
     fn register_track_is_a_no_op_once_an_entry_exists() {
-        let dir = temp_dir("register-no-op");
-        register_track(&dir, &[], &crate_track("ab01", "/a")).unwrap();
+        let file = temp_dir("register-no-op").join("tracks.json");
+        register_track(&file, &[], &crate_track("ab01", "/a")).unwrap();
         // A second registration under the same id, different title, must
         // not clobber the first — same "already there, leave it" contract
         // as the global library's own `register_track`.
         let mut changed = crate_track("ab01", "/a");
         changed.title = "Different".into();
-        register_track(&dir, &[], &changed).unwrap();
-        assert_eq!(list_tracks(&dir, &[])[0].title, "T");
+        register_track(&file, &[], &changed).unwrap();
+        assert_eq!(list_tracks(&file, &[])[0].title, "T");
     }
 
     #[test]
     fn register_track_stores_a_path_relative_to_its_music_dir() {
-        let dir = temp_dir("register-relative");
+        let file = temp_dir("register-relative").join("tracks.json");
         let music_dirs = [PathBuf::from("/music")];
-        register_track(&dir, &music_dirs, &crate_track("ab02", "/music/sub/track.mp3")).unwrap();
+        register_track(&file, &music_dirs, &crate_track("ab02", "/music/sub/track.mp3")).unwrap();
 
-        let raw = read_json::<TrackEntry>(&track_entry_file(&dir, "ab02")).unwrap();
-        assert_eq!(raw.path, PathBuf::from("sub/track.mp3"));
+        let raw = read_json::<TracksFile>(&file).unwrap();
+        assert_eq!(raw.tracks[0].path, PathBuf::from("sub/track.mp3"));
 
         // ...and listing it back resolves it to the absolute path again.
-        assert_eq!(list_tracks(&dir, &music_dirs)[0].path, PathBuf::from("/music/sub/track.mp3"));
+        assert_eq!(list_tracks(&file, &music_dirs)[0].path, PathBuf::from("/music/sub/track.mp3"));
     }
 
     #[test]
     fn set_youtube_url_preserves_an_existing_entrys_own_fields() {
-        let dir = temp_dir("youtube-url-preserve");
-        register_track(&dir, &[], &crate_track("ab03", "/a")).unwrap();
+        let file = temp_dir("youtube-url-preserve").join("tracks.json");
+        register_track(&file, &[], &crate_track("ab03", "/a")).unwrap();
 
         // A later call with different (e.g. stale search-result) title/path
         // must not overwrite the entry already on disk — only the URL.
         let mut stale = crate_track("ab03", "/elsewhere");
         stale.title = "Stale Title".into();
-        set_youtube_url(&dir, &[], &stale, Some("https://youtu.be/x".into())).unwrap();
+        set_youtube_url(&file, &[], &stale, Some("https://youtu.be/x".into())).unwrap();
 
-        let tracks = list_tracks(&dir, &[]);
+        let tracks = list_tracks(&file, &[]);
         assert_eq!(tracks[0].title, "T", "existing title wins over the stale one passed in");
         assert_eq!(tracks[0].path, PathBuf::from("/a"), "existing path wins too");
         assert_eq!(tracks[0].youtube_url, Some("https://youtu.be/x".into()));
-        assert_eq!(youtube_url(&dir, "ab03"), Some("https://youtu.be/x".into()));
+        assert_eq!(youtube_url(&file, "ab03"), Some("https://youtu.be/x".into()));
     }
 
     #[test]
     fn set_youtube_url_creates_a_minimal_entry_for_a_track_never_registered() {
-        let dir = temp_dir("youtube-url-new");
+        let file = temp_dir("youtube-url-new").join("tracks.json");
         let track = crate_track("ab04", "/music/missing.mp3");
-        set_youtube_url(&dir, &[], &track, Some("https://youtu.be/z".into())).unwrap();
-        assert_eq!(youtube_url(&dir, "ab04"), Some("https://youtu.be/z".into()));
-        assert_eq!(list_tracks(&dir, &[])[0].title, "T");
+        set_youtube_url(&file, &[], &track, Some("https://youtu.be/z".into())).unwrap();
+        assert_eq!(youtube_url(&file, "ab04"), Some("https://youtu.be/z".into()));
+        assert_eq!(list_tracks(&file, &[])[0].title, "T");
     }
 
     #[test]
     fn heal_path_updates_only_the_path() {
-        let dir = temp_dir("heal-path");
+        let file = temp_dir("heal-path").join("tracks.json");
         let music_dirs = [PathBuf::from("/music")];
-        register_track(&dir, &music_dirs, &crate_track("ab05", "/music/old/place.mp3")).unwrap();
+        register_track(&file, &music_dirs, &crate_track("ab05", "/music/old/place.mp3")).unwrap();
 
-        heal_path(&dir, &music_dirs, "ab05", Path::new("/music/new/place.mp3")).unwrap();
+        heal_path(&file, &music_dirs, "ab05", Path::new("/music/new/place.mp3")).unwrap();
 
-        let raw = read_json::<TrackEntry>(&track_entry_file(&dir, "ab05")).unwrap();
-        assert_eq!(raw.path, PathBuf::from("new/place.mp3"), "relativized, same as a fresh registration");
-        assert_eq!(list_tracks(&dir, &music_dirs)[0].title, "T", "everything else untouched");
+        let raw = read_json::<TracksFile>(&file).unwrap();
+        assert_eq!(raw.tracks[0].path, PathBuf::from("new/place.mp3"), "relativized, same as a fresh registration");
+        assert_eq!(list_tracks(&file, &music_dirs)[0].title, "T", "everything else untouched");
     }
 
     #[test]
     fn heal_path_is_a_no_op_without_an_existing_entry() {
-        let dir = temp_dir("heal-path-missing");
-        assert!(heal_path(&dir, &[], "ab06", Path::new("/wherever.mp3")).is_ok());
-        assert!(!track_entry_file(&dir, "ab06").exists());
+        let file = temp_dir("heal-path-missing").join("tracks.json");
+        assert!(heal_path(&file, &[], "ab06", Path::new("/wherever.mp3")).is_ok());
+        assert!(!file.exists());
     }
 
     #[test]
     fn forget_track_removes_only_that_entry() {
-        let dir = temp_dir("forget-track");
-        register_track(&dir, &[], &crate_track("ab07", "/a")).unwrap();
-        register_track(&dir, &[], &crate_track("ab08", "/b")).unwrap();
+        let file = temp_dir("forget-track").join("tracks.json");
+        register_track(&file, &[], &crate_track("ab07", "/a")).unwrap();
+        register_track(&file, &[], &crate_track("ab08", "/b")).unwrap();
 
-        forget_track(&dir, "ab07").unwrap();
+        forget_track(&file, "ab07").unwrap();
 
-        assert_eq!(list_tracks(&dir, &[]).len(), 1);
-        assert_eq!(list_tracks(&dir, &[])[0].id, "ab08");
+        assert_eq!(list_tracks(&file, &[]).len(), 1);
+        assert_eq!(list_tracks(&file, &[])[0].id, "ab08");
     }
 
     #[test]
     fn forget_track_is_a_no_op_without_an_existing_entry() {
-        let dir = temp_dir("forget-track-missing");
-        assert!(forget_track(&dir, "ab09").is_ok());
+        let file = temp_dir("forget-track-missing").join("tracks.json");
+        assert!(forget_track(&file, "ab09").is_ok());
     }
 
     #[test]
-    fn list_tracks_is_empty_without_a_tracks_dir() {
-        let dir = temp_dir("list-missing");
-        assert!(list_tracks(&dir, &[]).is_empty());
+    fn list_tracks_is_empty_without_a_tracks_file() {
+        let file = temp_dir("list-missing").join("tracks.json");
+        assert!(list_tracks(&file, &[]).is_empty());
     }
 
     #[test]

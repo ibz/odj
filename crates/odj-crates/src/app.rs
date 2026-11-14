@@ -90,7 +90,7 @@ impl CrateDetail {
     fn load(dir: PathBuf) -> Self {
         let name = Crate::load(dir.clone()).name;
         let music_dirs = memory::load_settings().music_dirs;
-        let tracks = crates::list_tracks(&Crate::tracks_dir(&dir), &music_dirs);
+        let tracks = crates::list_tracks(&Crate::tracks_file(&dir), &music_dirs);
         let checker = AvailabilityChecker::new();
         for t in &tracks {
             checker.check(t.id.clone(), t.path.clone());
@@ -204,7 +204,7 @@ impl BatchAdder {
                 }
             }
             let total = files.len();
-            let tracks_dir = Crate::tracks_dir(&crate_dir);
+            let tracks_dir = Crate::tracks_file(&crate_dir);
             let music_dirs = memory::load_settings().music_dirs;
             let (mut added, mut failed) = (0, 0);
             for (i, path) in files.iter().enumerate() {
@@ -236,7 +236,7 @@ fn register_file(tracks_dir: &Path, music_dirs: &[PathBuf], path: &Path) -> anyh
 }
 
 fn crate_track_for(path: &Path, d: track::Decoded) -> CrateTrack {
-    CrateTrack { id: d.id, path: path.to_path_buf(), title: d.title, artist: d.artist, sample_rate: d.sample_rate, youtube_url: None }
+    CrateTrack { id: d.id, path: path.to_path_buf(), title: d.title, artist: d.artist, youtube_url: None }
 }
 
 /// Search/queue/download, nested under whichever crate opened it — the
@@ -392,7 +392,7 @@ impl Download {
             Err(e) => return format!("Downloaded {title}, but could not read it: {e}"),
         };
         let t = crate_track_for(path, d);
-        let tracks_dir = Crate::tracks_dir(&self.crate_dir);
+        let tracks_dir = Crate::tracks_file(&self.crate_dir);
         let music_dirs = memory::load_settings().music_dirs;
         if let Err(e) = crates::register_track(&tracks_dir, &music_dirs, &t) {
             return format!("Downloaded {title}, but could not register it: {e}");
@@ -685,7 +685,7 @@ impl App {
     fn create_named_crate(&mut self, name: &str) {
         let root = crates::crates_root();
         let candidate = root.join(crates::slugify(name));
-        let already_a_crate = Crate::manifest_file(&candidate).is_file() || Crate::tracks_dir(&candidate).is_dir();
+        let already_a_crate = Crate::manifest_file(&candidate).is_file() || Crate::tracks_file(&candidate).is_file();
         let (dir, result) = if already_a_crate {
             (candidate.clone(), Ok(()))
         } else {
@@ -741,7 +741,7 @@ impl App {
         }
         c.pending_delete = None;
         let dir = c.dir.clone();
-        let result = crates::forget_track(&Crate::tracks_dir(&dir), &id);
+        let result = crates::forget_track(&Crate::tracks_file(&dir), &id);
         let Screen::Crate(c) = &mut self.screen else { return };
         match result {
             Ok(()) => {

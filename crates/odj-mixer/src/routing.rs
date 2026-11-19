@@ -45,6 +45,30 @@ impl Param {
 /// rows, not a dynamically sized list; see `record_mode.rs`.
 pub(crate) const TRACKS: usize = 8;
 
+/// How long a VU meter (see `MixedInput::level`) takes to fall back
+/// toward silence once the audio driving it stops or drops — picked
+/// for a readable, not-too-twitchy terminal display, not against any
+/// real VU/PPM ballistics standard.
+const METER_RELEASE_SECS: f32 = 0.3;
+/// How far one [`METER_RELEASE_SECS`] of continuous silence actually
+/// brings a level down — not all the way to `0.0` in a single step,
+/// which would read as an abrupt cutoff rather than a visible decay;
+/// see [`decay_level`] for the formula this feeds.
+const METER_RELEASE_FLOOR: f32 = 0.05;
+
+/// Updates a level meter's own decaying peak: jumps straight up to
+/// `block_peak` if that's louder than what's decayed to since the
+/// last call, otherwise keeps falling at [`METER_RELEASE_SECS`]'s own
+/// rate. Computed from elapsed real time (`frames`/`rate`), not a
+/// fixed per-call multiplier, so the meter's fall speed stays the same
+/// regardless of how often `render` actually gets called — which
+/// varies with `Routing`'s own configurable buffer size.
+fn decay_level(previous: f32, block_peak: f32, frames: usize, rate: u32) -> f32 {
+    let elapsed = frames as f32 / rate as f32;
+    let decayed = previous * METER_RELEASE_FLOOR.powf(elapsed / METER_RELEASE_SECS);
+    decayed.max(block_peak)
+}
+
 /// Sums every input routed to one output's captured audio, each run
 /// through its own Volume + 3-band EQ first — `odj_core::filter::
 /// ThreeBandEq`, the same DSP odj-player's own Mixer used to apply
@@ -79,6 +103,13 @@ pub(crate) struct MixedSource {
     /// `search`) is nonzero — `None` for a track that's muted or not
     /// currently armed to Play.
     play_tracks: [Option<PlayTrack>; TRACKS],
+    /// This output's own negotiated sample rate — needed to time each
+    /// input's own [`MixedInput::level`] decay in real seconds rather
+    /// than in render calls (see [`decay_level`]). Every routed input
+    /// runs at the same rate in practice (see `Routing::try_set_route`'s
+    /// own doc comment on why), so one shared value here is enough —
+    /// no need to track it per input.
+    rate: u32,
 }
 
 /// A record-mode track armed to Play: its whole recording, decoded
@@ -111,10 +142,17 @@ struct MixedInput {
     /// mixer screen silently muted by a decision made on a different
     /// screen.
     muted: bool,
+    /// This input's own post-EQ, post-volume VU-meter level — the
+    /// exact same value the mix itself just added into `out` (see
+    /// `render`'s own per-frame loop), peak-held and decaying rather
+    /// than a bare instantaneous reading, so sampling it from `ui.rs`'s
+    /// own ~100ms-tick polling loop never catches it artificially low
+    /// between loud blocks. See [`decay_level`] for the ballistics.
+    level: f32,
 }
 
 impl MixedSource {
-    fn new() -> Self {
+    fn new(rate: u32) -> Self {
         Self {
             inputs: HashMap::new(),
             scratch: Vec::new(),
@@ -124,6 +162,7 @@ impl MixedSource {
             running: false,
             search: 0.0,
             play_tracks: std::array::from_fn(|_| None),
+            rate,
         }
     }
 
@@ -158,6 +197,12 @@ impl MixedSource {
         self.inputs.get(key).is_some_and(|i| i.muted)
     }
 
+    /// `key`'s current VU-meter level — `0.0` if it isn't currently
+    /// mixed in (same "nothing to read" default `get` already uses).
+    pub(crate) fn input_level(&self, key: &DeviceKey) -> f32 {
+        self.inputs.get(key).map_or(0.0, |i| i.level)
+    }
+
     pub(crate) fn set_play_track(&mut self, slot: usize, track: Option<PlayTrack>) {
         self.play_tracks[slot] = track;
     }
@@ -190,7 +235,10 @@ impl MixedSource {
     }
 
     fn insert(&mut self, key: DeviceKey, cons: ringbuf::HeapCons<f32>, rate: u32) {
-        self.inputs.insert(key, MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false });
+        self.inputs.insert(
+            key,
+            MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false, level: 0.0 },
+        );
     }
 
     fn remove(&mut self, key: &DeviceKey) {
@@ -231,6 +279,7 @@ impl Source for MixedSource {
         }
         let scratch = &mut self.scratch[..out.len()];
         let (l, r) = (&mut self.scratch_l[..frames], &mut self.scratch_r[..frames]);
+        let rate = self.rate;
         for input in self.inputs.values_mut() {
             let got = input.cons.pop_slice(scratch);
             scratch[got..].fill(0.0); // underrun: silence rather than stale samples
@@ -245,8 +294,10 @@ impl Source for MixedSource {
             // capture tap should see (the next input's own `pop_slice`
             // overwrites it again before any of this is read a second
             // time).
+            let mut block_peak = 0.0f32;
             for i in 0..frames {
                 let (ls, rs) = (l[i] * input.volume, r[i] * input.volume);
+                block_peak = block_peak.max(ls.abs()).max(rs.abs());
                 // `muted` only ever suppresses the final mix — the
                 // capture tap below still sees this input's own
                 // contribution regardless, so arming a track to
@@ -261,6 +312,7 @@ impl Source for MixedSource {
                     scratch[i * 2 + 1] = rs;
                 }
             }
+            input.level = decay_level(input.level, block_peak, frames, rate);
             if let Some(tap) = &mut input.tap {
                 tap.push_slice(scratch);
             }
@@ -519,7 +571,7 @@ impl Routing {
             let host = audio::host();
             let out = audio::Output::open(&host, &cards, &choice)?;
             let rate = out.sample_rate();
-            let mixed = Arc::new(Mutex::new(MixedSource::new()));
+            let mixed = Arc::new(Mutex::new(MixedSource::new(rate)));
             let stream = out.start(mixed.clone(), self.buffer_frames)?;
             if let Err(e) = audio::verify_route(&host, &out) {
                 drop(stream);
@@ -637,6 +689,16 @@ impl Routing {
         o.mixed.lock().unwrap_or_else(|e| e.into_inner()).is_input_muted(input)
     }
 
+    /// `input`'s current VU-meter level — its post-EQ, post-volume
+    /// signal strength, decaying smoothly rather than a bare
+    /// instantaneous reading (see `MixedInput::level`'s own doc
+    /// comment) — `0.0` if it isn't routed anywhere right now.
+    pub fn input_level(&self, input: &DeviceKey) -> f32 {
+        let Some(r) = self.inputs.get(input) else { return 0.0 };
+        let Some(o) = self.outputs.get(&r.output) else { return 0.0 };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).input_level(input)
+    }
+
     /// Installs (`Some`) or clears (`None`) record-mode track `slot`'s
     /// decoded playback buffer on whichever output is currently main.
     /// `false` under the same condition as
@@ -733,7 +795,7 @@ mod tests {
         let (mut p2, c2) = input(8);
         p1.push_slice(&[0.2, 0.3]);
         p2.push_slice(&[0.1, -0.1]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.insert(key("B"), c2, RATE);
         let mut out = [0.0f32; 2];
@@ -748,7 +810,7 @@ mod tests {
         let (mut p2, c2) = input(8);
         p1.push_slice(&[1.0, 1.0]);
         p2.push_slice(&[1.0, 1.0]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.insert(key("B"), c2, RATE);
         mixed.set(&key("A"), Param::Volume, 0.5);
@@ -760,11 +822,59 @@ mod tests {
     }
 
     #[test]
+    fn mixed_source_input_level_reflects_the_post_eq_post_volume_peak() {
+        let (mut p, c) = input(8);
+        p.push_slice(&[1.0, -1.0]); // one full-scale frame
+        let mut mixed = MixedSource::new(RATE);
+        mixed.insert(key("A"), c, RATE);
+        mixed.set(&key("A"), Param::Volume, 0.5);
+        let mut out = [0.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        assert!((mixed.input_level(&key("A")) - 0.5).abs() < 1e-4, "{}", mixed.input_level(&key("A")));
+    }
+
+    #[test]
+    fn mixed_source_input_level_decays_toward_silence_rather_than_dropping_instantly() {
+        let (mut p, c) = input(4096);
+        p.push_slice(&[1.0, 1.0]); // one loud frame, full volume
+        let mut mixed = MixedSource::new(RATE);
+        mixed.insert(key("A"), c, RATE);
+        // 0.1s blocks — big enough that decay (released over ~0.3s,
+        // see `METER_RELEASE_SECS`) is visible within a handful of
+        // calls rather than needing thousands of tiny ones. The one
+        // real sample pushed above sits somewhere in this first
+        // block's own underrun-silence tail — `render`'s own
+        // whole-block peak still picks it up regardless of where.
+        let frames = (RATE / 10) as usize;
+        let mut out = vec![0.0f32; frames * 2];
+        mixed.render(&mut out, 0.0); // level jumps up to ~1.0
+        let peak = mixed.input_level(&key("A"));
+        assert!(peak > 0.9, "{peak}");
+        // Every further block is silence (consumer's empty by now) —
+        // the level should keep falling, not stay pinned at its peak,
+        // but also not vanish in a single call.
+        mixed.render(&mut out, 0.0);
+        let after_one_block = mixed.input_level(&key("A"));
+        assert!(after_one_block < peak, "{after_one_block} should have fallen from {peak}");
+        assert!(after_one_block > 0.0, "shouldn't cut straight to silence in one block");
+        for _ in 0..20 {
+            mixed.render(&mut out, 0.0);
+        }
+        assert!(mixed.input_level(&key("A")) < 0.01, "{}", mixed.input_level(&key("A")));
+    }
+
+    #[test]
+    fn mixed_source_input_level_is_zero_for_an_unrouted_key() {
+        let mixed = MixedSource::new(RATE);
+        assert_eq!(mixed.input_level(&key("Gone")), 0.0);
+    }
+
+    #[test]
     fn mixed_source_silences_an_empty_or_underrun_consumer() {
         let (mut p1, c1) = input(8);
         let (_p2, c2) = input(8); // never fed: stays empty
         p1.push_slice(&[0.5]); // only one frame's worth of L — R underruns
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.insert(key("B"), c2, RATE);
         let mut out = [1.0f32; 2]; // non-zero, so a bug wouldn't hide as a false pass
@@ -776,7 +886,7 @@ mod tests {
     #[test]
     fn set_volume_clamps_to_0_1() {
         let (_p, c1) = input(8);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.set(&key("A"), Param::Volume, 1.5);
         assert_eq!(mixed.get(&key("A"), Param::Volume), 1.0);
@@ -787,7 +897,7 @@ mod tests {
     #[test]
     fn eq_bands_are_independently_adjustable_and_default_flat() {
         let (_p, c1) = input(8);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         assert_eq!((mixed.get(&key("A"), Param::Low), mixed.get(&key("A"), Param::Mid), mixed.get(&key("A"), Param::High)), (0.0, 0.0, 0.0));
         mixed.set(&key("A"), Param::Low, 3.0);
@@ -797,7 +907,7 @@ mod tests {
 
     #[test]
     fn get_of_an_unrouted_input_is_the_neutral_default() {
-        let mixed = MixedSource::new();
+        let mixed = MixedSource::new(RATE);
         assert_eq!(mixed.get(&key("Gone"), Param::Volume), 1.0);
         assert_eq!(mixed.get(&key("Gone"), Param::Low), 0.0);
     }
@@ -845,7 +955,7 @@ mod tests {
     fn mixed_source_pushes_an_inputs_post_eq_post_volume_contribution_into_its_own_tap() {
         let (mut p1, c1) = input(8);
         p1.push_slice(&[1.0, 1.0]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.set(&key("A"), Param::Volume, 0.5);
         let (tap_prod, mut tap_cons) = input(8);
@@ -866,7 +976,7 @@ mod tests {
         let (mut p2, c2) = input(8);
         p1.push_slice(&[0.2, 0.3]);
         p2.push_slice(&[0.4, 0.5]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.insert(key("B"), c2, RATE);
         let (tap_prod, mut tap_cons) = input(8);
@@ -881,7 +991,7 @@ mod tests {
     #[test]
     fn mixed_source_input_tap_drops_rather_than_blocking_on_overrun() {
         let (_p, c1) = input(8);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         let (tap_prod, tap_cons) = input(4); // smaller than what gets pushed below
         mixed.set_input_tap(&key("A"), Some(tap_prod));
@@ -896,7 +1006,7 @@ mod tests {
 
     #[test]
     fn set_input_tap_is_a_no_op_for_an_unrouted_key() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         let (prod, _cons) = input(8);
         assert!(!mixed.set_input_tap(&key("Gone"), Some(prod)));
     }
@@ -912,7 +1022,7 @@ mod tests {
     fn mixed_source_muted_input_is_silent_but_still_pushes_to_its_own_tap() {
         let (mut p1, c1) = input(8);
         p1.push_slice(&[0.5, 0.5]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         let (tap_prod, mut tap_cons) = input(8);
         mixed.set_input_tap(&key("A"), Some(tap_prod));
@@ -931,7 +1041,7 @@ mod tests {
     fn mixed_source_unmuting_an_input_restores_its_contribution() {
         let (mut p1, c1) = input(8);
         p1.push_slice(&[0.5, 0.5]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.set_input_muted(&key("A"), true);
         mixed.set_input_muted(&key("A"), false);
@@ -942,7 +1052,7 @@ mod tests {
 
     #[test]
     fn set_input_muted_is_a_no_op_for_an_unrouted_key() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         assert!(!mixed.set_input_muted(&key("Gone"), true));
     }
 
@@ -953,8 +1063,14 @@ mod tests {
     }
 
     #[test]
+    fn routing_input_level_is_zero_without_a_route() {
+        let routing = Routing::default();
+        assert_eq!(routing.input_level(&key("A")), 0.0);
+    }
+
+    #[test]
     fn mixed_source_mixes_a_play_tracks_samples_starting_at_its_start_offset() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, -0.5, 0.25, -0.25], start_offset: 2 }));
         mixed.set_running(true);
         let mut out = [9.0f32; 8]; // 4 frames
@@ -964,7 +1080,7 @@ mod tests {
 
     #[test]
     fn mixed_source_play_track_is_silent_and_frozen_while_not_running() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, -0.5], start_offset: 0 }));
         for _ in 0..5 {
             let mut out = [9.0f32; 2];
@@ -976,7 +1092,7 @@ mod tests {
 
     #[test]
     fn mixed_source_playhead_advances_by_frames_rendered_only_while_running() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         let mut out = [0.0f32; 4]; // 2 frames
         mixed.render(&mut out, 0.0);
         assert_eq!(mixed.playhead(), 0, "not running yet");
@@ -989,7 +1105,7 @@ mod tests {
 
     #[test]
     fn mixed_source_rewind_resets_playhead_to_zero() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_running(true);
         mixed.render(&mut [0.0f32; 4], 0.0);
         assert_eq!(mixed.playhead(), 2);
@@ -1001,7 +1117,7 @@ mod tests {
     fn mixed_source_play_track_and_live_input_sum_together() {
         let (mut p1, c1) = input(8);
         p1.push_slice(&[0.1, 0.1]);
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.insert(key("A"), c1, RATE);
         mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.2, 0.2], start_offset: 0 }));
         mixed.set_running(true);
@@ -1013,7 +1129,7 @@ mod tests {
 
     #[test]
     fn mixed_source_search_scrubs_the_playhead_even_while_stopped() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_search(4.0); // not running
         mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames
         assert_eq!(mixed.playhead(), 8, "scrub works independently of the normal transport");
@@ -1021,7 +1137,7 @@ mod tests {
 
     #[test]
     fn mixed_source_search_adds_to_the_normal_running_speed() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_running(true);
         mixed.set_search(4.0);
         mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames: (1.0 + 4.0) * 2 = 10
@@ -1030,7 +1146,7 @@ mod tests {
 
     #[test]
     fn mixed_source_search_reads_a_play_track_at_the_scaled_stride() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         // One distinct sample per frame, so reading at a 4-frame stride
         // is directly observable in which values land in `out`.
         let samples: Vec<f32> = (0..40).map(|i| i as f32).flat_map(|v| [v, v]).collect();
@@ -1044,7 +1160,7 @@ mod tests {
 
     #[test]
     fn mixed_source_search_runs_backward_and_clamps_the_playhead_at_zero() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_playhead(2);
         mixed.set_search(-4.0);
         mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames backward: 2 - 2*4 = -6, clamped
@@ -1053,7 +1169,7 @@ mod tests {
 
     #[test]
     fn mixed_source_is_silent_when_running_and_search_exactly_cancel_out() {
-        let mut mixed = MixedSource::new();
+        let mut mixed = MixedSource::new(RATE);
         mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, 0.5], start_offset: 0 }));
         mixed.set_running(true);
         mixed.set_search(-1.0); // 1.0 (running) + -1.0 (search) == 0.0

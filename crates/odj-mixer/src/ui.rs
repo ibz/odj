@@ -1419,6 +1419,13 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // A narrow VU meter alongside the fader, its own column rather
+    // than folded into the fader's own bar — the two mean different
+    // things (where the volume control is set vs. how loud the signal
+    // actually, dynamically, is right now), so conflating them would
+    // make a hot signal on a low fader look deceptively quiet.
+    let [fader_area, meter_area] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(3)]).areas(inner);
+
     let row_style = |i: usize| {
         if active_control == Some(i) { Style::new().fg(Color::Black).bg(AMBER) } else { Style::new().fg(Color::White) }
     };
@@ -1436,6 +1443,11 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
         eq_line("Lo", routing.get_param(&ch.key, Param::Low), 2),
         Line::from(""),
     ];
+    // How many of `lines`' rows are header rows, not yet the fader/meter
+    // itself — both columns start with this many blank rows, so their
+    // own bars line up row for row even though the fader's own column
+    // also carries the EQ readouts above it and the meter's doesn't.
+    let header_rows = lines.len();
 
     // The Volume fader: filled bottom-up over whatever vertical room is
     // left, like a real channel strip's — the dominant visual element.
@@ -1452,7 +1464,28 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     let vol_label = volume.map_or("—".to_string(), |v| format!("{:.0}%", v * 100.0));
     lines.push(Line::from(Span::styled(vol_label, row_style(3))).alignment(Alignment::Center));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines), fader_area);
+
+    // The meter itself: same row count and fader-bottom-up fill logic
+    // as the fader's own bar, just driven by `routing.input_level`
+    // (a live, decaying signal strength) instead of the fader's
+    // static `volume` — and colored in zones (green/yellow/red,
+    // bottom to top) rather than a single color, same convention a
+    // real VU meter's colored scale uses, so a hot signal reads as hot
+    // at a glance rather than needing the exact number read off it.
+    let mut meter_lines: Vec<Line> = (0..header_rows).map(|_| Line::from("")).collect();
+    let level = routing.input_level(&ch.key).clamp(0.0, 1.0);
+    let meter_filled = ((fader_rows as f32) * level).round() as u16;
+    for row in 0..fader_rows {
+        let is_filled = row >= fader_rows.saturating_sub(meter_filled);
+        let bar = if is_filled { "▓▓" } else { "░░" };
+        let zone =
+            if row < fader_rows / 10 { Color::Red } else if row < fader_rows * 3 / 10 { Color::Yellow } else { Color::Green };
+        let color = if is_filled { zone } else { DIM };
+        meter_lines.push(Line::from(Span::styled(bar, Style::new().fg(color))).alignment(Alignment::Center));
+    }
+    meter_lines.push(Line::from(""));
+    f.render_widget(Paragraph::new(meter_lines), meter_area);
 }
 
 /// The record-mode screen's shared waveform timeline is always this

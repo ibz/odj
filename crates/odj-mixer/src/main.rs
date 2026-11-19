@@ -40,7 +40,8 @@ fn main() -> Result<()> {
             "usage: odj-mixer\n\n\
              Continuously detects running odj-player decks (as \"Deck n\") and a running\n\
              odj-sampler (as \"Sampler\"), connecting every one of them to the main output\n\
-             automatically, showing a channel strip — High, Mid, Low, Volume — for each.\n\
+             automatically, showing a channel strip — High, Mid, Low, Volume, and a live VU\n\
+             meter beside the fader — for each.\n\
              ←/→ picks the channel and ↑/↓ picks its control — neither changes a value, just\n\
              navigates; +/- adjusts the selected one instead (Shift: ×4).\n\
              ` opens Settings, 4 tabs (Tab/Shift+Tab cycles either way). Inputs: one row\n\

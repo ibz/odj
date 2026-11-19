@@ -23,11 +23,12 @@ use anyhow::Result;
 use midir::MidiInputConnection;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Widget};
 
 use odj_core::audio;
 use odj_core::filter::{MAX_DB, MIN_DB};
@@ -35,8 +36,8 @@ use odj_core::tui::{AMBER, DIM, Help, PAGE_HINT, Page, centered, draw_help, key_
 
 use crate::devices::{DeviceKey, Devices, Entry, device_key_string};
 use crate::midi::{self, Learning, Target, Targets};
-use crate::recorder::Recorder;
-use crate::routing::{Param, Routing};
+use crate::record_mode::{RecordMode, Track, TrackState};
+use crate::routing::{Param, Routing, TRACKS};
 
 /// A channel strip's step per `,`/`.` press on a control; `Shift`
 /// multiplies it, same convention odj-player's own (now-removed) Mixer
@@ -65,36 +66,49 @@ const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(3);
 /// itself processed, too fast to ever actually read. Matches
 /// odj-player's own `STATUS_TIME`.
 const STATUS_TIME: Duration = Duration::from_secs(4);
+/// Record mode's own `←`/`→` scrub: extra playhead speed, as a
+/// multiple of normal (1x), while held — same values and the same
+/// "hold, not a one-shot jump" shape as odj-player's own deck search
+/// (`Deck::search`/`SEARCH`/`SUPER_SEARCH`), just applied to the
+/// shared playhead instead of one deck's position.
+const RECORD_SEARCH: f64 = 4.0;
+const RECORD_SUPER_SEARCH: f64 = 20.0;
+/// How long a hold is kept alive without a real release event before
+/// it's cleared on its own — only used on a terminal that can't
+/// report key-release at all (`!key_release`); on one that can, the
+/// matching `KeyEventKind::Release` clears it directly instead. Same
+/// value and the same fallback-only role as odj-player's own
+/// `HOLD_FALLBACK`.
+const RECORD_HOLD_FALLBACK: Duration = Duration::from_millis(500);
 
 /// The help's pages (`?` or `/`, from the live screen only — Settings
-/// has no help of its own) — the live screen's own keys, then
-/// Settings' (for reference, since it can't be reopened from there),
-/// then About.
+/// has no help of its own, and isn't covered here either: its own
+/// hint line already spells out every key directly) — the live
+/// screen's own keys, then About.
 pub const HELP: &[Page] = &[
     Page::Keys(
         "Mixer",
         &[
             ("← / →", "Move between channels"),
-            ("↑ / ↓", "Move between its controls: High, Mid, Low, Volume"),
+            ("↑ / ↓", "Move between controls: High, Mid, Low, Volume"),
             ("+ / -", "Adjust the selected control (Shift: ×4)"),
-            ("R", "Start / stop recording the main output to a WAV file (saved under ~/.local/share/odj/recordings/)"),
+            ("R", "Enter multi-track recorder"),
             ("`", "Settings: pick channels, manage MIDI mappings, pick/change the output or controller"),
-            ("Ctrl+C", "Quit"),
         ],
     ),
     Page::Keys(
-        "Settings",
+        "Record",
         &[
-            ("Tab / BackTab", "Cycle the Inputs/Outputs/MIDI tabs"),
-            ("↑ / ↓", "Move between rows — every detected input and deck (Inputs), output (Outputs), or mapped/present controller (MIDI)"),
-            ("Space", "Inputs: add the selected input to the mix, or remove it (a no-op on a deck's row — always connected — or on one that's mapped but not currently detected)"),
-            ("Enter", "Inputs: open the selected row's own settings — for now just its 4 MIDI mappings · Outputs: make the selected one the main output · MIDI: switch to the selected controller (if it's present)"),
-            ("X / Delete", "MIDI: forget the selected controller's mappings (if it has any)"),
-            ("↑ / ↓ (drilled in)", "Move between its 4 params"),
-            ("Enter (drilled in)", "Map a knob to the selected param"),
-            ("X / Delete (drilled in)", "Clear whatever's mapped to the selected param"),
-            ("Esc (drilled in)", "Back to the channel list"),
-            ("Esc / `", "Back to the live screen"),
+            ("↑ / ↓", "Move between the 8 tracks"),
+            ("← / →", "Hold to scrub the shared playhead, audibly, at 4× speed (Shift: 20×) — same as odj-player's own deck search"),
+            ("S / Shift+S", "Cycle the selected track's state: Play → Mute → Record (Shift: backward)"),
+            ("Enter", "Assign the selected track's input, from everything currently routed"),
+            ("Space", "Play / pause the shared transport — restarts from 0 on its own once it reaches the end of whatever's armed to Play"),
+            ("R", "Start capturing every Record-armed track (or stop, if already capturing)"),
+            ("X", "Stop the transport; press again once stopped to rewind to 0"),
+            ("B", "Bounce every Play-armed track down to one new stereo WAV file, timestamped, saved alongside the tracks"),
+            ("M", "Leave record mode, back to the mixer"),
+            ("?", "Open this help"),
         ],
     ),
     Page::About(odj_core::about!()),
@@ -273,6 +287,51 @@ fn set_status(status: &mut Option<(String, Instant)>, msg: impl Into<String>) {
 /// `log::log_file()` afterward.
 fn status_text(status: &Option<(String, Instant)>) -> Option<&str> {
     status.as_ref().filter(|(_, at)| at.elapsed() < STATUS_TIME).map(|(s, _)| s.as_str())
+}
+
+/// One `←`/`→` scrub key currently held down — `strong` for Shift
+/// (full `RECORD_SUPER_SEARCH` speed instead of `RECORD_SEARCH`).
+/// Mirrors odj-player's own `Hold`/`hold`/`apply_holds` shape exactly,
+/// just for one pair of keys instead of several.
+struct Hold {
+    strong: bool,
+    /// Only set on a terminal that can't report real key releases
+    /// (`!key_release`) — a timeout fallback that clears the hold on
+    /// its own if no repeat event refreshes it first (see `record_search_hold`'s
+    /// own call site for how a repeated `Press` keeps re-arming this).
+    until: Option<Instant>,
+}
+
+fn record_search_hold(strong: bool, key_release: bool) -> Option<Hold> {
+    let until = (!key_release).then(|| Instant::now() + RECORD_HOLD_FALLBACK);
+    Some(Hold { strong, until })
+}
+
+/// Clears any hold whose fallback timeout has passed, then pushes the
+/// net scrub speed (forward minus backward, `0.0` if neither or both
+/// are held) onto the live engine — called every record-mode tick,
+/// not just when a key event arrives, so the fallback timeout (and a
+/// scrub that's still held) both stay live between events. Forced to
+/// `0.0` while `capturing` — moving the shared playhead abruptly
+/// while a track is actively writing would corrupt that track's own
+/// `start_offset`-based alignment, the same invariant the auto-restart
+/// check in `record_mode::RecordMode::poll` already protects; the
+/// holds themselves stay tracked underneath, so scrubbing picks back
+/// up the moment the capture stops, no need to re-press the key.
+fn apply_record_search(search_back: &mut Option<Hold>, search_fwd: &mut Option<Hold>, capturing: bool, routing: &Mutex<Routing>) {
+    let now = Instant::now();
+    for hold in [&mut *search_back, &mut *search_fwd] {
+        if hold.as_ref().and_then(|h| h.until).is_some_and(|t| now >= t) {
+            *hold = None;
+        }
+    }
+    let speed = |h: &Option<Hold>| match h {
+        Some(h) if h.strong => RECORD_SUPER_SEARCH,
+        Some(_) => RECORD_SEARCH,
+        None => 0.0,
+    };
+    let search = if capturing { 0.0 } else { speed(search_fwd) - speed(search_back) };
+    routing.lock().unwrap_or_else(|e| e.into_inner()).set_search(search);
 }
 
 /// Binds `cc` to `target` both live (`targets`) and in `controller`'s
@@ -763,6 +822,7 @@ pub fn run(
     #[allow(unused_variables)] mut midi_conn: Option<MidiInputConnection<()>>,
     mut controller: Option<String>,
     mut active_inputs: HashSet<String>,
+    key_release: bool,
 ) -> Result<()> {
     let mut selected_channel = 0usize;
     let mut selected_control = 0usize;
@@ -776,7 +836,15 @@ pub fn run(
     let mut midi_selected = 0usize;
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
-    let mut recorder = Recorder::default();
+    let mut record_mode = RecordMode::load();
+    let mut record_mode_open = false;
+    let mut record_selected = 0usize;
+    // `Some(picker-selected-index)` once `Enter` drills into the
+    // selected track's own input picker.
+    let mut record_picker: Option<usize> = None;
+    // `←`/`→` scrubbing the shared playhead — see `apply_record_search`.
+    let mut record_search_back: Option<Hold> = None;
+    let mut record_search_fwd: Option<Hold> = None;
     // See `set_status`/`status_text` for how long this actually stays
     // shown for.
     let mut status: Option<(String, Instant)> = None;
@@ -796,8 +864,7 @@ pub fn run(
                 set_status(&mut status, e);
             }
             drop(r);
-            if let Some(e) = recorder.poll_error(routing) {
-                let msg = format!("Recording stopped: {e}");
+            for msg in record_mode.poll(routing, |k| known.contains(k)) {
                 crate::log::log(&msg);
                 set_status(&mut status, msg);
             }
@@ -931,13 +998,13 @@ pub fn run(
                             // Switching outputs tears down and reconnects
                             // every route (see `Routing::set_main_output`'s
                             // own doc comment), which would otherwise
-                            // silently drop the recorder's tap along with
-                            // it and leave the writer thread running
-                            // forever with nothing left to write — stop it
-                            // first, with its own explanation.
-                            if recorder.is_active() {
-                                let _ = recorder.stop(routing);
-                                let msg = "Recording stopped: main output changed".to_string();
+                            // silently drop every record-mode tap and
+                            // Play track along with it — stop them
+                            // first, with their own explanation.
+                            let was_running = record_mode.is_running();
+                            record_mode.stop_everything(routing);
+                            if was_running {
+                                let msg = "Record mode stopped: main output changed".to_string();
                                 crate::log::log(&msg);
                                 set_status(&mut status, msg);
                             }
@@ -983,6 +1050,141 @@ pub fn run(
             continue;
         }
 
+        if record_mode_open {
+            apply_record_search(&mut record_search_back, &mut record_search_fwd, record_mode.is_capturing(), routing);
+            let labels: HashMap<DeviceKey, String> =
+                in_entries.iter().chain(&deck_entries).map(|e| (e.key.clone(), e.label.clone())).collect();
+            let mut routed_inputs = routing.lock().unwrap_or_else(|e| e.into_inner()).routed_inputs();
+            routed_inputs.sort_by(|a, b| labels.get(a).map(String::as_str).unwrap_or_default().cmp(labels.get(b).map(String::as_str).unwrap_or_default()));
+
+            if let Some(sel) = &mut record_picker {
+                *sel = (*sel).min(routed_inputs.len().saturating_sub(1));
+            }
+            let rate = routing.lock().unwrap_or_else(|e| e.into_inner()).main_output_rate().unwrap_or(48_000);
+            let playhead_frames = record_mode.playhead(routing);
+            let elapsed = Duration::from_secs_f64(playhead_frames as f64 / rate as f64);
+            let muted: [bool; TRACKS] = std::array::from_fn(|i| {
+                record_mode.tracks()[i].input.as_ref().is_some_and(|k| routing.lock().unwrap_or_else(|e| e.into_inner()).is_input_muted(k))
+            });
+
+            terminal.draw(|f| {
+                draw_record_mode(
+                    f,
+                    record_mode.tracks(),
+                    record_selected,
+                    &muted,
+                    elapsed,
+                    rate,
+                    record_mode.is_running(),
+                    record_mode.is_capturing(),
+                    &labels,
+                    record_picker.map(|sel| (routed_inputs.as_slice(), sel)),
+                    status_text(&status),
+                );
+                if help.is_open() {
+                    draw_help(f, &help, HELP);
+                }
+            })?;
+
+            if event::poll(Duration::from_millis(100))? {
+                let Event::Key(k) = event::read()? else { continue };
+                if k.kind == KeyEventKind::Release {
+                    // Only `←`/`→` care about a real release — every
+                    // other record-mode key is a one-shot action, same
+                    // as the rest of this app.
+                    match k.code {
+                        KeyCode::Left => record_search_back = None,
+                        KeyCode::Right => record_search_fwd = None,
+                        _ => {}
+                    }
+                    continue;
+                }
+                // The help takes the keys that turn and scroll it; nothing
+                // underneath acts while it's open — same as the live screen.
+                if help.is_open() {
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Char('?' | '/') => help.close(),
+                        _ => {
+                            help.key(k.code, k.modifiers.contains(KeyModifiers::SHIFT), HELP.len());
+                        }
+                    }
+                    continue;
+                }
+                if let Some(sel) = record_picker {
+                    match k.code {
+                        KeyCode::Esc => record_picker = None,
+                        KeyCode::Up => record_picker = Some(sel.saturating_sub(1)),
+                        KeyCode::Down => record_picker = Some((sel + 1).min(routed_inputs.len().saturating_sub(1))),
+                        KeyCode::Enter if !routed_inputs.is_empty() => {
+                            record_mode.set_input(record_selected, Some(routed_inputs[sel].clone()), routing);
+                            record_picker = None;
+                        }
+                        KeyCode::Char('x' | 'X') | KeyCode::Delete => {
+                            record_mode.set_input(record_selected, None, routing);
+                            record_picker = None;
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        _ => {}
+                    }
+                    continue;
+                }
+                let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+                let repeat = k.kind == KeyEventKind::Repeat;
+                match k.code {
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                    KeyCode::Char('?' | '/') => help.toggle(),
+                    KeyCode::Char('m' | 'M') => {
+                        record_mode_open = false;
+                        record_search_back = None;
+                        record_search_fwd = None;
+                        routing.lock().unwrap_or_else(|e| e.into_inner()).set_search(0.0);
+                        record_mode.leave(routing);
+                    }
+                    KeyCode::Up => record_selected = record_selected.saturating_sub(1),
+                    KeyCode::Down => record_selected = (record_selected + 1).min(TRACKS - 1),
+                    // Hold-to-scrub the shared playhead, same shape as
+                    // odj-player's own deck search: a fresh press (or,
+                    // on a terminal with no real release events, any
+                    // repeat too — see `record_search_hold`'s own doc
+                    // comment) arms or re-arms the hold; the matching
+                    // `Release` above (or the fallback timeout) clears
+                    // it. `apply_record_search` turns whichever holds
+                    // are live into the engine's actual scrub speed,
+                    // every tick, not just here.
+                    KeyCode::Left if !repeat || !key_release => record_search_back = record_search_hold(shift, key_release),
+                    KeyCode::Right if !repeat || !key_release => record_search_fwd = record_search_hold(shift, key_release),
+                    KeyCode::Char('s' | 'S') => {
+                        let forward = !shift;
+                        if let Err(e) = record_mode.cycle_state(record_selected, forward, routing) {
+                            let msg = format!("Track {}: {e}", record_selected + 1);
+                            crate::log::log(&msg);
+                            set_status(&mut status, msg);
+                        }
+                    }
+                    KeyCode::Enter => record_picker = Some(0),
+                    // Same key as odj-player's own Play/Pause.
+                    KeyCode::Char(' ') => record_mode.toggle_play(routing),
+                    KeyCode::Char('r' | 'R') => {
+                        for msg in record_mode.toggle_record(routing) {
+                            crate::log::log(&msg);
+                            set_status(&mut status, msg);
+                        }
+                    }
+                    KeyCode::Char('x' | 'X') => record_mode.stop_or_rewind(routing),
+                    KeyCode::Char('b' | 'B') => {
+                        let msg = match record_mode.bounce() {
+                            Ok(path) => format!("Bounced to {}", path.display()),
+                            Err(e) => format!("Could not bounce: {e}"),
+                        };
+                        crate::log::log(&msg);
+                        set_status(&mut status, msg);
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         let channels: Vec<Channel> = {
             let r = routing.lock().unwrap_or_else(|e| e.into_inner());
             shorten_labels(visible_channels(&build_channels(&in_entries, &deck_entries), &r))
@@ -995,7 +1197,7 @@ pub fn run(
 
         terminal.draw(|f| {
             let r = routing.lock().unwrap_or_else(|e| e.into_inner());
-            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status_text(&status), recorder.elapsed());
+            draw_mixer(f, &channels, selected_channel, selected_control, current_cc, &r, status_text(&status), record_mode.is_capturing());
             if help.is_open() {
                 draw_help(f, &help, HELP);
             }
@@ -1022,15 +1224,11 @@ pub fn run(
                 KeyCode::Char('`') => settings_open = true,
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                 KeyCode::Char('r' | 'R') => {
-                    let was_active = recorder.is_active();
-                    let result = if was_active { recorder.stop(routing) } else { recorder.start(routing) };
-                    let msg = match result {
-                        Err(e) => format!("Could not {} recording: {e}", if was_active { "stop" } else { "start" }),
-                        Ok(path) if was_active => format!("Recording saved to {}", path.display()),
-                        Ok(path) => format!("Recording to {}", path.display()),
-                    };
-                    crate::log::log(&msg);
-                    set_status(&mut status, msg);
+                    record_mode_open = true;
+                    for msg in record_mode.enter(routing) {
+                        crate::log::log(&msg);
+                        set_status(&mut status, msg);
+                    }
                 }
                 KeyCode::Left | KeyCode::Right if !channels.is_empty() => {
                     let forward = k.code == KeyCode::Right;
@@ -1095,7 +1293,7 @@ fn draw_mixer(
     current_cc: Option<u8>,
     routing: &Routing,
     status: Option<&str>,
-    recording: Option<Duration>,
+    record_mode_capturing: bool,
 ) {
     let [main_area, hint_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
 
@@ -1119,17 +1317,19 @@ fn draw_mixer(
     // `draw_footer`, the formatting (and naming: "Settings"/"quit",
     // not "Preferences"/"exit") every app's footer is meant to follow;
     // see its own doc comment for the convention itself.
-    let mut left = key_hint("R", if recording.is_some() { "stop" } else { "record" }, AMBER);
-    left.spans.extend(hints_line(&[("←→ ↑↓", "move"), ("+/-", "adjust (Shift ×4)")]).spans);
+    let mut left = hints_line(&[("←→ ↑↓", "move"), ("+/-", "adjust (Shift ×4)")]);
     if let Some(cc) = current_cc {
         left.push_span(Span::styled(format!("  (CC {cc})"), Style::new().fg(DIM)));
     }
-    let rec_badge = recording.map(|d| {
-        let s = d.as_secs();
-        Line::from(Span::styled(format!(" ● REC {:02}:{:02} ", s / 60, s % 60), Style::new().fg(Color::Black).bg(Color::Red).bold()))
-    });
+    // A record-mode capture can be running even while looking at this
+    // screen (nothing here pauses it) — same red "still recording"
+    // badge the old single-file `Recorder` showed, just driven by
+    // record mode's own state now.
+    let rec_badge = record_mode_capturing
+        .then(|| Line::from(Span::styled(" ● REC ", Style::new().fg(Color::Black).bg(Color::Red).bold())));
     let rec_w = rec_badge.as_ref().map_or(0, |l| l.width() as u16);
     let right = hints_line(&[
+        ("R", "multi-track recorder"),
         ("`", "settings"),
         ("?", "help"),
         ("Ctrl+C", "quit"),
@@ -1195,6 +1395,273 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     lines.push(Line::from(Span::styled(vol_label, row_style(3))).alignment(Alignment::Center));
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The record-mode screen's shared waveform timeline is always this
+/// many seconds wide. While the playhead is still inside it (`now_secs
+/// <= RECORD_WINDOW_SECS`), the window sits fixed at `0..
+/// RECORD_WINDOW_SECS` and the playhead visibly travels across it;
+/// past that, the window scrolls to keep the playhead pinned at the
+/// right edge instead, same as any real multitrack editor's own
+/// follow-the-playhead view — continuous motion (the waveform sliding
+/// left under a fixed playhead column) rather than a periodic jump a
+/// rescale-to-fit approach would cause at every window boundary.
+const RECORD_WINDOW_SECS: f64 = 30.0;
+/// One track row's total height, borders included: 1 info line (state
+/// + assigned input) plus [`RECORD_WAVE_ROWS`] of waveform.
+const RECORD_ROW_HEIGHT: u16 = 2 + 1 + RECORD_WAVE_ROWS;
+const RECORD_WAVE_ROWS: u16 = 2;
+
+/// Record mode (`R` from the live screen, `M` back): 8 fixed,
+/// full-width track rows ([`draw_record_track`]) instead of
+/// [`draw_mixer`]'s own vertical strips — "horizontal tracks" was the
+/// request, and each row already needs more label room (its assigned
+/// input's name) than a 14-column strip affords. Every row shares one
+/// scrolling [`RECORD_WINDOW_SECS`]-wide timeline (see its own doc
+/// comment) so the same playhead column lines up across all 8 — see
+/// [`draw_record_track`] for how each row's own waveform ([`RecordWave`])
+/// is drawn against it. `picker`, once `Enter` drills into the
+/// selected row, swaps the body for the list of currently-routed
+/// inputs to assign instead — same whole-body-swap shape
+/// [`draw_settings`]'s own `drilled` uses, not a popup over the tracks
+/// (there's no existing "overlay on top of another live screen"
+/// convention in this app to borrow instead).
+#[allow(clippy::too_many_arguments)]
+fn draw_record_mode(
+    f: &mut Frame,
+    tracks: &[Track; TRACKS],
+    selected: usize,
+    muted: &[bool; TRACKS],
+    elapsed: Duration,
+    rate: u32,
+    running: bool,
+    capturing: bool,
+    labels: &HashMap<DeviceKey, String>,
+    picker: Option<(&[DeviceKey], usize)>,
+    status: Option<&str>,
+) {
+    let [main_area, hint_area] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
+    let [status_area, tracks_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(main_area);
+    let now_secs = elapsed.as_secs_f64();
+    let window_start_secs = (now_secs - RECORD_WINDOW_SECS).max(0.0);
+
+    draw_record_status(f, status_area, elapsed, running, capturing);
+    if let Some((items, picker_selected)) = picker {
+        draw_record_picker(f, tracks_area, items, picker_selected, labels, selected);
+    } else {
+        let rows = Layout::vertical([Constraint::Length(RECORD_ROW_HEIGHT); TRACKS]).split(tracks_area);
+        for (i, (track, area)) in tracks.iter().zip(rows.iter()).enumerate() {
+            draw_record_track(f, *area, i, track, i == selected, muted[i], labels, window_start_secs, now_secs, rate);
+        }
+    }
+
+    let transport = if picker.is_some() {
+        hints_line(&[("↑↓", "select"), ("Enter", "assign"), ("X", "clear"), ("Esc", "back")])
+    } else {
+        hints_line(&[
+            ("Space", if running { "pause" } else { "play" }),
+            ("R", "record"),
+            ("X", "stop / rewind"),
+            ("↑↓", "select"),
+            ("←→", "scrub"),
+            ("S", "state"),
+            ("Enter", "assign input"),
+            ("B", "bounce to disk"),
+        ])
+    };
+    let right = hints_line(&[("M", "mixer"), ("?", "help"), ("Ctrl+C", "quit")]);
+    let rw = right.width() as u16;
+    let [left_area, right_area] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(rw)]).areas(hint_area);
+    f.render_widget(Paragraph::new(transport), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
+    draw_status_popup(f, status);
+}
+
+/// Same orange odj-player's own play-state row uses for "paused"
+/// (`CUE_COLOR`) — kept as its own exact RGB value rather than
+/// reusing this app's own, slightly different `AMBER`, since the
+/// point is to visually match that row specifically.
+const RECORD_PAUSE_COLOR: Color = Color::Rgb(255, 140, 0);
+
+/// A dedicated row above the 8 tracks, mirroring odj-player's own
+/// play-state + time status line (`status_groups` in its `ui.rs`):
+/// a colored badge — black, bold text on a colored background, same
+/// convention as every on/off badge in either app — for whichever of
+/// capturing/running/stopped currently applies, then the shared
+/// playhead's own elapsed time, dim label plus bold value. No
+/// remaining-time or blink-on-low-time variant: unlike a loaded
+/// track, record mode's own timeline has no fixed end to count down
+/// to.
+fn draw_record_status(f: &mut Frame, area: Rect, elapsed: Duration, running: bool, capturing: bool) {
+    let (state, color) = if capturing {
+        ("● REC  ", Color::Red)
+    } else if running {
+        ("▶ PLAY ", Color::Green)
+    } else {
+        ("‖ PAUSE", RECORD_PAUSE_COLOR)
+    };
+    let s = elapsed.as_secs();
+    let line = Line::from(vec![
+        Span::styled(format!(" {state} "), Style::new().fg(Color::Black).bg(color).bold()),
+        Span::raw(" "),
+        Span::styled("TIME ", Style::new().fg(DIM)),
+        Span::styled(format!("{:02}:{:02}", s / 60, s % 60), Style::new().bold().fg(Color::White)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// One full-width track row: an info line (state glyph, assigned
+/// input's label) over [`RECORD_WAVE_ROWS`] of its own waveform
+/// ([`RecordWave`]), drawn against the screen's shared timeline so
+/// every row's playhead column lines up.
+#[allow(clippy::too_many_arguments)]
+fn draw_record_track(
+    f: &mut Frame,
+    area: Rect,
+    index: usize,
+    track: &Track,
+    selected: bool,
+    muted: bool,
+    labels: &HashMap<DeviceKey, String>,
+    window_start_secs: f64,
+    now_secs: f64,
+    rate: u32,
+) {
+    let border_color = if selected { AMBER } else { DIM };
+    let block = Block::bordered().title(format!(" Track {} ", index + 1)).border_style(Style::new().fg(border_color));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [info_area, wave_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+
+    let (state_label, state_color) = match track.state {
+        TrackState::Mute => ("MUTE", DIM),
+        TrackState::Record => ("REC", Color::Red),
+        TrackState::Play => ("PLAY", Color::Green),
+    };
+    let input_label = track.input.as_ref().map(|k| labels.get(k).cloned().unwrap_or_else(|| k.0.clone()));
+    let mut spans = vec![
+        Span::styled(format!("{state_label:<5}"), Style::new().fg(state_color).bold()),
+        Span::raw("  "),
+    ];
+    match &input_label {
+        Some(l) => spans.push(Span::styled(l.clone(), Style::new().fg(Color::White))),
+        None => spans.push(Span::styled("— unassigned —", Style::new().fg(DIM))),
+    }
+    // Confirms, right where you're looking, that this track's own
+    // state is actually doing something to the live mix — not just a
+    // label. Only ever shown for a track with an input assigned; a
+    // Record-armed one is never muted (see `record_mode.rs`'s own
+    // `apply_mute`), so this never shows alongside "REC".
+    if muted {
+        spans.push(Span::styled(" 🔇 live muted", Style::new().fg(DIM)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), info_area);
+
+    f.render_widget(
+        RecordWave {
+            wave: &track.wave,
+            scale: track.wave_scale,
+            start_secs: track.wave_start_secs,
+            capturing: track.is_capturing(),
+            capture_start_secs: track.start_offset as f64 / rate.max(1) as f64,
+            window_start_secs,
+            now_secs,
+        },
+        wave_area,
+    );
+}
+
+/// One track row's own horizontal waveform, over the record-mode
+/// screen's shared, scrolling [`RECORD_WINDOW_SECS`]-wide timeline
+/// (`window_start_secs..window_start_secs + RECORD_WINDOW_SECS`) — a
+/// single-sided, bottom-up cousin of odj-player's own zoomed `Wave`
+/// widget (same `BARS` sub-cell resolution and color palette),
+/// simplified for a 2-row-tall strip rather than a dedicated editor
+/// pane: no mirroring, no bands, just peak level. The playhead column
+/// (`now_secs`) is highlighted the same way regardless of whether
+/// this particular track has anything recorded there yet, so it reads
+/// as one line moving through all 8 rows together, not 8 independent
+/// ones. A track mid-capture shows a plain solid block from its own
+/// current pass's start to `now` instead of (stale,
+/// about-to-be-overwritten) cached wave data.
+struct RecordWave<'a> {
+    wave: &'a [odj_core::track::WaveBin],
+    scale: f32,
+    start_secs: f64,
+    capturing: bool,
+    capture_start_secs: f64,
+    window_start_secs: f64,
+    now_secs: f64,
+}
+
+impl Widget for RecordWave<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        const WAVE_BG: Color = Color::Rgb(14, 14, 18);
+        const PLAYHEAD_BG: Color = Color::Rgb(210, 40, 40);
+        const WAVE_FG: Color = Color::Rgb(225, 230, 240);
+
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let (w, h) = (area.width as usize, area.height as usize);
+        let per_col = RECORD_WINDOW_SECS / w as f64;
+        let depth = (h * 8) as f32;
+        let now_col = (((self.now_secs - self.window_start_secs) / per_col).floor() as i64).clamp(0, w as i64 - 1) as u16;
+
+        for x in 0..w as u16 {
+            let t0 = self.window_start_secs + x as f64 * per_col;
+            let t1 = t0 + per_col;
+            let fg = if self.capturing { Color::Red } else { WAVE_FG };
+            let filled_eighths = if self.capturing {
+                if t1 > self.capture_start_secs && t0 < self.now_secs { depth as usize } else { 0 }
+            } else if self.wave.is_empty() {
+                0
+            } else {
+                let rel1 = t1 - self.start_secs;
+                if rel1 <= 0.0 {
+                    0
+                } else {
+                    let rel0 = (t0 - self.start_secs).max(0.0);
+                    let b0 = (rel0 * odj_core::track::WAVE_RATE) as usize;
+                    if b0 >= self.wave.len() {
+                        0
+                    } else {
+                        let b1 = ((rel1 * odj_core::track::WAVE_RATE).ceil() as usize).clamp(b0 + 1, self.wave.len());
+                        let peak = self.wave[b0..b1].iter().fold(0.0f32, |m, b| m.max(b.peak));
+                        ((peak / self.scale.max(1e-6)).min(1.0) * depth).round() as usize
+                    }
+                }
+            };
+            let bg = if x == now_col { PLAYHEAD_BG } else { WAVE_BG };
+            for row in 0..h as u16 {
+                let Some(cell) = buf.cell_mut((area.x + x, area.y + row)) else { continue };
+                let from_bottom = (h as u16 - 1 - row) as usize;
+                let level = filled_eighths.saturating_sub(from_bottom * 8).min(8);
+                cell.set_char(BARS[level]).set_fg(fg).set_bg(bg);
+            }
+        }
+    }
+}
+
+/// The input-assignment picker a selected track's own `Enter` drills
+/// into — every currently-routed input/deck, same source list (and
+/// label lookup) the live screen itself would show, since those are
+/// the only ones with any audio actually flowing to tap.
+fn draw_record_picker(f: &mut Frame, area: Rect, items: &[DeviceKey], selected: usize, labels: &HashMap<DeviceKey, String>, track: usize) {
+    let block = Block::bordered()
+        .title(format!(" Track {} — assign input ", track + 1))
+        .border_style(Style::new().fg(AMBER));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new("(nothing routed yet — add a channel from the live screen first)").fg(DIM)]
+    } else {
+        items.iter().map(|k| ListItem::new(labels.get(k).cloned().unwrap_or_else(|| k.0.clone()))).collect()
+    };
+    let list = List::new(list_items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 /// Settings (`` ` ``): [`SettingsTab::Inputs`] is one list of every
@@ -1440,6 +1907,8 @@ fn draw_status_popup(f: &mut Frame, status: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use odj_core::audio::Route;
 
     use super::*;
@@ -1768,14 +2237,8 @@ mod tests {
             "↑ / ↓",
             "+ / -",
             "`",
-            "Ctrl+C",
             "Space",
             "Enter",
-            "Tab / BackTab",
-            "X / Delete",
-            "X / Delete (drilled in)",
-            "Esc (drilled in)",
-            "Esc / `",
         ] {
             assert!(keys.contains(&k), "{k}");
         }
@@ -1868,5 +2331,97 @@ mod tests {
         // it literally takes 3 real seconds in a test.
         auto_connect(&channels, &routing, &devices_in, &devices_deck, &devices_out, &HashSet::new(), &mut failed, Duration::from_millis(1), &mut status);
         assert!(status.is_some(), "retry_after elapsed, so this device gets attempted (and fails, and reports) again");
+    }
+
+    // --- Screenshots for CI's own `Screenshots` workflow (.github/workflows/screenshots.yml)
+    // — same `--ignored screenshot` convention odj-player/odj-sampler/odj-crates already use,
+    // just calling the free `draw_*` functions directly instead of going through an `App`
+    // (odj-mixer has none): odj-mixer's own screens are plain functions over explicit
+    // parameters, not a `.snapshot()`/`crate::ui::draw(f, app, &snapshot)` entry point.
+    //
+    // `draw_mixer`'s own channel strips only show real EQ/Volume values once a channel is
+    // actually routed to a real, open output — which needs real audio hardware CI can't
+    // offer. Rather than make this screenshot depend on that (like `routing.rs`'s/
+    // `record_mode.rs`'s own `#[ignore = "opens a real output on this machine"]` tests,
+    // which would simply fail in a GitHub Actions runner), it uses a bare `Routing::default()`
+    // and leans on `Channel::available` instead (no routing needed at all) to still show two
+    // different visual states.
+
+    fn screenshot_dir() -> PathBuf {
+        let dir = std::env::var_os("ODJ_SCREENSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/screenshots")));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dump_screenshot(name: &str, cols: u16, rows: u16, draw: impl FnOnce(&mut Frame)) {
+        use odj_core::tui::to_ansi;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut t = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        t.draw(draw).unwrap();
+        std::fs::write(screenshot_dir().join(format!("{name}.ans")), to_ansi(t.backend().buffer())).unwrap();
+    }
+
+    /// A synthetic waveform — a plain sine-shaped envelope, not real
+    /// decoded audio — just to give the screenshot's bars something
+    /// other than flat silence to show.
+    fn fixture_wave(duration_secs: f64, scale: f32) -> Vec<odj_core::track::WaveBin> {
+        let bins = (duration_secs * odj_core::track::WAVE_RATE) as usize;
+        (0..bins)
+            .map(|i| {
+                let t = i as f64 / odj_core::track::WAVE_RATE;
+                let peak = (0.5 + 0.5 * (t * 2.0).sin()) as f32 * scale;
+                odj_core::track::WaveBin { peak, low: peak * 0.6, mid: peak * 0.3, high: peak * 0.1, clipped: false }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_mixer() {
+        let routing = Routing::default();
+        let mut unavailable = input_channel("broken", "Audio Interface");
+        unavailable.available = false;
+        let channels =
+            [deck_channel("odj-deck-1", "Deck 1"), deck_channel("odj-sampler", "Sampler"), input_channel("mic", "Vocal Mic"), unavailable];
+        dump_screenshot("mixer", 120, 40, |f| {
+            draw_mixer(f, &channels, 0, 3, Some(42), &routing, Some("Could not connect Audio Interface: device busy"), true);
+        });
+    }
+
+    #[test]
+    #[ignore = "writes target/screenshots/*.ans; run with `cargo test -- --ignored screenshot`"]
+    fn screenshot_record_mode() {
+        let deck = entry("odj-deck-1", "Deck 1").key;
+        let mic = entry("mic", "Vocal Mic").key;
+        let labels: HashMap<DeviceKey, String> = [(deck.clone(), "Deck 1".to_string()), (mic.clone(), "Vocal Mic".to_string())].into_iter().collect();
+
+        let mut tracks: [Track; TRACKS] = std::array::from_fn(|_| Track::default());
+        tracks[0].input = Some(deck.clone());
+        tracks[0].state = TrackState::Play;
+        tracks[0].wave = fixture_wave(12.0, 0.8);
+        tracks[0].wave_scale = 0.8;
+        tracks[0].wave_end_offset = 12 * 48_000;
+
+        tracks[1].input = Some(mic);
+        tracks[1].state = TrackState::Record;
+
+        tracks[2].input = Some(deck);
+        tracks[2].state = TrackState::Mute;
+        tracks[2].wave = fixture_wave(8.0, 0.5);
+        tracks[2].wave_scale = 0.5;
+        tracks[2].wave_start_secs = 2.0;
+        tracks[2].wave_end_offset = 10 * 48_000;
+
+        // Only a `Record`-armed track monitors its own live input — see
+        // `record_mode.rs`'s own `apply_mute`.
+        let muted = [true, false, true, false, false, false, false, false];
+
+        dump_screenshot("mixer-record-mode", 120, 40, |f| {
+            draw_record_mode(f, &tracks, 0, &muted, Duration::from_secs(14), 48_000, true, true, &labels, None, Some("Recording to track 2"));
+        });
     }
 }

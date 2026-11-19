@@ -34,6 +34,7 @@ jobs:
           cargo test -p odj-player --bin odj-player -- --ignored screenshot
           cargo test -p odj-sampler --bin odj-sampler -- --ignored screenshot
           cargo test -p odj-crates --bin odj-crates -- --ignored screenshot
+          cargo test -p odj-mixer --bin odj-mixer -- --ignored screenshot
 
       - name: Install freeze
         run: |

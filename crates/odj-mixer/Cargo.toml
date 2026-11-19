@@ -16,3 +16,9 @@ cpal.workspace = true
 midir.workspace = true
 ratatui.workspace = true
 ringbuf.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+# Also brings in its `tui::to_ansi` screenshot-dumping helper, shared with
+# odj-player/odj-sampler/odj-crates' own screenshot tests — see ui.rs.
+odj-core = { workspace = true, features = ["test-util"] }

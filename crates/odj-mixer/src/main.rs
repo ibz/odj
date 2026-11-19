@@ -14,6 +14,7 @@
 mod devices;
 mod log;
 mod midi;
+mod record_mode;
 mod recorder;
 mod routing;
 mod ui;
@@ -68,8 +69,16 @@ fn main() -> Result<()> {
              ones falls back to asking (skip with Esc/N). Once one's picked, if any decks are\n\
              already running, walks you through mapping a knob to each deck's (and the\n\
              sampler's, if it's running) Volume/Low/Mid/High that isn't mapped yet on that\n\
-             controller. R starts/stops recording the main output to a timestamped WAV file\n\
-             under ~/.local/share/odj/recordings/. Press ? for the full list of keys.\n\
+             controller. R enters record mode: 8 fixed tracks, each freely assignable to any\n\
+             currently-routed input, toggled Play/Mute/Record (S, Shift+S to go back; Play is\n\
+             the default) — a Play track mixes its own prior take back into the live output in\n\
+             real time, synced to a shared playhead; Space/R/X are Play-Pause/Record/Stop for\n\
+             the whole transport (Space restarts from 0 on its own once it reaches the end of\n\
+             whatever's armed to Play, X again rewinds once already stopped), and ←/→\n\
+             hold-scrub the playhead audibly, same as odj-player's own deck search. B bounces\n\
+             every Play-armed track down to one new, timestamped stereo WAV file. Each track\n\
+             (and every bounce) saves under ~/.local/share/odj/multitrack-recorder/, surviving\n\
+             a restart. M leaves record mode. Press ? for the full list of keys.\n\
              Routing a real sound card's input needs PipeWire's shared graph clock, which\n\
              plain ALSA doesn't have — without PipeWire, that's unavailable, but a deck or\n\
              odj-sampler still connects, over a direct Unix-socket link instead of a virtual\n\
@@ -80,7 +89,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let (mut terminal, key_release) = tui::init();
-    let result = start(&mut terminal);
+    let result = start(&mut terminal, key_release);
     tui::restore(key_release);
     result
 }
@@ -101,7 +110,7 @@ fn main() -> Result<()> {
 /// actually gets mapped on it; an unmapped controller isn't worth
 /// remembering as its own entry. Settings' own MIDI tab can always
 /// switch to a different controller live afterward, known or not.
-fn start(terminal: &mut DefaultTerminal) -> Result<()> {
+fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
     let host = audio::host();
     if !audio::is_pipewire(&host) {
         // Routing a real sound-card input still needs PipeWire's shared
@@ -237,6 +246,7 @@ fn start(terminal: &mut DefaultTerminal) -> Result<()> {
         midi_conn,
         controller,
         settings.mixer_active_inputs,
+        key_release,
     )
 }
 

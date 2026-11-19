@@ -41,42 +41,156 @@ impl Param {
     pub const ALL: [Param; 4] = [Param::Volume, Param::Low, Param::Mid, Param::High];
 }
 
+/// How many record-mode tracks exist — a fixed number of horizontal
+/// rows, not a dynamically sized list; see `record_mode.rs`.
+pub(crate) const TRACKS: usize = 8;
+
 /// Sums every input routed to one output's captured audio, each run
 /// through its own Volume + 3-band EQ first — `odj_core::filter::
 /// ThreeBandEq`, the same DSP odj-player's own Mixer used to apply
 /// locally, now applied once, centrally, to everything odj-mixer routes.
+/// Also drives record mode's own real-time plumbing: each input can
+/// have its own capture tap (`MixedInput::tap`), and up to
+/// [`TRACKS`] previously-recorded tracks can be mixed back in live
+/// (`play_tracks`), both synced to a shared, free-running `playhead`
+/// (see `record_mode.rs` for the UI-facing half of this).
 pub(crate) struct MixedSource {
     inputs: HashMap<DeviceKey, MixedInput>,
     scratch: Vec<f32>,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
-    /// The recorder's own tap, if one's installed — every rendered block
-    /// is pushed here too, verbatim, once `out` holds the final mix.
-    rec_tap: Option<ringbuf::HeapProd<f32>>,
+    /// Frames elapsed since record mode's playhead was last at 0 —
+    /// advances every render call while `running`, frozen otherwise.
+    playhead: u64,
+    /// Whether record mode's playhead is currently advancing at
+    /// normal (1x) speed — contributes `1.0` to the render loop's own
+    /// speed multiplier, added to `search` below (same additive model
+    /// odj-player's own deck uses for its search-while-playing case).
+    running: bool,
+    /// Extra playhead speed, as a multiple of normal — `0.0` normally,
+    /// `±RECORD_SEARCH`/`±RECORD_SUPER_SEARCH` while `ui::run`'s own
+    /// `←`/`→` scrub hold is live (see `ui.rs`'s `apply_record_search`).
+    /// Added to `running`'s own contribution, so scrubbing works
+    /// whether or not the transport happens to be playing at the time
+    /// — same as odj-player's own deck search.
+    search: f64,
+    /// A previously-recorded track's audio, decoded up front, mixed
+    /// back into `out` whenever the combined speed (`running` +
+    /// `search`) is nonzero — `None` for a track that's muted or not
+    /// currently armed to Play.
+    play_tracks: [Option<PlayTrack>; TRACKS],
+}
+
+/// A record-mode track armed to Play: its whole recording, decoded
+/// once up front (same "whole file into memory" approach
+/// `odj_core::track::decode` already serves odj-player's `Deck` and
+/// odj-sampler's `Sampler` with — these are bounded in length, same
+/// class as any other recording), and the playhead frame its first
+/// frame corresponds to.
+pub(crate) struct PlayTrack {
+    /// Interleaved stereo.
+    pub samples: Vec<f32>,
+    pub start_offset: u64,
 }
 
 struct MixedInput {
     cons: ringbuf::HeapCons<f32>,
     volume: f32,
     eq: ThreeBandEq,
+    /// A record-mode track's capture tap, if one's installed — this
+    /// input's own post-EQ, post-volume contribution (exactly what it
+    /// already adds into `out`) is pushed here too, every render call.
+    tap: Option<ringbuf::HeapProd<f32>>,
+    /// Suppresses this input's own contribution to the final mix,
+    /// independent of its own `volume` (which stays whatever it was,
+    /// unchanged, visible as-is on the live mixer screen) — record
+    /// mode's own doing, while it's open, for a track that's `Mute`
+    /// or `Play` rather than `Record` (see `record_mode.rs`'s own
+    /// `apply_mute`/`enter`/`leave`); always `false` again the moment
+    /// record mode closes, so leaving it never leaves the ordinary
+    /// mixer screen silently muted by a decision made on a different
+    /// screen.
+    muted: bool,
 }
 
 impl MixedSource {
     fn new() -> Self {
-        Self { inputs: HashMap::new(), scratch: Vec::new(), scratch_l: Vec::new(), scratch_r: Vec::new(), rec_tap: None }
+        Self {
+            inputs: HashMap::new(),
+            scratch: Vec::new(),
+            scratch_l: Vec::new(),
+            scratch_r: Vec::new(),
+            playhead: 0,
+            running: false,
+            search: 0.0,
+            play_tracks: std::array::from_fn(|_| None),
+        }
     }
 
+    /// Whether this output has nothing left to do and can be torn
+    /// down — no live input, no armed Play track, and the transport
+    /// isn't running. Checking only `inputs` here would let the last
+    /// hardware input being removed silently destroy an in-progress
+    /// overdub session along with it.
     fn is_empty(&self) -> bool {
-        self.inputs.is_empty()
+        self.inputs.is_empty() && self.play_tracks.iter().all(Option::is_none) && !self.running
     }
 
-    /// Installs (`Some`) or clears (`None`) the recorder's tap.
-    pub(crate) fn set_tap(&mut self, tap: Option<ringbuf::HeapProd<f32>>) {
-        self.rec_tap = tap;
+    /// Installs (`Some`) or clears (`None`) a capture tap on `key`'s
+    /// own post-EQ, post-volume contribution — `false` if `key` isn't
+    /// currently mixed in.
+    pub(crate) fn set_input_tap(&mut self, key: &DeviceKey, tap: Option<ringbuf::HeapProd<f32>>) -> bool {
+        let Some(i) = self.inputs.get_mut(key) else { return false };
+        i.tap = tap;
+        true
+    }
+
+    /// Suppresses (`true`) or restores (`false`) `key`'s own
+    /// contribution to the final mix — `false` if `key` isn't
+    /// currently mixed in.
+    pub(crate) fn set_input_muted(&mut self, key: &DeviceKey, muted: bool) -> bool {
+        let Some(i) = self.inputs.get_mut(key) else { return false };
+        i.muted = muted;
+        true
+    }
+
+    pub(crate) fn is_input_muted(&self, key: &DeviceKey) -> bool {
+        self.inputs.get(key).is_some_and(|i| i.muted)
+    }
+
+    pub(crate) fn set_play_track(&mut self, slot: usize, track: Option<PlayTrack>) {
+        self.play_tracks[slot] = track;
+    }
+
+    pub(crate) fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+
+    pub(crate) fn set_search(&mut self, search: f64) {
+        self.search = search;
+    }
+
+    pub(crate) fn playhead(&self) -> u64 {
+        self.playhead
+    }
+
+    /// Only meaningful while `!running` — rewinding a moving playhead
+    /// isn't a supported transport action (see `record_mode.rs`'s own
+    /// `stop_or_rewind`).
+    pub(crate) fn rewind(&mut self) {
+        self.playhead = 0;
+    }
+
+    /// Jumps the playhead straight to `frames` — used once, to restore
+    /// a previous session's own saved position onto a freshly opened
+    /// output (see `record_mode.rs`'s own `poll`), not a transport
+    /// action a key triggers.
+    pub(crate) fn set_playhead(&mut self, frames: u64) {
+        self.playhead = frames;
     }
 
     fn insert(&mut self, key: DeviceKey, cons: ringbuf::HeapCons<f32>, rate: u32) {
-        self.inputs.insert(key, MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate) });
+        self.inputs.insert(key, MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false });
     }
 
     fn remove(&mut self, key: &DeviceKey) {
@@ -125,13 +239,61 @@ impl Source for MixedSource {
                 r[i] = lr[1];
             }
             input.eq.process_stereo(l, r);
+            // `scratch` is done holding this input's raw, pre-EQ samples
+            // the moment `l`/`r` are read above — safe to reuse it right
+            // back below for the exact post-EQ, post-volume values a
+            // capture tap should see (the next input's own `pop_slice`
+            // overwrites it again before any of this is read a second
+            // time).
             for i in 0..frames {
-                out[i * 2] += l[i] * input.volume;
-                out[i * 2 + 1] += r[i] * input.volume;
+                let (ls, rs) = (l[i] * input.volume, r[i] * input.volume);
+                // `muted` only ever suppresses the final mix — the
+                // capture tap below still sees this input's own
+                // contribution regardless, so arming a track to
+                // Record still captures correctly even though record
+                // mode never actually mutes a Record-armed track.
+                if !input.muted {
+                    out[i * 2] += ls;
+                    out[i * 2 + 1] += rs;
+                }
+                if input.tap.is_some() {
+                    scratch[i * 2] = ls;
+                    scratch[i * 2 + 1] = rs;
+                }
+            }
+            if let Some(tap) = &mut input.tap {
+                tap.push_slice(scratch);
             }
         }
-        if let Some(tap) = &mut self.rec_tap {
-            tap.push_slice(out);
+        // The combined speed: `running` contributes normal (1x)
+        // forward speed, `search` adds a scrub on top (see this
+        // struct's own doc comments) — always a whole number in
+        // practice (both terms are exact multiples of 1), so every
+        // per-frame read position below lands on an exact sample
+        // index, no fractional interpolation needed. Gated on the
+        // whole block, not just the playhead update: while this is
+        // exactly 0 (stopped, not scrubbing), a Play track must stay
+        // silent, not keep replaying the same frozen window of itself
+        // every call.
+        let speed = f64::from(u8::from(self.running)) + self.search;
+        if speed != 0.0 {
+            for track in self.play_tracks.iter().flatten() {
+                for i in 0..frames {
+                    let pos = self.playhead as i64 + (i as f64 * speed) as i64;
+                    // A scrub can run the position below the track's
+                    // own start (or below 0 entirely) — both are
+                    // simply silence, not an error.
+                    if pos >= track.start_offset as i64 {
+                        let idx = (pos - track.start_offset as i64) as usize;
+                        if idx < track.samples.len() / 2 {
+                            out[i * 2] += track.samples[idx * 2];
+                            out[i * 2 + 1] += track.samples[idx * 2 + 1];
+                        }
+                    }
+                }
+            }
+            let step = (frames as f64 * speed) as i64;
+            self.playhead = (self.playhead as i64 + step).max(0) as u64;
         }
     }
 }
@@ -393,20 +555,99 @@ impl Routing {
         self.outputs.values().filter_map(|o| o.errors.take()).collect()
     }
 
-    /// Installs (`Some`) or clears (`None`) the recorder's tap on
-    /// whichever output is currently main. `false` if there's no main
-    /// output, or nothing's routed to it yet (so it isn't actually
-    /// open) — the recorder treats that as "nothing to record".
-    pub fn set_main_output_tap(&mut self, tap: Option<ringbuf::HeapProd<f32>>) -> bool {
+    /// Installs (`Some`) or clears (`None`) a record-mode track's
+    /// capture tap on `input`'s own post-EQ, post-volume contribution
+    /// — `false` if `input` isn't routed anywhere right now.
+    pub fn set_input_tap(&mut self, input: &DeviceKey, tap: Option<ringbuf::HeapProd<f32>>) -> bool {
+        let Some(r) = self.inputs.get(input) else { return false };
+        let Some(o) = self.outputs.get(&r.output) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_input_tap(input, tap)
+    }
+
+    /// Suppresses (`true`) or restores (`false`) `input`'s own
+    /// contribution to the mix — `false` if `input` isn't routed
+    /// anywhere right now.
+    pub fn set_input_muted(&mut self, input: &DeviceKey, muted: bool) -> bool {
+        let Some(r) = self.inputs.get(input) else { return false };
+        let Some(o) = self.outputs.get(&r.output) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_input_muted(input, muted)
+    }
+
+    /// Whether `input`'s own contribution is currently suppressed —
+    /// `false` if it isn't routed anywhere right now.
+    pub fn is_input_muted(&self, input: &DeviceKey) -> bool {
+        let Some(r) = self.inputs.get(input) else { return false };
+        let Some(o) = self.outputs.get(&r.output) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).is_input_muted(input)
+    }
+
+    /// Installs (`Some`) or clears (`None`) record-mode track `slot`'s
+    /// decoded playback buffer on whichever output is currently main.
+    /// `false` under the same condition as
+    /// [`set_input_tap`](Self::set_input_tap) — nothing's open yet to
+    /// mix it into.
+    pub fn set_play_track(&mut self, slot: usize, track: Option<PlayTrack>) -> bool {
         let Some(key) = &self.main_output else { return false };
         let Some(o) = self.outputs.get(key) else { return false };
-        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_tap(tap);
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_play_track(slot, track);
         true
     }
 
-    /// The main output's own negotiated sample rate, for the recorder's
+    /// Starts or freezes record mode's shared playhead on the main
+    /// output. `false` under the same condition as
+    /// [`set_input_tap`](Self::set_input_tap).
+    pub fn set_running(&mut self, running: bool) -> bool {
+        let Some(key) = &self.main_output else { return false };
+        let Some(o) = self.outputs.get(key) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_running(running);
+        true
+    }
+
+    /// Sets the shared playhead's extra scrub speed — `0.0` normally,
+    /// signed otherwise (see `MixedSource`'s own doc comments on
+    /// `search`). `false` under the same condition as
+    /// [`set_input_tap`](Self::set_input_tap) — a no-op silently
+    /// absorbed by a hold key pressed before anything's routed yet.
+    pub fn set_search(&mut self, search: f64) -> bool {
+        let Some(key) = &self.main_output else { return false };
+        let Some(o) = self.outputs.get(key) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_search(search);
+        true
+    }
+
+    /// Record mode's shared playhead, in frames since it was last at
+    /// 0 — `None` under the same condition as
+    /// [`set_input_tap`](Self::set_input_tap).
+    pub fn playhead(&self) -> Option<u64> {
+        let key = self.main_output.as_ref()?;
+        let o = self.outputs.get(key)?;
+        Some(o.mixed.lock().unwrap_or_else(|e| e.into_inner()).playhead())
+    }
+
+    /// Resets the playhead to 0 — only meaningful while nothing's
+    /// running (see `MixedSource::rewind`'s own doc comment). `false`
+    /// under the same condition as [`set_input_tap`](Self::set_input_tap).
+    pub fn rewind_playhead(&mut self) -> bool {
+        let Some(key) = &self.main_output else { return false };
+        let Some(o) = self.outputs.get(key) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).rewind();
+        true
+    }
+
+    /// Jumps the playhead straight to `frames`, for restoring a
+    /// previous session's own saved position (see
+    /// `MixedSource::set_playhead`'s own doc comment). `false` under
+    /// the same condition as [`set_input_tap`](Self::set_input_tap).
+    pub fn set_playhead(&mut self, frames: u64) -> bool {
+        let Some(key) = &self.main_output else { return false };
+        let Some(o) = self.outputs.get(key) else { return false };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).set_playhead(frames);
+        true
+    }
+
+    /// The main output's own negotiated sample rate, for a recording's
     /// WAV header — `None` under the same condition as
-    /// [`set_main_output_tap`](Self::set_main_output_tap).
+    /// [`set_input_tap`](Self::set_input_tap).
     pub fn main_output_rate(&self) -> Option<u32> {
         self.outputs.get(self.main_output.as_ref()?).map(|o| o.rate)
     }
@@ -545,27 +786,49 @@ mod tests {
     }
 
     #[test]
-    fn mixed_source_pushes_rendered_frames_into_an_installed_tap() {
+    fn mixed_source_pushes_an_inputs_post_eq_post_volume_contribution_into_its_own_tap() {
         let (mut p1, c1) = input(8);
-        p1.push_slice(&[0.2, 0.3]);
+        p1.push_slice(&[1.0, 1.0]);
         let mut mixed = MixedSource::new();
         mixed.insert(key("A"), c1, RATE);
+        mixed.set(&key("A"), Param::Volume, 0.5);
         let (tap_prod, mut tap_cons) = input(8);
-        mixed.set_tap(Some(tap_prod));
+        assert!(mixed.set_input_tap(&key("A"), Some(tap_prod)));
         let mut out = [0.0f32; 2];
         mixed.render(&mut out, 0.0);
         let mut tapped = [0.0f32; 2];
         assert_eq!(tap_cons.pop_slice(&mut tapped), 2);
-        assert_eq!(tapped, out);
+        // Volume-scaled (0.5), not the raw 1.0 that was pushed in.
+        assert!((tapped[0] - 0.5).abs() < 1e-4, "{tapped:?}");
+        assert!((tapped[1] - 0.5).abs() < 1e-4, "{tapped:?}");
+        assert_eq!(tapped, out, "matches what actually went into the mix");
     }
 
     #[test]
-    fn mixed_source_tap_drops_rather_than_blocking_on_overrun() {
+    fn mixed_source_input_tap_is_independent_per_input() {
+        let (mut p1, c1) = input(8);
+        let (mut p2, c2) = input(8);
+        p1.push_slice(&[0.2, 0.3]);
+        p2.push_slice(&[0.4, 0.5]);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        mixed.insert(key("B"), c2, RATE);
+        let (tap_prod, mut tap_cons) = input(8);
+        mixed.set_input_tap(&key("A"), Some(tap_prod));
+        let mut out = [0.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        let mut tapped = [0.0f32; 2];
+        assert_eq!(tap_cons.pop_slice(&mut tapped), 2);
+        assert_eq!(tapped, [0.2, 0.3], "only A's own contribution, not B's");
+    }
+
+    #[test]
+    fn mixed_source_input_tap_drops_rather_than_blocking_on_overrun() {
         let (_p, c1) = input(8);
         let mut mixed = MixedSource::new();
         mixed.insert(key("A"), c1, RATE);
         let (tap_prod, tap_cons) = input(4); // smaller than what gets pushed below
-        mixed.set_tap(Some(tap_prod));
+        mixed.set_input_tap(&key("A"), Some(tap_prod));
         let mut out = [0.0f32; 4];
         // Several renders in a row would overrun a 4-sample tap; this must
         // not panic or block.
@@ -576,10 +839,172 @@ mod tests {
     }
 
     #[test]
-    fn routing_set_main_output_tap_is_a_no_op_without_a_main_output() {
+    fn set_input_tap_is_a_no_op_for_an_unrouted_key() {
+        let mut mixed = MixedSource::new();
+        let (prod, _cons) = input(8);
+        assert!(!mixed.set_input_tap(&key("Gone"), Some(prod)));
+    }
+
+    #[test]
+    fn routing_set_input_tap_is_a_no_op_without_a_route() {
         let mut routing = Routing::default();
         let (prod, _cons) = input(8);
-        assert!(!routing.set_main_output_tap(Some(prod)));
+        assert!(!routing.set_input_tap(&key("A"), Some(prod)));
+    }
+
+    #[test]
+    fn mixed_source_muted_input_is_silent_but_still_pushes_to_its_own_tap() {
+        let (mut p1, c1) = input(8);
+        p1.push_slice(&[0.5, 0.5]);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        let (tap_prod, mut tap_cons) = input(8);
+        mixed.set_input_tap(&key("A"), Some(tap_prod));
+        assert!(mixed.set_input_muted(&key("A"), true));
+
+        let mut out = [9.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        assert_eq!(out, [0.0, 0.0], "muted: nothing added to the final mix");
+
+        let mut tapped = [0.0f32; 2];
+        assert_eq!(tap_cons.pop_slice(&mut tapped), 2);
+        assert_eq!(tapped, [0.5, 0.5], "still captured — muted only suppresses the mix, not the tap");
+    }
+
+    #[test]
+    fn mixed_source_unmuting_an_input_restores_its_contribution() {
+        let (mut p1, c1) = input(8);
+        p1.push_slice(&[0.5, 0.5]);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        mixed.set_input_muted(&key("A"), true);
+        mixed.set_input_muted(&key("A"), false);
+        let mut out = [0.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        assert_eq!(out, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn set_input_muted_is_a_no_op_for_an_unrouted_key() {
+        let mut mixed = MixedSource::new();
+        assert!(!mixed.set_input_muted(&key("Gone"), true));
+    }
+
+    #[test]
+    fn routing_set_input_muted_is_a_no_op_without_a_route() {
+        let mut routing = Routing::default();
+        assert!(!routing.set_input_muted(&key("A"), true));
+    }
+
+    #[test]
+    fn mixed_source_mixes_a_play_tracks_samples_starting_at_its_start_offset() {
+        let mut mixed = MixedSource::new();
+        mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, -0.5, 0.25, -0.25], start_offset: 2 }));
+        mixed.set_running(true);
+        let mut out = [9.0f32; 8]; // 4 frames
+        mixed.render(&mut out, 0.0);
+        assert_eq!(out, [0.0, 0.0, 0.0, 0.0, 0.5, -0.5, 0.25, -0.25], "silent before start_offset, then its samples, silent after its end");
+    }
+
+    #[test]
+    fn mixed_source_play_track_is_silent_and_frozen_while_not_running() {
+        let mut mixed = MixedSource::new();
+        mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, -0.5], start_offset: 0 }));
+        for _ in 0..5 {
+            let mut out = [9.0f32; 2];
+            mixed.render(&mut out, 0.0);
+            assert_eq!(out, [0.0, 0.0], "not a repeated non-zero window — genuinely silent");
+        }
+        assert_eq!(mixed.playhead(), 0, "frozen, not advancing");
+    }
+
+    #[test]
+    fn mixed_source_playhead_advances_by_frames_rendered_only_while_running() {
+        let mut mixed = MixedSource::new();
+        let mut out = [0.0f32; 4]; // 2 frames
+        mixed.render(&mut out, 0.0);
+        assert_eq!(mixed.playhead(), 0, "not running yet");
+        mixed.set_running(true);
+        mixed.render(&mut out, 0.0);
+        assert_eq!(mixed.playhead(), 2);
+        mixed.render(&mut out, 0.0);
+        assert_eq!(mixed.playhead(), 4);
+    }
+
+    #[test]
+    fn mixed_source_rewind_resets_playhead_to_zero() {
+        let mut mixed = MixedSource::new();
+        mixed.set_running(true);
+        mixed.render(&mut [0.0f32; 4], 0.0);
+        assert_eq!(mixed.playhead(), 2);
+        mixed.rewind();
+        assert_eq!(mixed.playhead(), 0);
+    }
+
+    #[test]
+    fn mixed_source_play_track_and_live_input_sum_together() {
+        let (mut p1, c1) = input(8);
+        p1.push_slice(&[0.1, 0.1]);
+        let mut mixed = MixedSource::new();
+        mixed.insert(key("A"), c1, RATE);
+        mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.2, 0.2], start_offset: 0 }));
+        mixed.set_running(true);
+        let mut out = [0.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        assert!((out[0] - 0.3).abs() < 1e-4, "{out:?}");
+        assert!((out[1] - 0.3).abs() < 1e-4, "{out:?}");
+    }
+
+    #[test]
+    fn mixed_source_search_scrubs_the_playhead_even_while_stopped() {
+        let mut mixed = MixedSource::new();
+        mixed.set_search(4.0); // not running
+        mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames
+        assert_eq!(mixed.playhead(), 8, "scrub works independently of the normal transport");
+    }
+
+    #[test]
+    fn mixed_source_search_adds_to_the_normal_running_speed() {
+        let mut mixed = MixedSource::new();
+        mixed.set_running(true);
+        mixed.set_search(4.0);
+        mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames: (1.0 + 4.0) * 2 = 10
+        assert_eq!(mixed.playhead(), 10, "running (1x) and search are additive, same as odj-player's own deck search");
+    }
+
+    #[test]
+    fn mixed_source_search_reads_a_play_track_at_the_scaled_stride() {
+        let mut mixed = MixedSource::new();
+        // One distinct sample per frame, so reading at a 4-frame stride
+        // is directly observable in which values land in `out`.
+        let samples: Vec<f32> = (0..40).map(|i| i as f32).flat_map(|v| [v, v]).collect();
+        mixed.set_play_track(0, Some(PlayTrack { samples, start_offset: 0 }));
+        mixed.set_search(4.0);
+        let mut out = [0.0f32; 6]; // 3 frames: reads frame 0, 4, 8
+        mixed.render(&mut out, 0.0);
+        assert_eq!(out, [0.0, 0.0, 4.0, 4.0, 8.0, 8.0]);
+        assert_eq!(mixed.playhead(), 12);
+    }
+
+    #[test]
+    fn mixed_source_search_runs_backward_and_clamps_the_playhead_at_zero() {
+        let mut mixed = MixedSource::new();
+        mixed.set_playhead(2);
+        mixed.set_search(-4.0);
+        mixed.render(&mut [0.0f32; 4], 0.0); // 2 frames backward: 2 - 2*4 = -6, clamped
+        assert_eq!(mixed.playhead(), 0, "never goes negative");
+    }
+
+    #[test]
+    fn mixed_source_is_silent_when_running_and_search_exactly_cancel_out() {
+        let mut mixed = MixedSource::new();
+        mixed.set_play_track(0, Some(PlayTrack { samples: vec![0.5, 0.5], start_offset: 0 }));
+        mixed.set_running(true);
+        mixed.set_search(-1.0); // 1.0 (running) + -1.0 (search) == 0.0
+        let mut out = [9.0f32; 2];
+        mixed.render(&mut out, 0.0);
+        assert_eq!(out, [0.0, 0.0], "a net-zero combined speed is still frozen, same as fully stopped");
+        assert_eq!(mixed.playhead(), 0);
     }
 
     #[test]

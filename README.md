@@ -34,6 +34,10 @@ now mixed and MIDI-mappable in software, no cables to run.
 - **Mixer with MIDI** — odj-mixer finds every running deck and the
   sampler on its own, each a channel with Volume and 3-band EQ; add a
   turntable, synth, drum machine or mic input too, all mappable to MIDI.
+- **Multi-track recorder** — 8 tracks inside odj-mixer, each freely
+  assignable to any routed input and toggled Play/Mute/Record; Play
+  tracks loop and overdub live against whatever you're recording next,
+  and bounce down to one stereo WAV file whenever you're ready.
 - **16-pad sampler** — plays your stored cues from 16 pads, organized into
   swappable kits, triggerable from the keyboard or MIDI.
 - **Crates** — a curated, git-friendly set of tracks: create one and

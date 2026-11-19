@@ -324,7 +324,6 @@ struct RoutedInput {
     source: InputSource,
 }
 
-#[derive(Default)]
 pub struct Routing {
     inputs: HashMap<DeviceKey, RoutedInput>,
     outputs: HashMap<DeviceKey, RoutedOutput>,
@@ -333,9 +332,34 @@ pub struct Routing {
     /// successfully — `None` (the default every existing test already
     /// gets) just means every input is resolved the usual cpal way.
     socket_listener: Option<Arc<Listener>>,
+    /// Requested `cpal` buffer size, in frames, for every stream this
+    /// opens from here on — odj-mixer's own Settings screen's Buffer
+    /// tab (see `ui::set_buffer_frames_setting`), trading this against
+    /// round-trip latency or headroom against dropouts. Changing it
+    /// (`set_buffer_frames`) only affects a stream opened *after* the
+    /// change — it tears down every current route so [`ui::run`]'s own
+    /// auto-connect reopens them all fresh, same as a main-output swap
+    /// already does (see [`set_main_output`](Self::set_main_output)).
+    buffer_frames: u32,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Self::new(audio::DEFAULT_BUFFER_FRAMES)
+    }
 }
 
 impl Routing {
+    pub fn new(buffer_frames: u32) -> Self {
+        Self {
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            main_output: None,
+            socket_listener: None,
+            buffer_frames,
+        }
+    }
+
     pub fn set_socket_listener(&mut self, listener: Arc<Listener>) {
         self.socket_listener = Some(listener);
     }
@@ -361,10 +385,42 @@ impl Routing {
         if output == self.main_output {
             return;
         }
+        self.disconnect_all();
+        self.main_output = output;
+    }
+
+    /// This instance's current buffer size, in frames — whatever the
+    /// most recent [`set_buffer_frames`](Self::set_buffer_frames) left
+    /// it at, or [`audio::DEFAULT_BUFFER_FRAMES`] if it's never been
+    /// changed.
+    pub fn buffer_frames(&self) -> u32 {
+        self.buffer_frames
+    }
+
+    /// Changes the buffer size every stream opens with from here on,
+    /// tearing down every current route first — same reasoning as
+    /// [`set_main_output`](Self::set_main_output): a stream already
+    /// open can't have its buffer size changed under it, so the only
+    /// way to actually apply this is to close everything and let
+    /// auto-connect reopen it fresh. A no-op if `frames` is already
+    /// the current value, so callers don't need their own check first.
+    pub fn set_buffer_frames(&mut self, frames: u32) {
+        if frames == self.buffer_frames {
+            return;
+        }
+        self.disconnect_all();
+        self.buffer_frames = frames;
+    }
+
+    /// Tears down every currently routed input (and, with it, any
+    /// output left with nothing else keeping it open) — the shared
+    /// half of [`set_main_output`] and [`set_buffer_frames`], neither
+    /// of which can apply its own change to a stream that's already
+    /// open.
+    fn disconnect_all(&mut self) {
         for input in self.inputs.keys().cloned().collect::<Vec<_>>() {
             self.clear_route(&input);
         }
-        self.main_output = output;
     }
 
     /// Every input currently routed somewhere — the live screen forgets
@@ -464,7 +520,7 @@ impl Routing {
             let out = audio::Output::open(&host, &cards, &choice)?;
             let rate = out.sample_rate();
             let mixed = Arc::new(Mutex::new(MixedSource::new()));
-            let stream = out.start(mixed.clone())?;
+            let stream = out.start(mixed.clone(), self.buffer_frames)?;
             if let Err(e) = audio::verify_route(&host, &out) {
                 drop(stream);
                 return Err(e);
@@ -501,7 +557,7 @@ impl Routing {
         let host = audio::host();
         let inp = audio::Input::open(&host, &cards, &choice)?;
         let (prod, cons) = HeapRb::<f32>::new(RING_STEREO_SAMPLES).split();
-        let stream = inp.start(prod)?;
+        let stream = inp.start(prod, self.buffer_frames)?;
         if let Err(e) = audio::verify_input_route(&host, &inp) {
             drop(stream); // tear down rather than capture from the wrong device
             self.drop_output_if_unused(output);

@@ -30,8 +30,13 @@ pub trait Source: Send + 'static {
     fn render(&mut self, out: &mut [f32], heard_at: f64);
 }
 
-/// Requested buffer size; small enough for cue/hot-cue response to feel immediate.
-pub(crate) const BUFFER_FRAMES: u32 = 512;
+/// Default requested buffer size, in frames; small enough for cue/hot-cue
+/// response to feel immediate. `Output::start`/`Input::start` take their
+/// own buffer size explicitly now (odj-mixer's own Settings screen lets
+/// it be changed, to trade this for lower round-trip latency or more
+/// headroom against dropouts) — this is just what odj-player and
+/// odj-sampler, which have no such setting, always pass.
+pub const DEFAULT_BUFFER_FRAMES: u32 = 512;
 
 /// Which output channels (0-based) of a card the deck plays on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -487,9 +492,9 @@ impl Output {
         self.config.sample_rate
     }
 
-    pub fn start<S: Source>(&self, source: Arc<Mutex<S>>) -> Result<Stream> {
+    pub fn start<S: Source>(&self, source: Arc<Mutex<S>>, buffer_frames: u32) -> Result<Stream> {
         let mut config = self.config;
-        config.buffer_size = BufferSize::Fixed(BUFFER_FRAMES);
+        config.buffer_size = BufferSize::Fixed(buffer_frames);
         let stream = self.build(&config, source.clone()).or_else(|_| {
             config.buffer_size = BufferSize::Default;
             self.build(&config, source)
@@ -690,9 +695,9 @@ impl Input {
     /// size on failure — `into` isn't cheaply cloneable (a ring buffer has
     /// exactly one producer), so there's nothing to retry with once it's
     /// been moved into a failed attempt.
-    pub fn start(&self, into: ringbuf::HeapProd<f32>) -> Result<Stream> {
+    pub fn start(&self, into: ringbuf::HeapProd<f32>, buffer_frames: u32) -> Result<Stream> {
         let mut config = self.config;
-        config.buffer_size = BufferSize::Fixed(BUFFER_FRAMES);
+        config.buffer_size = BufferSize::Fixed(buffer_frames);
         let route = self.route;
         let errors = self.errors.clone();
         let stream = match self.format {
@@ -1180,7 +1185,7 @@ mod tests {
         let host = host();
         let (cards, choice) = any_stereo_choice(&host);
         let output = Output::open(&host, &cards, &choice).unwrap();
-        let stream = output.start(Arc::new(Mutex::new(Silence))).unwrap();
+        let stream = output.start(Arc::new(Mutex::new(Silence)), DEFAULT_BUFFER_FRAMES).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
             matches!(pipewire_peer_of_own_stream(true), PeerCheck::Linked(_)),
@@ -1198,7 +1203,7 @@ mod tests {
         let (cards, choice) = any_stereo_choice(&host);
         let mut output = Output::open(&host, &cards, &choice).unwrap();
         output.target_id = Some("not-a-real-pipewire-node".to_string());
-        let stream = output.start(Arc::new(Mutex::new(Silence))).unwrap();
+        let stream = output.start(Arc::new(Mutex::new(Silence)), DEFAULT_BUFFER_FRAMES).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let err = verify_route(&host, &output).unwrap_err();
         assert!(err.to_string().contains("PipeWire linked"), "{err}");

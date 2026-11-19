@@ -171,7 +171,7 @@ fn setup_direct(terminal: &mut DefaultTerminal, deck_number: Option<u8>) -> Resu
     let host = audio::host();
     let Some(output) = tui::pick_output(terminal, &host)? else { return Ok(None) };
     let deck = Arc::new(Mutex::new(Deck::new(output.sample_rate())));
-    let stream = output.start(deck.clone())?;
+    let stream = output.start(deck.clone(), audio::DEFAULT_BUFFER_FRAMES)?;
     if let Err(e) = audio::verify_route(&host, &output) {
         drop(stream); // tear down rather than play on from the wrong device
         return Err(e);
@@ -223,7 +223,7 @@ fn setup_through_mixer(deck_number: Option<u8>) -> Result<Setup> {
             .find(|c| outputs[c.card].id() == sink_name)
             .ok_or_else(|| anyhow!("the virtual sink didn't register with PipeWire in time"))?;
         let output = audio::Output::open(&host, &outputs, &choice)?;
-        let stream = output.start(deck.clone())?;
+        let stream = output.start(deck.clone(), audio::DEFAULT_BUFFER_FRAMES)?;
         if let Err(e) = audio::verify_route(&host, &output) {
             drop(stream);
             return Err(e);

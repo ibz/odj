@@ -141,6 +141,13 @@ pub struct RecentTrack {
     pub artist: Option<String>,
 }
 
+/// odj-mixer's own default buffer size (see `Settings.mixer_buffer_frames`)
+/// — lower than [`crate::audio::DEFAULT_BUFFER_FRAMES`] on purpose, since
+/// odj-mixer (unlike odj-player or odj-sampler) always has its own
+/// Settings screen right there to raise it back up if a particular
+/// machine or card can't keep up with it.
+pub const DEFAULT_MIXER_BUFFER_FRAMES: u32 = 128;
+
 /// Settings shared by odj-player, odj-sampler and odj-mixer, one file
 /// between them — each app only ever touches the field(s) it owns,
 /// always through a full read-modify-write of this whole struct (see
@@ -205,6 +212,17 @@ pub struct Settings {
     /// means it hasn't been picked yet (from Settings' own Outputs
     /// tab), and nothing plays until it is. odj-mixer.
     pub mixer_output: Option<String>,
+    /// odj-mixer's own requested `cpal` buffer size, in frames, for
+    /// every audio stream it opens — its Settings screen's Buffer tab
+    /// trades this against round-trip latency (lower) or headroom
+    /// against dropouts (higher); see `odj_mixer::routing::Routing::
+    /// set_buffer_frames`. Defaults to [`DEFAULT_MIXER_BUFFER_FRAMES`]
+    /// — deliberately lower than [`crate::audio::DEFAULT_BUFFER_FRAMES`]
+    /// (what odj-player and odj-sampler always use, having no such
+    /// setting to raise it back from) since this one's always right
+    /// there in Settings to turn back up if a particular machine or
+    /// card can't keep up with it. odj-mixer.
+    pub mixer_buffer_frames: u32,
     /// Crates currently active, by directory name under
     /// `crate::crates::crates_root()` (see `Crate::slug`) — not a full
     /// path, so moving `$HOME` or syncing settings.json to a different
@@ -270,6 +288,7 @@ impl Default for Settings {
             mixer_midi_last: None,
             mixer_active_inputs: HashSet::new(),
             mixer_output: None,
+            mixer_buffer_frames: DEFAULT_MIXER_BUFFER_FRAMES,
             active_crates: Vec::new(),
             recent_tracks: Vec::new(),
         }

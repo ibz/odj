@@ -37,10 +37,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::audio::{BUFFER_FRAMES, Errors, Source};
+use crate::audio::{DEFAULT_BUFFER_FRAMES, Errors, Source};
 use crate::link;
 
-const CHUNK_FRAMES: usize = BUFFER_FRAMES as usize;
+const CHUNK_FRAMES: usize = DEFAULT_BUFFER_FRAMES as usize;
 const CHUNK_SAMPLES: usize = CHUNK_FRAMES * 2; // stereo
 const CHUNK_BYTES: usize = CHUNK_SAMPLES * 4; // f32
 

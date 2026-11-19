@@ -66,6 +66,16 @@ const AUTO_CONNECT_RETRY: Duration = Duration::from_secs(3);
 /// itself processed, too fast to ever actually read. Matches
 /// odj-player's own `STATUS_TIME`.
 const STATUS_TIME: Duration = Duration::from_secs(4);
+/// Settings' Buffer tab: the audio buffer sizes on offer, in frames —
+/// below [`odj_core::audio::DEFAULT_BUFFER_FRAMES`] (512, included
+/// here too) for lower round-trip latency, or above it for more
+/// headroom against dropouts on a busier system. Kept comfortably
+/// under `routing::RING_STEREO_SAMPLES`'s own fixed 4096-stereo-sample
+/// ceiling even at the largest option here (1024 frames is 2048
+/// stereo samples, still half that ceiling) — the ring buffer's own
+/// slack isn't scaled to match a chosen buffer size, so this list
+/// deliberately stops short of where that would start to matter.
+const BUFFER_FRAME_OPTIONS: [u32; 5] = [64, 128, 256, 512, 1024];
 /// Record mode's own `←`/`→` scrub: extra playhead speed, as a
 /// multiple of normal (1x), while held — same values and the same
 /// "hold, not a one-shot jump" shape as odj-player's own deck search
@@ -171,18 +181,21 @@ enum Group {
     Deck,
 }
 
-/// Settings' 3 tabs — `Tab`/`BackTab` (Shift+Tab) cycles through them,
+/// Settings' 4 tabs — `Tab`/`BackTab` (Shift+Tab) cycles through them,
 /// forward or back. Inputs is everything [`draw_settings`] showed
 /// before this was split into tabs at all; Outputs and MIDI both used
 /// to be a mandatory screen before the live screen could even start
 /// (see `main.rs`'s own doc comment) — now each is just another
 /// Settings tab, so either can be changed mid-session too, not only
-/// chosen once upfront.
+/// chosen once upfront. Buffer is the newest: `routing::Routing`'s own
+/// requested `cpal` buffer size (see [`BUFFER_FRAME_OPTIONS`]), trading
+/// round-trip latency against headroom.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
     Inputs,
     Outputs,
     Midi,
+    Buffer,
 }
 
 impl SettingsTab {
@@ -190,15 +203,17 @@ impl SettingsTab {
         match self {
             SettingsTab::Inputs => SettingsTab::Outputs,
             SettingsTab::Outputs => SettingsTab::Midi,
-            SettingsTab::Midi => SettingsTab::Inputs,
+            SettingsTab::Midi => SettingsTab::Buffer,
+            SettingsTab::Buffer => SettingsTab::Inputs,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            SettingsTab::Inputs => SettingsTab::Midi,
+            SettingsTab::Inputs => SettingsTab::Buffer,
             SettingsTab::Outputs => SettingsTab::Inputs,
             SettingsTab::Midi => SettingsTab::Outputs,
+            SettingsTab::Buffer => SettingsTab::Midi,
         }
     }
 }
@@ -395,6 +410,16 @@ fn set_active(active_inputs: &mut HashSet<String>, key: &DeviceKey, active: bool
 fn set_output(key: &DeviceKey) {
     let mut settings = odj_core::memory::load_settings();
     settings.mixer_output = Some(device_key_string(key));
+    let _ = odj_core::memory::save_settings(&settings);
+}
+
+/// Saves `frames` as the mixer's own buffer size in the shared
+/// settings file — mirrors [`set_output`]'s pattern, just for
+/// `Settings.mixer_buffer_frames` instead; the live `Routing` itself
+/// is updated by the caller separately.
+fn set_buffer_frames_setting(frames: u32) {
+    let mut settings = odj_core::memory::load_settings();
+    settings.mixer_buffer_frames = frames;
     let _ = odj_core::memory::save_settings(&settings);
 }
 
@@ -834,6 +859,7 @@ pub fn run(
     let mut param_selected = 0usize;
     let mut output_selected = 0usize;
     let mut midi_selected = 0usize;
+    let mut buffer_selected = 0usize;
     let mut help = Help::default();
     let mut failed: HashMap<DeviceKey, Instant> = HashMap::new();
     let mut record_mode = RecordMode::load();
@@ -891,9 +917,14 @@ pub fn run(
             let main_output = routing.lock().unwrap_or_else(|e| e.into_inner()).main_output();
             let known_controllers = odj_core::memory::load_settings().mixer_midi_controllers;
             let controller_rows = build_controller_rows(&known_controllers);
+            let (buffer_frames, buffer_rate) = {
+                let r = routing.lock().unwrap_or_else(|e| e.into_inner());
+                (r.buffer_frames(), r.main_output_rate().unwrap_or(48_000))
+            };
             channel_selected = channel_selected.min(channel_rows.len().saturating_sub(1));
             output_selected = output_selected.min(out_entries.len().saturating_sub(1));
             midi_selected = midi_selected.min(controller_rows.len().saturating_sub(1));
+            buffer_selected = buffer_selected.min(BUFFER_FRAME_OPTIONS.len() - 1);
             // The drilled-into channel disappearing (unplugged, deck
             // quit) backs out to the channel list rather than pointing
             // at nothing.
@@ -922,6 +953,9 @@ pub fn run(
                     &controller_rows,
                     midi_selected,
                     controller.as_deref(),
+                    buffer_selected,
+                    buffer_frames,
+                    buffer_rate,
                     status_text(&status),
                 );
             })?;
@@ -1041,6 +1075,30 @@ pub fn run(
                         }
                         KeyCode::Char('x' | 'X') | KeyCode::Delete if controller_rows.get(midi_selected).is_some_and(|r| r.mappings > 0) => {
                             forget_controller(&controller_rows[midi_selected].name);
+                        }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                        _ => {}
+                    },
+                    SettingsTab::Buffer => match k.code {
+                        KeyCode::Esc | KeyCode::Char('`') => settings_open = false,
+                        KeyCode::Up => buffer_selected = buffer_selected.saturating_sub(1),
+                        KeyCode::Down => buffer_selected = (buffer_selected + 1).min(BUFFER_FRAME_OPTIONS.len() - 1),
+                        KeyCode::Enter if BUFFER_FRAME_OPTIONS[buffer_selected] != buffer_frames => {
+                            let frames = BUFFER_FRAME_OPTIONS[buffer_selected];
+                            // Same hazard, same guard, as switching the
+                            // main output (see that arm's own comment
+                            // just above) — changing the buffer size
+                            // tears down every route exactly the same
+                            // way.
+                            let was_running = record_mode.is_running();
+                            record_mode.stop_everything(routing);
+                            if was_running {
+                                let msg = "Record mode stopped: buffer size changed".to_string();
+                                crate::log::log(&msg);
+                                set_status(&mut status, msg);
+                            }
+                            routing.lock().unwrap_or_else(|e| e.into_inner()).set_buffer_frames(frames);
+                            set_buffer_frames_setting(frames);
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                         _ => {}
@@ -1675,8 +1733,15 @@ fn draw_record_picker(f: &mut Frame, area: Rect, items: &[DeviceKey], selected: 
 /// if any, is currently picked. [`SettingsTab::Midi`] is every known
 /// or present MIDI controller (`controller_rows`/`midi_selected`),
 /// `controller` marking which one, if any, is currently connected.
-/// Whichever one's showing, a tab row atop the list shows which of
-/// the 3 is current — styled like the help overlay's own tabs (see
+/// [`SettingsTab::Buffer`] is every option in
+/// [`BUFFER_FRAME_OPTIONS`] (`buffer_selected` is just the cursor;
+/// `buffer_frames` — `routing::Routing::buffer_frames`'s own current
+/// value — marks which one's actually applied, same relationship
+/// `output_selected`/`main_output` already have), `buffer_rate` only
+/// used to turn each option's frame count into an estimated `ms` for
+/// display. Whichever one's showing, a tab row atop the list shows
+/// which of the 4 is current — styled like the help overlay's own
+/// tabs (see
 /// `odj_core::tui::tab_span`), not shown at all while drilled in. See
 /// `run`'s own doc comment for what the keys do either way. Its own
 /// hint line spells out every key already, so — like odj-player's own
@@ -1696,6 +1761,9 @@ fn draw_settings(
     controller_rows: &[ControllerRow],
     midi_selected: usize,
     controller: Option<&str>,
+    buffer_selected: usize,
+    buffer_frames: u32,
+    buffer_rate: u32,
     status: Option<&str>,
 ) {
     let area = centered(f.area(), 70, 70);
@@ -1712,6 +1780,7 @@ fn draw_settings(
         (SettingsTab::Inputs, None) => " Space toggle  Enter settings ",
         (SettingsTab::Outputs, None) => " Enter use ",
         (SettingsTab::Midi, None) => " Enter use  X forget mappings ",
+        (SettingsTab::Buffer, None) => " Enter apply ",
     };
     let esc_action = if drilled.is_some() { "Back" } else { "Close" };
     let title = match &drilled {
@@ -1755,6 +1824,8 @@ fn draw_settings(
         tab_span("Outputs", tab == SettingsTab::Outputs),
         Span::raw(" "),
         tab_span("MIDI", tab == SettingsTab::Midi),
+        Span::raw(" "),
+        tab_span("Buffer", tab == SettingsTab::Buffer),
     ]);
     f.render_widget(Paragraph::new(tabs), tabs_area);
 
@@ -1762,6 +1833,7 @@ fn draw_settings(
         SettingsTab::Inputs => draw_settings_inputs(f, body, channel_rows, channel_selected),
         SettingsTab::Outputs => draw_settings_outputs(f, body, out_entries, output_selected, main_output),
         SettingsTab::Midi => draw_settings_midi(f, body, controller_rows, midi_selected, controller),
+        SettingsTab::Buffer => draw_settings_buffer(f, body, buffer_selected, buffer_frames, buffer_rate),
     }
     draw_status_popup(f, status);
 }
@@ -1879,6 +1951,36 @@ fn draw_settings_midi(f: &mut Frame, inner: Rect, rows: &[ControllerRow], select
             })
             .collect()
     };
+    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// Same `●`/`○` convention [`draw_settings_outputs`] uses — `current`
+/// marks the row that's actually applied, not merely under the
+/// cursor (`selected`), same relationship `main_output`/
+/// `output_selected` already have there. `rate` only turns each
+/// option's frame count into an estimated `~ms` figure for display
+/// (the main output's own negotiated rate once one's open, else a
+/// 48 kHz guess) — it plays no other part in what gets applied.
+fn draw_settings_buffer(f: &mut Frame, inner: Rect, selected: usize, current: u32, rate: u32) {
+    let width = inner.width.saturating_sub(2) as usize;
+    let items: Vec<ListItem> = BUFFER_FRAME_OPTIONS
+        .iter()
+        .map(|&frames| {
+            let is_current = frames == current;
+            let (icon, icon_color) = if is_current { ("●", AMBER) } else { ("○", DIM) };
+            let label_color = if is_current { AMBER } else { DIM };
+            let ms = f64::from(frames) / f64::from(rate) * 1000.0;
+            let label = format!("{frames} frames (~{ms:.1} ms)");
+            let pad = width.saturating_sub(label.chars().count() + 1).max(1);
+            ListItem::new(Line::from(vec![
+                Span::styled(label, Style::new().fg(label_color)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(icon, Style::new().fg(icon_color)),
+            ]))
+        })
+        .collect();
     let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
     f.render_stateful_widget(list, inner, &mut state);

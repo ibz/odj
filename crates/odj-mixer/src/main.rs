@@ -43,7 +43,7 @@ fn main() -> Result<()> {
              automatically, showing a channel strip — High, Mid, Low, Volume — for each.\n\
              ←/→ picks the channel and ↑/↓ picks its control — neither changes a value, just\n\
              navigates; +/- adjusts the selected one instead (Shift: ×4).\n\
-             ` opens Settings, 3 tabs (Tab/Shift+Tab cycles either way). Inputs: one row\n\
+             ` opens Settings, 4 tabs (Tab/Shift+Tab cycles either way). Inputs: one row\n\
              per detected input, deck and the sampler, plus one for any device that's no\n\
              longer detected but still has a MIDI mapping. Space adds the selected input to\n\
              the mix or removes it (a no-op on a deck's or the sampler's row — always\n\
@@ -59,8 +59,11 @@ fn main() -> Result<()> {
              upfront. MIDI: one row per MIDI controller odj-mixer has saved mappings for,\n\
              plus one for each currently plugged in that has none yet (each row names how\n\
              many mappings it has); Enter switches to the selected one live if it's plugged\n\
-             in, X/Delete forgets its mappings (a no-op if it has none). Esc/` closes\n\
-             Settings, any tab.\n\
+             in, X/Delete forgets its mappings (a no-op if it has none). Buffer: the audio\n\
+             buffer size every stream opens with from here on, in frames — lower trades\n\
+             headroom against dropouts for lower round-trip latency; Enter applies the\n\
+             selected size immediately, tearing down and reconnecting every input (same as\n\
+             changing the main output does). Esc/` closes Settings, any tab.\n\
              Nothing on the live screen itself changes a mapping, the output or the\n\
              controller; that's Settings-only.\n\
              Picking a MIDI controller at startup needs no picker either, the same way the\n\
@@ -141,7 +144,7 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
     let devices_out = Devices::start(Kind::Output);
 
     let mut settings = odj_core::memory::load_settings();
-    let routing: Arc<Mutex<Routing>> = Arc::new(Mutex::new(Routing::default()));
+    let routing: Arc<Mutex<Routing>> = Arc::new(Mutex::new(Routing::new(settings.mixer_buffer_frames)));
     if let Some(listener) = &socket_listener {
         routing.lock().unwrap_or_else(|e| e.into_inner()).set_socket_listener(listener.clone());
     }

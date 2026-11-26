@@ -88,6 +88,15 @@ through it instead of a real device, and odj-mixer discovers it live, as
 does for any sound-card input — see below. Which one happens is checked
 once, at startup, not re-checked if odj-mixer starts or quits mid-session.
 
+A MIDI pad controller can call memory points too: each pad calls the
+memory with its own number (pad 1 → memory 1, in track order), straight
+there from wherever the playhead is, the same jump `J`/`K` make. It's set
+up exactly like odj-sampler's (below): `` ` `` opens Settings, `Tab` flips
+from **General** to **MIDI**, `Enter` picks a device, `C` configures it pad
+by pad. Each deck remembers its own device, so two decks can each have their
+own controller without both jumping on one press; learned pad notes are per
+device, shared by every deck.
+
 odj-sampler works the same way: standalone with a real output, or, if
 odj-mixer is already running when it starts, routed through it instead
 (no output picker in that case), discovered live as "Sampler" and given
@@ -255,10 +264,15 @@ own Settings — where `↑`/`↓` picks a device and `Enter` switches to it.
 The first time you pick a given device, you're walked through pressing each
 of the 16 pads in order so its notes are learned rather than assumed
 (controllers don't agree on how they number pads); after that it's
-remembered. `X`/`Delete` forgets the selected device's learned pads (`●`
-marks the one connected now, `○` another one that's plugged in, `✕` one
-known only from its saved mappings). The device and each device's learned
-notes are kept in the same shared settings file.
+remembered — a device with any pads learned is never walked through again.
+`C` configures the selected device pad by pad instead: every pad with its
+learned note or `—`; `Enter` learns the selected pad (press it on the
+device), carrying straight on to the next pad while that one's unmapped too
+(`Esc` stops), and `X` clears one. `X`/`Delete` on the device list forgets
+the selected device's learned pads altogether (`●` marks the one connected
+now, `○` another one that's plugged in, `✕` one known only from its saved
+mappings). The device and each device's learned notes are kept in the same
+shared settings file.
 
 ## odj-crates
 
@@ -367,11 +381,12 @@ used automatically; if more than one is, the last-used one is
 one isn't among them. Only when every currently plugged-in controller
 is unknown does it fall back to asking (`Esc`/`N` skips it) — picking
 one there makes it known from then on, with an empty map to start.
-Either way, it then briefly looks for decks (and the
-sampler) already running, then walks you through turning a knob for
-each one's Volume, Low, Mid and High that isn't mapped yet on *that*
-controller (so 8 knobs total for two decks, 12 with the sampler too) —
-`Esc` at any point stops the walkthrough, leaving the rest for later.
+If that controller has no mappings at all yet, it then briefly looks for
+decks (and the sampler) already running, then walks you through turning a
+knob for each one's Volume, Low, Mid and High (so 8 knobs total for two decks, 12 with the sampler too) —
+`Esc` at any point stops the walkthrough, leaving the rest for later. Once
+a controller has *any* mapping, startup never asks again: anything left
+unmapped is mapped from Settings (**MIDI**, `C`) instead.
 Inputs are left out of this walkthrough (most already have a physical
 knob on their own hardware); map one on demand from Settings instead.
 Any knob mapped this way, for an input, a deck or the sampler, is
@@ -445,8 +460,12 @@ picks a row, `Enter` switches to it live if it's plugged in (tearing
 down whatever was connected before and loading that controller's own
 saved mappings, or an empty one if it has none), `X`/`Delete` forgets
 its mappings instead — a no-op if it has none to forget, same as
-`Enter` is on one that isn't plugged in. `Esc`/`` ` `` closes Settings back to the live
-screen here too.
+`Enter` is on one that isn't plugged in. `C` configures the selected
+controller: every possible mapping (each channel's High, Mid, Low and
+Volume) with the knob bound to it or `—`; `Enter` maps the selected one
+(turn a knob — only on the controller in use, since that's the one being
+listened to), `X` clears it, `Esc` backs out. `Esc`/`` ` `` closes Settings
+back to the live screen here too.
 
 `?`/`/` opens the full key list from the live screen (Settings has
 no help of its own — every key's already spelled out in its own hint

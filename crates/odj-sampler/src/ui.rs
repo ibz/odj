@@ -14,7 +14,6 @@ use odj_core::tui::{AMBER, DIM, PAGE_HINT, Page, centered, draw_help, hinted_box
 
 use crate::app::{App, AudioRoute, Editor, KitBrowserMode, KitBrowserState, PAD_KEYS, PadStatus, Picker, SampleBrowser, Screen, Slot};
 use crate::engine::{Mode, PadState, Snapshot, TAIL};
-use crate::midi::DeviceRow;
 
 const PLAYING: Color = Color::Rgb(60, 220, 100);
 const PLAYING_BG: Color = Color::Rgb(20, 45, 25);
@@ -49,9 +48,7 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
     } else if let Screen::NamingKit(name) = &app.screen {
         draw_naming_kit(f, name);
     } else if let Screen::Settings = &app.screen {
-        let rows = app.midi_rows();
-        let pad_config = app.pad_config.as_deref().map(|name| (name, app.pad_notes_of(name), app.pad_config_selected));
-        draw_settings(f, &rows, app.settings_selected.min(rows.len().saturating_sub(1)), app.midi_device.as_deref(), pad_config);
+        draw_settings(f, app);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -375,49 +372,19 @@ fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Settings (`` ` ``): one tab, MIDI, with the same list odj-mixer's own
-/// Settings shows and the same `Enter` use / `X` forget convention. The
-/// single tab is still drawn as a tab — not just a title — so it reads as
-/// the same kind of screen as odj-mixer's multi-tab one, and there's room
-/// for more here later without changing the shape.
-///
-/// `pad_config` is `Some((device, notes, selected))` while drilled into
-/// one device's per-pad mappings (`C`): every pad with its learned note,
-/// or `—`.
-fn draw_settings(
-    f: &mut Frame,
-    rows: &[DeviceRow],
-    selected: usize,
-    current: Option<&str>,
-    pad_config: Option<(&str, [Option<u8>; crate::engine::PADS], usize)>,
-) {
+/// Settings (`` ` ``): one tab, MIDI — `odj_core::pad_midi`'s device
+/// list (`Enter` use, `C` configure, `X` forget) or, drilled in, one
+/// device's pads (`Enter` learn, `X` clear), the same as odj-player's own
+/// MIDI tab. The single tab is still drawn as a tab — not just a title —
+/// so it reads as the same kind of screen as odj-mixer's multi-tab one.
+fn draw_settings(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 70, 70);
     f.render_widget(Clear, area);
-    if let Some((name, notes, selected)) = pad_config {
-        let block = Block::bordered()
-            .title(format!(" Settings — MIDI — {name} "))
-            .title_bottom(key_hint("Esc", "Back", AMBER).left_aligned())
-            .title_bottom(hints_line(&[("Enter", "learn"), ("X", "clear")]).centered())
-            .border_style(Style::new().fg(AMBER));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let items: Vec<ListItem> = notes
-            .iter()
-            .enumerate()
-            .map(|(pad, note)| {
-                let note = note.map_or(Span::styled("—", Style::new().fg(DIM)), |n| Span::raw(format!("note {n}")));
-                ListItem::new(Line::from(vec![Span::raw(format!("Pad {:<4}", pad + 1)), note]))
-            })
-            .collect();
-        let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-        let mut state = ListState::default().with_selected(Some(selected));
-        f.render_stateful_widget(list, inner, &mut state);
-        return;
-    }
+    let back = if app.midi.pad_config.is_some() { "Back" } else { "Close" };
     let block = Block::bordered()
         .title(" Settings ")
-        .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
-        .title_bottom(hints_line(&[("Enter", "use"), ("C", "configure"), ("X", "forget mappings")]).centered())
+        .title_bottom(key_hint("Esc", back, AMBER).left_aligned())
+        .title_bottom(hints_line(app.midi.hints()).centered())
         .border_style(Style::new().fg(AMBER));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -425,37 +392,7 @@ fn draw_settings(
     let [tabs_area, _, body] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(Line::from(tab_span("MIDI", true))), tabs_area);
-
-    let items: Vec<ListItem> = if rows.is_empty() {
-        vec![ListItem::new("(no MIDI device used or connected yet)").fg(DIM)]
-    } else {
-        let width = body.width.saturating_sub(2) as usize;
-        rows.iter()
-            .map(|r| {
-                // Same 3-icon convention as odj-mixer's MIDI tab: a
-                // distinct shape for a device known only from its saved
-                // mappings, separate from "present but not the active one".
-                let is_current = current == Some(r.name.as_str());
-                let (icon, icon_color) = match (r.present, is_current) {
-                    (false, _) => ("✕", DIM),
-                    (true, true) => ("●", AMBER),
-                    (true, false) => ("○", DIM),
-                };
-                let mappings = format!("{} mapping{}", r.mappings, if r.mappings == 1 { "" } else { "s" });
-                let pad = width.saturating_sub(r.name.chars().count() + mappings.chars().count() + 2).max(1);
-                ListItem::new(Line::from(vec![
-                    Span::raw(r.name.clone()),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(mappings, Style::new().fg(DIM)),
-                    Span::raw(" "),
-                    Span::styled(icon, Style::new().fg(icon_color)),
-                ]))
-            })
-            .collect()
-    };
-    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(selected));
-    f.render_stateful_widget(list, body, &mut state);
+    app.midi.draw(f, body, |_| None);
 }
 
 fn draw_picker(f: &mut Frame, p: &Picker) {

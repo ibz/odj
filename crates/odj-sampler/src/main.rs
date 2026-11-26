@@ -92,13 +92,6 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         return Ok(());
     };
 
-    // No MIDI picker at startup: a remembered device is restored if it's
-    // plugged in and already learned, and Settings (`` ` ``) can switch to
-    // any other present device — learning its pads on the spot — at any
-    // time. The connection is kept alive by `App` for the rest of `start`.
-    let mut midi_config = midi::MidiConfig::load();
-    let midi_restored = midi::restore(&mut midi_config, setup.sampler.clone());
-
     let (kit_dir, kit) = match settings::load_active_kit() {
         Some(settings::ActiveKit::Saved(dir)) => {
             let kit = Kit::load(&dir.join("kit.json"));
@@ -114,7 +107,13 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
     };
 
     let mut app = App::new(setup.sampler.clone(), setup.out_rate, kit_dir, kit, key_release, setup.output);
-    app.set_midi(midi_config, midi_restored);
+    // No MIDI picker at startup: a remembered device is restored if it's
+    // plugged in and already learned (or, failing that, the one learned
+    // device that's plugged in), and Settings (`` ` ``) can switch to any
+    // other present device — learning its pads on the spot — at any time.
+    // The connection is kept alive by `App` for the rest of `start`.
+    app.midi = midi::pad_midi(setup.sampler.clone(), midi::load());
+    app.midi.restore(true);
     run(terminal, &mut app, &setup.errors)
 }
 
@@ -240,17 +239,9 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) ->
         // Settings picked a device whose pads aren't learned yet: walk
         // through them here, where drawing a temporary screen is possible,
         // then let `App` connect it and remember the result.
-        // `while`, not `if`: learning one pad can queue the next one
-        // (see `App::finish_pad_learn`), which must follow straight on
-        // rather than drawing the normal screen for a frame in between.
-        while let Some(req) = app.take_midi_learn() {
-            if let Some(pad) = req.pad {
-                let note = midi::learn_one_pad(terminal, &req.port_id, pad)?;
-                app.finish_pad_learn(req, pad, note);
-            } else {
-                let notes = midi::learn_pad_notes(terminal, &req.port_id)?;
-                app.finish_midi_learn(req, notes);
-            }
+        odj_core::pad_midi::run_pending_learns(terminal, &mut app.midi)?;
+        if let Some(status) = app.midi.take_status() {
+            app.set_status(status);
         }
     }
     Ok(())

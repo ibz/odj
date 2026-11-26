@@ -13,6 +13,7 @@ use odj_core::library::{Browser, fuzzy_match, siblings};
 use odj_core::library_index::{IndexRefresher, LibraryIndex, RefreshProgress};
 use odj_core::link;
 use odj_core::memory::{LibraryTrack, Memory, RecentTrack, TrackMemory};
+use odj_core::pad_midi::PadMidi;
 use odj_core::track::Track;
 use odj_core::tui::Help;
 
@@ -59,11 +60,21 @@ struct Hold {
     until: Option<Instant>,
 }
 
-/// The settings screen: just Auto Cue now — music folders and crates
-/// each moved into their own tab of the browse screen (see `BrowseTab`).
+/// The settings screen: General (just Auto Cue now — music folders and
+/// crates each moved into their own tab of the browse screen, see
+/// `BrowseTab`) and MIDI (pads calling memory points — see `midi.rs`),
+/// `Tab`/`Shift+Tab` switching between them.
 #[derive(Default)]
 pub struct SettingsScreen {
     open: bool,
+    pub tab: SettingsTab,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Midi,
 }
 
 impl SettingsScreen {
@@ -559,6 +570,11 @@ pub struct App {
     status: Option<(String, Instant)>,
     pub help: Help,
     pub settings_screen: SettingsScreen,
+    /// MIDI pads calling memory points, and Settings' MIDI tab — see
+    /// `midi.rs`. Not connected to anything until [`Self::set_midi`].
+    pub midi: PadMidi,
+    /// Where pad presses (on the MIDI thread) report what they did.
+    midi_status: mpsc::Receiver<String>,
     pub crate_browser: CrateBrowser,
     pub recent_browser: RecentBrowser,
     pub known_tracks_browser: KnownTracksBrowser,
@@ -613,7 +629,10 @@ impl App {
         // Crates already active from a previous session default the
         // Crate contents tab open first; otherwise Folder, same as always.
         let browse_tab = if memory.settings.active_crates.is_empty() { BrowseTab::Folder } else { BrowseTab::CrateContents };
+        let (midi, midi_status) = crate::midi::pad_midi(deck.clone(), None, Default::default());
         Self {
+            midi,
+            midi_status,
             deck,
             browser,
             memory,
@@ -1189,17 +1208,35 @@ impl App {
         }
     }
 
-    /// While the settings screen is open it's modal: Enter toggles Auto
-    /// Cue, Esc falls through to close it, anything else is swallowed
-    /// rather than reaching the deck underneath.
+    /// While the settings screen is open it's modal: `Tab`/`Shift+Tab`
+    /// switch tabs; on General, Enter toggles Auto Cue; on MIDI, every key
+    /// is `odj_core::pad_midi`'s (drilled into a device's pads, `Esc`
+    /// backs out of that first). Esc otherwise falls through to close
+    /// Settings; anything else is swallowed rather than reaching the deck
+    /// underneath.
     fn settings_key(&mut self, code: KeyCode) -> bool {
         if !self.settings_screen.open {
             return false;
         }
-        match code {
-            KeyCode::Esc => return false,
-            KeyCode::Enter => self.toggle_auto_cue(),
-            _ => {}
+        if matches!(code, KeyCode::Tab | KeyCode::BackTab) && self.midi.pad_config.is_none() {
+            self.settings_screen.tab = match self.settings_screen.tab {
+                SettingsTab::General => SettingsTab::Midi,
+                SettingsTab::Midi => SettingsTab::General,
+            };
+            self.midi.clamp_selection();
+            return true;
+        }
+        match self.settings_screen.tab {
+            SettingsTab::General => match code {
+                KeyCode::Esc => return false,
+                KeyCode::Enter => self.toggle_auto_cue(),
+                _ => {}
+            },
+            SettingsTab::Midi => {
+                let consumed = self.midi.key(code);
+                self.take_midi_status();
+                return consumed;
+            }
         }
         true
     }
@@ -1344,7 +1381,29 @@ impl App {
         deck.search = search;
     }
 
+    /// Hooks up MIDI pads for deck `deck`: its remembered device (only
+    /// its own — see `midi.rs` on why there's no fallback), reconnected
+    /// if it's plugged in.
+    pub fn set_midi(&mut self, deck: u8) {
+        let (midi, rx) = crate::midi::pad_midi(self.deck.clone(), Some(deck), crate::midi::load(deck));
+        self.midi = midi;
+        self.midi_status = rx;
+        self.midi.restore(false);
+    }
+
+    /// Shows whatever the MIDI side has to say — a pad press, or Settings'
+    /// MIDI tab (a device connected, not plugged in, …).
+    pub fn take_midi_status(&mut self) {
+        while let Ok(msg) = self.midi_status.try_recv() {
+            self.set_status(msg);
+        }
+        if let Some(msg) = self.midi.take_status() {
+            self.set_status(msg);
+        }
+    }
+
     pub fn tick(&mut self) {
+        self.take_midi_status();
         self.finish_loading();
         self.apply_holds();
         self.update_video();
@@ -2420,6 +2479,30 @@ mod tests {
         press(&mut app, KeyCode::Char('`'), false);
         assert!(app.settings_screen.is_open());
         assert!(!app.help.is_open());
+    }
+
+    #[test]
+    fn settings_tab_switches_to_midi_and_esc_backs_out_of_configure_first() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('`'), false);
+        assert_eq!(app.settings_screen.tab, SettingsTab::General);
+        press(&mut app, KeyCode::Tab, false);
+        assert_eq!(app.settings_screen.tab, SettingsTab::Midi);
+
+        app.midi.config.set_pad_notes_for("zzz-not-a-real-pad".into(), [36; odj_core::pad_midi::PADS]);
+        app.midi.selected = app.midi.rows().iter().position(|r| r.name == "zzz-not-a-real-pad").expect("listed");
+        press(&mut app, KeyCode::Char('c'), false);
+        assert_eq!(app.midi.pad_config.as_deref(), Some("zzz-not-a-real-pad"));
+        press(&mut app, KeyCode::Tab, false);
+        assert_eq!(app.settings_screen.tab, SettingsTab::Midi, "no tab switching while configuring a device");
+        press(&mut app, KeyCode::Char('j'), false);
+        assert_eq!(app.midi.pad_selected, 0, "deck keys don't leak through: J isn't a list move here");
+
+        press(&mut app, KeyCode::Esc, false);
+        assert!(app.settings_screen.is_open(), "first Esc only backs out of configure");
+        assert!(app.midi.pad_config.is_none());
+        press(&mut app, KeyCode::Esc, false);
+        assert!(!app.settings_screen.is_open(), "second Esc closes Settings");
     }
 
     #[test]

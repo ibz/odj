@@ -912,6 +912,22 @@ impl Deck {
             MemoryCall::Left => self.memories.iter().rposition(|m| m.pos < from - 1.0)?,
             MemoryCall::Right => self.memories.iter().position(|m| m.pos > from + 1.0)?,
         };
+        self.call_memory_at(i)
+    }
+
+    /// Calls memory point `i` (0-based, in track order — the same
+    /// numbering `store_memory`/`call_memory` report, minus one) directly,
+    /// wherever the playhead is: a MIDI pad's own jump (see `midi.rs`).
+    /// Same jump/cue/loop behavior as [`call_memory`](Self::call_memory).
+    /// `None` if there's no such memory on this track.
+    pub fn call_memory_number(&mut self, i: usize) -> Option<usize> {
+        if i >= self.memories.len() {
+            return None;
+        }
+        self.call_memory_at(i)
+    }
+
+    fn call_memory_at(&mut self, i: usize) -> Option<usize> {
         let m = self.memories[i];
         self.loop_adjust = false;
         self.cancel_slips();
@@ -2108,6 +2124,28 @@ mod tests {
         let expected = cue + (0.875 - 0.75) * SR as f64;
         assert!((d.pos - expected).abs() < 2.0, "pos {} expected {expected}", d.pos);
         assert!(off_beat(d.pos - (expected - cue)).abs() < 1.0);
+    }
+
+    #[test]
+    fn memory_called_by_number_jumps_straight_there_from_anywhere() {
+        let mut d = deck_with(Some(false));
+        d.step_paused(150.0);
+        d.cue_down(true);
+        let first = d.cue;
+        d.store_memory();
+        d.step_paused(150.0);
+        d.cue_down(true);
+        let second = d.cue;
+        d.store_memory();
+
+        assert_eq!(d.call_memory_number(0), Some(1));
+        assert!((d.pos - first).abs() < 1.0);
+        // Already sat on memory 1: memory 2 is still just "2", no stepping.
+        assert_eq!(d.call_memory_number(1), Some(2));
+        assert!((d.pos - second).abs() < 1.0);
+        assert_eq!(d.call_memory_number(0), Some(1), "backwards just as directly");
+        assert_eq!(d.call_memory_number(2), None, "only 2 memories on this track");
+        assert!((d.pos - first).abs() < 1.0, "a missing one leaves the deck where it was");
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::kit::{Kit, KitPad, PadSource};
 use crate::kit_browser::{self, KitRow};
 use crate::kits;
 use crate::loader::{Done, Failure, Job, Loader};
-use crate::midi::{self, DeviceRow, LearnRequest, MidiConfig};
+use odj_core::pad_midi::PadMidi;
 use crate::settings;
 use crate::starter_kit;
 
@@ -339,22 +339,9 @@ pub struct App {
     /// Whether the terminal reports key releases (kitty keyboard protocol).
     pub key_release: bool,
     pub output: AudioRoute,
-    /// The MIDI input this app remembers (settings file), whether or not
-    /// it's connected right now.
-    pub midi: MidiConfig,
-    /// The live MIDI connection, if any — kept alive here for as long as
-    /// MIDI input should work. Its device's stable name names it in Settings.
-    pub midi_conn: Option<midir::MidiInputConnection<()>>,
-    pub midi_device: Option<String>,
-    /// Set when Settings picks an unlearned device; `main`'s run loop
-    /// takes it, walks through the pads, and hands the result back.
-    midi_learn: Option<LearnRequest>,
-    pub settings_selected: usize,
-    /// `Some(device name)` while Settings is drilled into that device's
-    /// per-pad mappings (`C`), with [`Self::pad_config_selected`] the
-    /// pad under the cursor.
-    pub pad_config: Option<String>,
-    pub pad_config_selected: usize,
+    /// The MIDI pad controller and Settings' MIDI tab — see
+    /// `odj_core::pad_midi`. Pads trigger exactly like key presses.
+    pub midi: PadMidi,
     /// Gate pads held without key-release events, and when they time out.
     holds: [Option<Instant>; PADS],
     pub memory: MemoryUse,
@@ -384,6 +371,7 @@ impl App {
         key_release: bool,
         output: AudioRoute,
     ) -> Self {
+        let midi = crate::midi::pad_midi(sampler.clone(), Default::default());
         let mut app = Self {
             sampler,
             out_rate,
@@ -397,13 +385,7 @@ impl App {
             status: None,
             key_release,
             output,
-            midi: MidiConfig::default(),
-            midi_conn: None,
-            midi_device: None,
-            midi_learn: None,
-            settings_selected: 0,
-            pad_config: None,
-            pad_config_selected: 0,
+            midi,
             holds: [None; PADS],
             memory: MemoryUse { process: None, system: system_memory() },
             memory_at: None,
@@ -417,212 +399,21 @@ impl App {
         app
     }
 
-    /// Hands over what `main` restored (or didn't) at startup: the
-    /// remembered MIDI config, plus a live connection if its device was
-    /// plugged in and already learned. No picker — Settings changes it
-    /// later instead.
-    pub fn set_midi(&mut self, config: MidiConfig, restored: Option<(midir::MidiInputConnection<()>, String)>) {
-        self.midi = config;
-        if let Some((conn, name)) = restored {
-            self.midi_conn = Some(conn);
-            self.midi_device = Some(name);
-        }
-    }
-
-    /// Settings' MIDI tab rows — see [`midi::device_rows`].
-    pub fn midi_rows(&self) -> Vec<DeviceRow> {
-        midi::device_rows(&self.midi)
-    }
-
-    /// An unlearned device Settings just picked, for `main`'s run loop to
-    /// walk through with [`midi::learn_pad_notes`] (it owns the terminal).
-    pub fn take_midi_learn(&mut self) -> Option<LearnRequest> {
-        self.midi_learn.take()
-    }
-
-    /// Applies a completed walkthrough: remembers the notes (or, if the
-    /// user cancelled before learning any, leaves everything as it was)
-    /// and connects the device.
-    pub fn finish_midi_learn(&mut self, req: LearnRequest, notes: Option<[u8; PADS]>) {
-        if let Some(notes) = notes {
-            self.connect_midi(&req.port_id, &req.name, req.slot, notes);
-        }
-    }
-
-    /// Applies one pad learned from Settings' per-pad configure — see
-    /// [`midi::learn_one_pad`]. `None` (cancelled) changes nothing. On
-    /// success, if the very next pad isn't learned yet either, moves the
-    /// cursor there and queues learning it too — so filling in a run of
-    /// unmapped pads is just pressing them in turn, `Esc` to stop.
-    pub fn finish_pad_learn(&mut self, req: LearnRequest, pad: usize, note: Option<u8>) {
-        let Some(note) = note else { return };
-        self.set_pad_note(&req.name, pad, Some(note));
-        let next = pad + 1;
-        if next < PADS && self.pad_notes_of(&req.name)[next].is_none() {
-            self.pad_config_selected = next;
-            self.midi_learn = Some(LearnRequest { pad: Some(next), ..req });
-        }
-    }
-
-    /// `name`'s learned note per pad, `None` for an unlearned one — what
-    /// Settings' per-pad configure lists.
-    pub fn pad_notes_of(&self, name: &str) -> [Option<u8>; PADS] {
-        let map = self.midi.controllers.get(name);
-        std::array::from_fn(|pad| map.and_then(|m| m.get(&pad).copied()))
-    }
-
-    /// Sets (or, with `None`, clears) one pad's note on `name`, saving it
-    /// and, if `name` is the device in use, reconnecting it so the change
-    /// applies straight away. A note moved onto `pad` is taken off any
-    /// other pad that had it — one note only ever triggers one pad. A
-    /// device left with nothing learned is dropped entirely, same as
-    /// odj-mixer's own last-knob-cleared behavior, and stops being used.
-    fn set_pad_note(&mut self, name: &str, pad: usize, note: Option<u8>) {
-        let map = self.midi.controllers.entry(name.to_string()).or_default();
-        match note {
-            Some(note) => {
-                map.retain(|_, n| *n != note);
-                map.insert(pad, note);
-            }
-            None => {
-                map.remove(&pad);
-            }
-        }
-        if map.is_empty() {
-            self.midi.controllers.remove(name);
-        }
-        let _ = self.midi.save();
-        if self.midi_device.as_deref() != Some(name) {
-            return;
-        }
-        let port = odj_core::midi::port_id_for(name);
-        let slot = port.as_deref().and_then(odj_core::midi::device_slot).map(|(_, slot)| slot);
-        match (port, slot, self.midi.pad_notes_for(name, 0)) {
-            (Some(port), Some(slot), Some(notes)) => self.connect_midi(&port, name, slot, notes),
-            _ => {
-                self.midi_conn = None;
-                self.midi_device = None;
-            }
-        }
-    }
-
-    /// Settings' per-pad configure (`C` on a device row): `Enter` learns
-    /// the selected pad (the device must be plugged in), `X`/`Delete`
-    /// clears it, `Esc` backs out to the device list.
-    fn pad_config_key(&mut self, name: String, code: KeyCode) {
-        match code {
-            KeyCode::Esc | KeyCode::Char('`') => self.pad_config = None,
-            KeyCode::Up => self.pad_config_selected = self.pad_config_selected.saturating_sub(1),
-            KeyCode::Down => self.pad_config_selected = (self.pad_config_selected + 1).min(PADS - 1),
-            KeyCode::Enter => {
-                let port = odj_core::midi::port_id_for(&name);
-                match port.as_deref().and_then(|p| odj_core::midi::device_slot(p).map(|(_, slot)| (p.to_string(), slot))) {
-                    Some((port_id, slot)) => {
-                        self.midi_learn = Some(LearnRequest { name, slot, port_id, pad: Some(self.pad_config_selected) });
-                    }
-                    None => self.set_status(format!("MIDI device {name} is not connected")),
-                }
-            }
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => self.set_pad_note(&name, self.pad_config_selected, None),
-            _ => {}
-        }
-    }
-
     fn open_settings(&mut self) {
         self.screen = Screen::Settings;
-        self.settings_selected = self.settings_selected.min(self.midi_rows().len().saturating_sub(1));
+        self.midi.clamp_selection();
     }
 
-    /// Settings is one tab (MIDI), so its keys are all here: the same
-    /// list/Enter/X convention odj-mixer's own MIDI tab uses.
+    /// Settings is one tab (MIDI), wholly `odj_core::pad_midi`'s; only
+    /// closing it (`Esc`/`` ` `` on the device list) is this app's.
     fn settings_key(&mut self, key: &KeyEvent) {
         let (code, _) = normalize(key);
-        if let Some(name) = self.pad_config.clone() {
-            self.pad_config_key(name, code);
-            return;
+        if !self.midi.key(code) {
+            self.screen = Screen::Pads;
         }
-        let rows = self.midi_rows();
-        match code {
-            KeyCode::Esc | KeyCode::Char('`') => {
-                self.screen = Screen::Pads;
-                return;
-            }
-            KeyCode::Up => self.settings_selected = self.settings_selected.saturating_sub(1),
-            KeyCode::Down => self.settings_selected = (self.settings_selected + 1).min(rows.len().saturating_sub(1)),
-            KeyCode::Enter if rows.get(self.settings_selected).is_some_and(|r| r.present) => {
-                let name = rows[self.settings_selected].name.clone();
-                self.use_midi_device(&name);
-            }
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace
-                if rows.get(self.settings_selected).is_some_and(|r| r.mappings > 0) =>
-            {
-                let name = rows[self.settings_selected].name.clone();
-                self.forget_midi_device(&name);
-            }
-            KeyCode::Char('c') if !rows.is_empty() => {
-                self.pad_config = Some(rows[self.settings_selected].name.clone());
-                self.pad_config_selected = 0;
-            }
-            _ => {}
+        if let Some(status) = self.midi.take_status() {
+            self.set_status(status);
         }
-        self.settings_selected = self.settings_selected.min(self.midi_rows().len().saturating_sub(1));
-    }
-
-    /// Switches to the present device `name`: connects it straight away if
-    /// its pads were learned before, otherwise asks `main` to walk through
-    /// learning them first.
-    fn use_midi_device(&mut self, name: &str) {
-        let Some(port_id) = odj_core::midi::port_id_for(name) else {
-            self.set_status(format!("MIDI device {name} is not connected"));
-            return;
-        };
-        let Some((name, slot)) = odj_core::midi::device_slot(&port_id) else { return };
-        match self.midi.pad_notes_for(&name, slot) {
-            Some(notes) if self.midi_device.as_deref() != Some(name.as_str()) => {
-                self.connect_midi(&port_id, &name, slot, notes);
-            }
-            Some(_) => {}
-            None => self.midi_learn = Some(LearnRequest { name, slot, port_id, pad: None }),
-        }
-    }
-
-    /// (Re)opens `port_id` with `notes` and remembers it as the one MIDI
-    /// input to restore next time. Dropping the previous connection first
-    /// matches odj-mixer's own live switching — a connection is tied to one
-    /// specific port and can't simply be redirected.
-    fn connect_midi(&mut self, port_id: &str, name: &str, slot: usize, notes: [u8; PADS]) {
-        self.midi_conn = None;
-        self.midi_device = None;
-        match midi::connect(port_id, self.sampler.clone(), notes) {
-            Some(conn) => {
-                self.midi_conn = Some(conn);
-                self.midi_device = Some(name.to_string());
-                self.midi.last = Some(name.to_string());
-                self.midi.set_pad_notes_for(name.to_string(), slot, notes);
-                let _ = self.midi.save();
-                self.set_status(format!("MIDI: {name}"));
-            }
-            None => self.set_status(format!("Could not connect MIDI device {name}")),
-        }
-    }
-
-    /// Forgets `name`'s learned pad notes and, if it's the one connected
-    /// right now, stops listening to it too — unlike odj-mixer, the learned
-    /// notes are the whole mapping here, so leaving a "forgotten" device
-    /// still triggering pads would be misleading.
-    fn forget_midi_device(&mut self, name: &str) {
-        if self.midi.controllers.remove(name).is_none() {
-            return;
-        }
-        if self.midi_device.as_deref() == Some(name) {
-            self.midi_conn = None;
-            self.midi_device = None;
-        }
-        if self.midi.last.as_deref() == Some(name) {
-            self.midi.last = None;
-        }
-        let _ = self.midi.save();
-        self.set_status(format!("Forgot MIDI mappings for {name}"));
     }
 
     /// Replaces every pad with `kit`'s — shared by the initial load above
@@ -2520,85 +2311,6 @@ mod tests {
         key(&mut a, '`', KeyEventKind::Press);
         a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(a.screen, Screen::Pads));
-    }
-
-    #[test]
-    fn configure_in_settings_lists_and_clears_single_pads() {
-        with_temp_dirs(|| {
-            let mut a = app("settings-configure");
-            let mut cfg = crate::midi::MidiConfig::default();
-            let mut notes = [0u8; PADS];
-            notes[0] = 36;
-            notes[1] = 37;
-            cfg.set_pad_notes_for("zzz-not-a-real-pad".into(), 0, notes);
-            a.midi = cfg;
-            a.screen = Screen::Settings;
-            let rows = a.midi_rows();
-            a.settings_selected = rows.iter().position(|r| r.name == "zzz-not-a-real-pad").expect("known row listed");
-
-            key(&mut a, 'c', KeyEventKind::Press);
-            assert_eq!(a.pad_config.as_deref(), Some("zzz-not-a-real-pad"));
-            assert_eq!(a.pad_notes_of("zzz-not-a-real-pad")[..3], [Some(36), Some(37), None]);
-
-            key(&mut a, 'x', KeyEventKind::Press); // clears pad 1 only
-            assert_eq!(a.pad_notes_of("zzz-not-a-real-pad")[..2], [None, Some(37)]);
-
-            // Enter on a device that isn't plugged in can't learn anything.
-            a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            assert!(a.take_midi_learn().is_none());
-            assert!(a.status().is_some_and(|s| s.contains("not connected")));
-
-            a.pad_config_selected = 1;
-            key(&mut a, 'x', KeyEventKind::Press); // last one gone: device forgotten
-            assert!(a.midi.controllers.is_empty());
-
-            a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-            assert!(a.pad_config.is_none(), "Esc backs out to the device list");
-            assert!(matches!(a.screen, Screen::Settings));
-        });
-    }
-
-    #[test]
-    fn learning_a_pad_chains_onto_the_next_one_only_while_its_unmapped() {
-        with_temp_dirs(|| {
-            let mut a = app("settings-chain");
-            let mut notes = [0u8; PADS];
-            notes[2] = 50; // pad 3 already learned
-            let mut cfg = crate::midi::MidiConfig::default();
-            cfg.set_pad_notes_for("zzz-not-a-real-pad".into(), 0, notes);
-            a.midi = cfg;
-            a.pad_config = Some("zzz-not-a-real-pad".into());
-            let req = |pad| LearnRequest { name: "zzz-not-a-real-pad".into(), slot: 0, port_id: "p".into(), pad: Some(pad) };
-
-            a.finish_pad_learn(req(0), 0, Some(36));
-            assert_eq!(a.pad_config_selected, 1);
-            assert_eq!(a.take_midi_learn().and_then(|r| r.pad), Some(1), "pad 2 is unmapped: keep going");
-
-            a.finish_pad_learn(req(1), 1, Some(37));
-            assert!(a.take_midi_learn().is_none(), "pad 3 is already mapped: stop");
-
-            a.finish_pad_learn(req(5), 5, None);
-            assert!(a.take_midi_learn().is_none(), "cancelled (Esc): stop");
-            assert_eq!(a.pad_notes_of("zzz-not-a-real-pad")[..3], [Some(36), Some(37), Some(50)]);
-        });
-    }
-
-    #[test]
-    fn forget_in_settings_drops_a_devices_learned_pads() {
-        with_temp_dirs(|| {
-            let mut a = app("settings-forget");
-            let mut cfg = crate::midi::MidiConfig::default();
-            cfg.set_pad_notes_for("zzz-not-a-real-pad".into(), 0, [36; PADS]);
-            a.midi = cfg;
-            a.screen = Screen::Settings;
-            let rows = a.midi_rows();
-            a.settings_selected = rows.iter().position(|r| r.name == "zzz-not-a-real-pad").expect("known row listed");
-
-            key(&mut a, 'x', KeyEventKind::Press);
-
-            assert!(a.midi.controllers.is_empty(), "the learned pad notes are gone");
-            assert!(a.status().is_some_and(|s| s.contains("Forgot MIDI mappings for zzz-not-a-real-pad")));
-        });
     }
 
     /// The README's Keys section mirrors the help: the same pages, each with

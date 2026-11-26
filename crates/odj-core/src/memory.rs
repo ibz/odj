@@ -198,6 +198,16 @@ pub struct Settings {
     /// if more than one known controller is present at once); see
     /// `main.rs`'s own doc comment. odj-mixer.
     pub mixer_midi_last: Option<String>,
+    /// The MIDI pad controller each odj-player deck used last, by deck
+    /// number, by the same stable name as `sampler_midi_last` — per deck,
+    /// since every running deck would otherwise grab the same device and
+    /// all jump together on one pad press. odj-player.
+    pub player_midi_last: HashMap<u8, String>,
+    /// Each pad's learned MIDI note, per device, same shape as
+    /// `sampler_midi_controllers` — shared by every deck (how a device
+    /// numbers its pads doesn't depend on which deck uses it). A pad
+    /// calls the memory point with its own number. odj-player.
+    pub player_midi_controllers: HashMap<String, HashMap<usize, u8>>,
     /// Hardware inputs added to the mix, by their stable device key (see
     /// `odj_mixer::devices::device_key_string` — not a display label,
     /// which can change) — restored at startup so a previous session's
@@ -286,6 +296,8 @@ impl Default for Settings {
             sampler_midi_controllers: HashMap::new(),
             mixer_midi_controllers: HashMap::new(),
             mixer_midi_last: None,
+            player_midi_last: HashMap::new(),
+            player_midi_controllers: HashMap::new(),
             mixer_active_inputs: HashSet::new(),
             mixer_output: None,
             mixer_buffer_frames: DEFAULT_MIXER_BUFFER_FRAMES,

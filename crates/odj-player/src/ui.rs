@@ -12,7 +12,7 @@ use odj_core::key::Key;
 use odj_core::track::{Track, WAVE_RATE, WaveBin};
 use odj_core::tui::{AMBER, DIM, PAGE_HINT, Page, centered, draw_help, hinted_box, key_hint, tab_span};
 
-use crate::app::{App, AudioRoute};
+use crate::app::{App, AudioRoute, SettingsTab};
 use crate::engine::{CD_FRAMES, Lane, Snapshot, SyncView};
 use crate::video;
 
@@ -729,15 +729,37 @@ fn draw_browser(f: &mut Frame, app: &App) {
 
 /// The settings screen: just Auto Cue now — music folders and crates
 /// each moved into their own tab of the browse screen.
+/// Settings: General (Auto-cue) and MIDI — the same device list and
+/// per-pad configure as odj-sampler's own MIDI tab (`odj_core::pad_midi`),
+/// here with each pad's memory point named alongside it.
 fn draw_settings(f: &mut Frame, app: &App) {
-    let area = centered(f.area(), 60, 30);
+    let tab = app.settings_screen.tab;
+    let midi_tall = tab == SettingsTab::Midi;
+    let area = centered(f.area(), if midi_tall { 70 } else { 60 }, if midi_tall { 70 } else { 30 });
     let block = Block::bordered().title(" Settings ").border_style(Style::new().fg(AMBER));
-    let hints: &[&str] = &["Enter toggle", "Esc close"];
-    let list_area = hinted_box(f, area, block, hints);
-    let items = vec![ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" }))];
-    let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
-    let mut state = ListState::default().with_selected(Some(0));
-    f.render_stateful_widget(list, list_area, &mut state);
+    let hints: &[&'static str] = match tab {
+        SettingsTab::General => &["Enter toggle", "Tab MIDI", "Esc close"],
+        SettingsTab::Midi if app.midi.pad_config.is_some() => &["Enter learn", "X clear", "Esc back"],
+        SettingsTab::Midi => &["Enter use", "C configure", "X forget mappings", "Tab General", "Esc close"],
+    };
+    let inner = hinted_box(f, area, block, hints);
+    let [tabs_area, _, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    let tabs = Line::from(vec![
+        tab_span("General", tab == SettingsTab::General),
+        Span::raw(" "),
+        tab_span("MIDI", tab == SettingsTab::Midi),
+    ]);
+    f.render_widget(Paragraph::new(tabs), tabs_area);
+    match tab {
+        SettingsTab::General => {
+            let items = vec![ListItem::new(format!("Auto-cue: {}", if app.auto_cue() { "On" } else { "Off" }))];
+            let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+            let mut state = ListState::default().with_selected(Some(0));
+            f.render_stateful_widget(list, body, &mut state);
+        }
+        SettingsTab::Midi => app.midi.draw(f, body, |pad| Some(format!("→ memory {}", pad + 1))),
+    }
 }
 
 /// The next tab `Tab` would cycle to, in `Recent → Known tracks → Crate

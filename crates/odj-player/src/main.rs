@@ -1,5 +1,6 @@
 mod app;
 mod engine;
+mod midi;
 mod stretch;
 mod sync;
 mod ui;
@@ -68,7 +69,13 @@ fn main() -> Result<()> {
                      browser) and Crate (a curated track roster of your own, with its own cue\n\
                      memory and odj-sampler kits, instead of the global library) — Tab again\n\
                      flips between them. Settings (`) manages crates and saved folders; see\n\
-                     the README's Crates section."
+                     the README's Crates section.\n\n\
+                     Optionally driven by a MIDI pad controller too: each pad calls the memory\n\
+                     point with its own number (pad 1 → memory 1, in track order). Settings' MIDI\n\
+                     tab (Tab from General) picks the device for this deck (Enter — learning its\n\
+                     pads first if it's new), C configures one pad by pad (Enter learns the\n\
+                     selected pad and carries on to the next while it's unmapped, X clears it),\n\
+                     X forgets a device. Each deck remembers its own device."
                 );
                 return Ok(());
             }
@@ -141,7 +148,11 @@ fn start(
         return Ok(());
     };
 
+    // Which deck this is — same rule as the header's "DECK n" — picks
+    // which remembered MIDI device is this deck's own (see `midi.rs`).
+    let deck_n = deck_number.or_else(|| setup.link.as_ref().ok().map(|l| l.deck())).unwrap_or(1);
     let mut app = App::new(setup.deck, browser, key_release, setup.output, memory);
+    app.set_midi(deck_n);
     if let Err(e) = &setup.link {
         app.set_status(format!("Sync unavailable: {e}"));
     }
@@ -310,6 +321,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) ->
                 }
             }
         }
+        // Settings' MIDI tab asked to learn pads: walk through them here,
+        // where drawing a temporary screen is possible.
+        odj_core::pad_midi::run_pending_learns(terminal, &mut app.midi)?;
+        app.take_midi_status();
     }
     Ok(())
 }

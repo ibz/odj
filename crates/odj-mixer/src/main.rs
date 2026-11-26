@@ -264,7 +264,9 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
 pub(crate) fn dispatch(target: &str, t: f32, routing: &Mutex<Routing>) {
     let Some(target) = midi::parse_target(target) else { return };
     let value = if target.param == Param::Volume { t } else { MIN_DB + t * (MAX_DB - MIN_DB) };
-    routing.lock().unwrap_or_else(|e| e.into_inner()).set_param(&target.input, target.param, value);
+    let mut routing = routing.lock().unwrap_or_else(|e| e.into_inner());
+    routing.set_param(&target.input, target.param, value);
+    routing.note_midi_touch(&target.input, target.param);
 }
 
 #[cfg(test)]

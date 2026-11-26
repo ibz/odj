@@ -1248,6 +1248,14 @@ pub fn run(
             shorten_labels(visible_channels(&build_channels(&in_entries, &deck_entries), &r))
         };
         selected_channel = if channels.is_empty() { 0 } else { selected_channel.min(channels.len() - 1) };
+        // A MIDI knob turned since the last tick moves the selection to
+        // whatever it just changed, same as navigating there by hand.
+        if let Some((key, param)) = routing.lock().unwrap_or_else(|e| e.into_inner()).take_midi_touch()
+            && let Some(i) = channels.iter().position(|ch| ch.key == key)
+        {
+            selected_channel = i;
+            selected_control = (0..CONTROLS).find(|&c| control_param(c) == param).unwrap_or(selected_control);
+        }
 
         let current_cc = channels
             .get(selected_channel)
@@ -1436,12 +1444,14 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     let row_style = |i: usize| {
         if active_control == Some(i) { Style::new().fg(Color::Black).bg(AMBER) } else { Style::new().fg(Color::White) }
     };
+    // Each EQ band as a small horizontal slider rather than a bare dB
+    // number: see `eq_bar`. The label alone carries the selection
+    // highlight; the bar's fill turns amber too while selected.
+    let eq_width = (fader_area.width as usize).saturating_sub(3);
     let eq_line = |label: &str, value: Option<f32>, i: usize| {
-        let text = match value {
-            Some(v) => format!("{label} {v:+.0}"),
-            None => format!("{label} —"),
-        };
-        Line::from(Span::styled(text, row_style(i)))
+        let mut spans = vec![Span::styled(label.to_string(), row_style(i)), Span::raw(" ")];
+        spans.extend(eq_bar(value, eq_width, active_control == Some(i)));
+        Line::from(spans)
     };
 
     let mut lines = vec![
@@ -1481,27 +1491,63 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     // real VU meter's colored scale uses, so a hot signal reads as hot
     // at a glance rather than needing the exact number read off it.
     let level = routing.input_level(&ch.key);
-    f.render_widget(Paragraph::new(meter_lines(header_rows, fader_rows, level)), meter_area);
+    f.render_widget(Paragraph::new(meter_lines(header_rows, fader_rows, level, routing.input_peak(&ch.key))), meter_area);
 
     let backlog = routing.input_backlog(&ch.key);
     f.render_widget(Paragraph::new(buffer_lines(buffer_area.width, backlog)), buffer_area);
+}
+
+/// One EQ band's slider for [`draw_channel`], `width` cells wide over
+/// `filter::MIN_DB..=filter::MAX_DB`: a dim track with a `┼` tick at
+/// 0 dB (flat), filled from that tick out to `value` — leftward for a
+/// cut, rightward for a boost — so how far a band is off flat, and in
+/// which direction, reads at a glance. The range is lopsided (-26..+6),
+/// so the tick sits well right of center, same as on a real DJ mixer's
+/// kill-capable EQ knob. All dim with no fill when `value` is `None`.
+fn eq_bar(value: Option<f32>, width: usize, selected: bool) -> Vec<Span<'static>> {
+    use odj_core::filter::{MAX_DB, MIN_DB};
+    if width == 0 {
+        return Vec::new();
+    }
+    let pos = |db: f32| (((db - MIN_DB) / (MAX_DB - MIN_DB)).clamp(0.0, 1.0) * (width - 1) as f32).round() as usize;
+    let zero = pos(0.0);
+    let fill = if selected { AMBER } else { Color::White };
+    (0..width)
+        .map(|i| {
+            let filled = value.is_some_and(|v| {
+                let at = pos(v);
+                i >= zero.min(at) && i <= zero.max(at) && at != zero
+            });
+            match (i == zero, filled) {
+                (true, true) => Span::styled("┼", Style::new().fg(fill)),
+                (true, false) => Span::styled("┼", Style::new().fg(if value.is_some() { Color::White } else { DIM })),
+                (false, true) => Span::styled("━", Style::new().fg(fill)),
+                (false, false) => Span::styled("─", Style::new().fg(DIM)),
+            }
+        })
+        .collect()
 }
 
 /// [`draw_channel`]'s VU meter column: blank rows down to the last of
 /// `header_rows` (so it lines up with the fader beside it), which
 /// carries a "VU" label instead, then `fader_rows` rows filled
 /// bottom-up to `level` in green/yellow/red zones, then one blank row
-/// level with the fader's own percentage readout.
-fn meter_lines(header_rows: usize, fader_rows: u16, level: f32) -> Vec<Line<'static>> {
+/// level with the fader's own percentage readout. `peak` (the held
+/// recent peak) also draws a lingering red `▬▬` marker at its own row,
+/// above the bar, but only while that row is in the red zone.
+fn meter_lines(header_rows: usize, fader_rows: u16, level: f32, peak: f32) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = (0..header_rows.saturating_sub(1)).map(|_| Line::from("")).collect();
     lines.push(Line::from(Span::styled("VU", Style::new().fg(DIM))).alignment(Alignment::Center));
     let filled = ((fader_rows as f32) * level.clamp(0.0, 1.0)).round() as u16;
+    let red_rows = (fader_rows / 10).max(1);
+    let peak_row = fader_rows.saturating_sub(((fader_rows as f32) * peak.clamp(0.0, 1.0)).round() as u16);
     for row in 0..fader_rows {
         let is_filled = row >= fader_rows.saturating_sub(filled);
-        let bar = if is_filled { "▓▓" } else { "░░" };
+        let held = !is_filled && row == peak_row && row < red_rows;
+        let bar = if held { "▬▬" } else if is_filled { "▓▓" } else { "░░" };
         let zone =
-            if row < fader_rows / 10 { Color::Red } else if row < fader_rows * 3 / 10 { Color::Yellow } else { Color::Green };
-        let color = if is_filled { zone } else { DIM };
+            if row < red_rows { Color::Red } else if row < fader_rows * 3 / 10 { Color::Yellow } else { Color::Green };
+        let color = if is_filled || held { zone } else { DIM };
         lines.push(Line::from(Span::styled(bar, Style::new().fg(color))).alignment(Alignment::Center));
     }
     lines.push(Line::from(""));

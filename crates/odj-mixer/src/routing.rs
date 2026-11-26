@@ -55,6 +55,9 @@ const METER_RELEASE_SECS: f32 = 0.3;
 /// which would read as an abrupt cutoff rather than a visible decay;
 /// see [`decay_level`] for the formula this feeds.
 const METER_RELEASE_FLOOR: f32 = 0.05;
+/// How long a VU meter's peak-hold marker (see `MixedInput::peak`)
+/// stays put at the loudest recent level before resetting.
+const PEAK_HOLD_SECS: f32 = 1.5;
 
 /// Updates a level meter's own decaying peak: jumps straight up to
 /// `block_peak` if that's louder than what's decayed to since the
@@ -156,6 +159,11 @@ struct MixedInput {
     /// is one more frame of delay between this input and the speakers,
     /// so a bar pinned near full means this input is playing ~43ms late.
     backlog: f32,
+    /// The loudest block peak seen within the last [`PEAK_HOLD_SECS`]
+    /// — the VU meter's lingering peak-hold marker — and how many
+    /// seconds it has left before it resets to whatever's current.
+    peak: f32,
+    peak_left: f32,
 }
 
 impl MixedSource {
@@ -210,6 +218,12 @@ impl MixedSource {
         self.inputs.get(key).map_or(0.0, |i| i.level)
     }
 
+    /// `key`'s held peak (see `MixedInput::peak`) — `0.0` if it isn't
+    /// currently mixed in.
+    pub(crate) fn input_peak(&self, key: &DeviceKey) -> f32 {
+        self.inputs.get(key).map_or(0.0, |i| i.peak)
+    }
+
     /// `key`'s current buffer backlog — a fraction of its ring's
     /// capacity, and the same amount as milliseconds of delay — or
     /// `None` if it isn't currently mixed in.
@@ -253,7 +267,7 @@ impl MixedSource {
     fn insert(&mut self, key: DeviceKey, cons: ringbuf::HeapCons<f32>, rate: u32) {
         self.inputs.insert(
             key,
-            MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false, level: 0.0, backlog: 0.0 },
+            MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false, level: 0.0, backlog: 0.0, peak: 0.0, peak_left: 0.0 },
         );
     }
 
@@ -331,6 +345,11 @@ impl Source for MixedSource {
                 }
             }
             input.level = decay_level(input.level, block_peak, frames, rate);
+            input.peak_left -= frames as f32 / rate as f32;
+            if block_peak >= input.peak || input.peak_left <= 0.0 {
+                input.peak = block_peak;
+                input.peak_left = PEAK_HOLD_SECS;
+            }
             if let Some(tap) = &mut input.tap {
                 tap.push_slice(scratch);
             }
@@ -411,6 +430,11 @@ pub struct Routing {
     /// auto-connect reopens them all fresh, same as a main-output swap
     /// already does (see [`set_main_output`](Self::set_main_output)).
     buffer_frames: u32,
+    /// The input/parameter a MIDI knob most recently changed (see
+    /// `crate::dispatch`), not yet picked up by the live screen — which
+    /// [`take_midi_touch`](Self::take_midi_touch)s it to move its own
+    /// selection there, so turning a knob also highlights what it moved.
+    midi_touch: Option<(DeviceKey, Param)>,
 }
 
 impl Default for Routing {
@@ -427,6 +451,7 @@ impl Routing {
             main_output: None,
             socket_listener: None,
             buffer_frames,
+            midi_touch: None,
         }
     }
 
@@ -463,6 +488,18 @@ impl Routing {
     /// most recent [`set_buffer_frames`](Self::set_buffer_frames) left
     /// it at, or [`audio::DEFAULT_BUFFER_FRAMES`] if it's never been
     /// changed.
+    /// Records that a MIDI knob just changed `param` on `input` — see
+    /// [`midi_touch`](Self::midi_touch)'s field doc comment.
+    pub fn note_midi_touch(&mut self, input: &DeviceKey, param: Param) {
+        self.midi_touch = Some((input.clone(), param));
+    }
+
+    /// The most recent [`note_midi_touch`](Self::note_midi_touch) since
+    /// the last call, if any.
+    pub fn take_midi_touch(&mut self) -> Option<(DeviceKey, Param)> {
+        self.midi_touch.take()
+    }
+
     pub fn buffer_frames(&self) -> u32 {
         self.buffer_frames
     }
@@ -720,6 +757,12 @@ impl Routing {
     /// `input`'s ring-buffer backlog as `(fraction of capacity, ms of
     /// delay)` — see `MixedInput::backlog` — or `None` if it isn't
     /// routed anywhere right now.
+    pub fn input_peak(&self, input: &DeviceKey) -> f32 {
+        let Some(r) = self.inputs.get(input) else { return 0.0 };
+        let Some(o) = self.outputs.get(&r.output) else { return 0.0 };
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).input_peak(input)
+    }
+
     pub fn input_backlog(&self, input: &DeviceKey) -> Option<(f32, f32)> {
         let r = self.inputs.get(input)?;
         let o = self.outputs.get(&r.output)?;

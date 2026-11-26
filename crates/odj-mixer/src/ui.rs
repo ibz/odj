@@ -372,6 +372,13 @@ fn bind_knob(targets: &Targets, controller: &str, cc: u8, target: String) {
 /// otherwise show up with nothing to forget (see [`ControllerRow`]).
 fn unbind_knob(targets: &Targets, controller: &str, target: &str) {
     targets.unbind(target);
+    unbind_saved(controller, target);
+}
+
+/// [`unbind_knob`]'s settings-file half alone — for a controller that
+/// isn't the one connected right now, whose mappings aren't live in
+/// `Targets` at all, so only its saved map needs changing.
+fn unbind_saved(controller: &str, target: &str) {
     let mut settings = odj_core::memory::load_settings();
     if let Some(knobs) = settings.mixer_midi_controllers.get_mut(controller) {
         knobs.remove(target);
@@ -756,7 +763,11 @@ fn build_controller_rows(known: &HashMap<String, HashMap<String, u8>>) -> Vec<Co
 /// (or remaps) one, `X`/`Delete` clears it.
 struct ParamRow {
     target: String,
-    param: Param,
+    /// What the row reads as — just the param's own name inside one
+    /// channel's drill-in, "{channel} {param}" in a controller's own
+    /// (see [`build_controller_mapping_rows`]), where rows span every
+    /// channel at once.
+    label: String,
     cc: Option<u8>,
 }
 
@@ -775,9 +786,49 @@ fn build_param_rows(key: &DeviceKey, targets: &Targets) -> Vec<ParamRow> {
         .map(|param| {
             let target = midi::target_key(&Target { input: key.clone(), param });
             let cc = targets.cc_for(&target);
-            ParamRow { target, param, cc }
+            ParamRow { target, label: param_label(param).to_string(), cc }
         })
         .collect()
+}
+
+/// Settings' MIDI tab drill-in (`C`): every possible mapping on one
+/// controller — each of `channel_rows`' 4 params, plus any param
+/// `saved` (that controller's own entry of
+/// `Settings.mixer_midi_controllers`) still maps for a device not among
+/// them (a controller other than the one in use has its own phantom
+/// devices, which `channel_rows`, built from the live `Targets`, can't
+/// know about) — each with whatever CC `saved` binds to it, if any.
+fn build_controller_mapping_rows(channel_rows: &[ChannelRow], saved: &HashMap<String, u8>) -> Vec<ParamRow> {
+    let mut keys: Vec<(DeviceKey, String)> = channel_rows.iter().map(|r| (r.key.clone(), r.label.clone())).collect();
+    let mut extra: Vec<DeviceKey> = saved
+        .keys()
+        .filter_map(|t| midi::parse_target(t))
+        .map(|t| t.input)
+        .filter(|k| !keys.iter().any(|(known, _)| known == k))
+        .collect();
+    extra.sort_by_key(|k| format!("{k:?}"));
+    extra.dedup();
+    keys.extend(extra.into_iter().map(|k| {
+        let label = phantom_channel(&k).1;
+        (k, label)
+    }));
+    keys.into_iter()
+        .flat_map(|(key, label)| {
+            (0..CONTROLS).map(control_param).map(move |param| {
+                let target = midi::target_key(&Target { input: key.clone(), param });
+                ParamRow { cc: saved.get(&target).copied(), label: format!("{label} {}", param_label(param)), target }
+            })
+        })
+        .collect()
+}
+
+/// What Settings is drilled into, if anything: one channel's own 4
+/// params (Inputs tab, `Enter`) or one controller's every possible
+/// mapping (MIDI tab, `C`).
+#[derive(Clone, PartialEq)]
+enum Drill {
+    Channel(DeviceKey),
+    Controller(String),
 }
 
 /// The live screen: one channel strip per running deck (connected
@@ -854,8 +905,9 @@ pub fn run(
     let mut settings_open = false;
     let mut settings_tab = SettingsTab::Inputs;
     let mut channel_selected = 0usize;
-    // `Some(key)` once `Enter` drills into that channel's own 4 params.
-    let mut mapping_drill: Option<DeviceKey> = None;
+    // `Some` once `Enter` (Inputs) drills into one channel's own 4
+    // params, or `C` (MIDI) into one controller's every mapping.
+    let mut mapping_drill: Option<Drill> = None;
     let mut param_selected = 0usize;
     let mut output_selected = 0usize;
     let mut midi_selected = 0usize;
@@ -928,14 +980,23 @@ pub fn run(
             // The drilled-into channel disappearing (unplugged, deck
             // quit) backs out to the channel list rather than pointing
             // at nothing.
-            if mapping_drill.as_ref().is_some_and(|k| !channel_rows.iter().any(|r| &r.key == k)) {
+            if let Some(Drill::Channel(k)) = &mapping_drill
+                && !channel_rows.iter().any(|r| &r.key == k)
+            {
                 mapping_drill = None;
             }
-            let drilled = mapping_drill.as_ref().map(|key| {
-                let label = channel_rows.iter().find(|r| &r.key == key).map_or("", |r| &r.label);
-                (label.to_string(), build_param_rows(key, targets))
+            // `(title, label prefix for a learn prompt, rows)`.
+            let drilled = mapping_drill.as_ref().map(|drill| match drill {
+                Drill::Channel(key) => {
+                    let label = channel_rows.iter().find(|r| &r.key == key).map_or("", |r| &r.label);
+                    (format!("Inputs — {label}"), format!("{label} "), build_param_rows(key, targets))
+                }
+                Drill::Controller(name) => {
+                    let saved = known_controllers.get(name).cloned().unwrap_or_default();
+                    (format!("MIDI — {name}"), String::new(), build_controller_mapping_rows(&channel_rows, &saved))
+                }
             });
-            if let Some((_, rows)) = &drilled {
+            if let Some((_, _, rows)) = &drilled {
                 param_selected = param_selected.min(rows.len().saturating_sub(1));
             }
 
@@ -945,7 +1006,7 @@ pub fn run(
                     settings_tab,
                     &channel_rows,
                     channel_selected,
-                    drilled.as_ref().map(|(label, rows)| (label.as_str(), rows.as_slice())),
+                    drilled.as_ref().map(|(title, _, rows)| (title.as_str(), rows.as_slice())),
                     param_selected,
                     &out_entries,
                     output_selected,
@@ -964,25 +1025,40 @@ pub fn run(
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                if let Some((label, rows)) = &drilled {
+                if let Some((_, prompt, rows)) = &drilled {
+                    // Which controller the drill-in edits: the one it
+                    // was opened on (MIDI, `C`), or else whichever's in
+                    // use (Inputs).
+                    let editing = match &mapping_drill {
+                        Some(Drill::Controller(name)) => Some(name.clone()),
+                        _ => controller.clone(),
+                    };
                     match k.code {
                         KeyCode::Esc => mapping_drill = None,
                         KeyCode::Up => param_selected = param_selected.saturating_sub(1),
                         KeyCode::Down => param_selected = (param_selected + 1).min(rows.len().saturating_sub(1)),
                         KeyCode::Enter if !rows.is_empty() => {
                             let row = &rows[param_selected];
-                            match &controller {
+                            match &editing {
                                 None => set_status(&mut status, "No MIDI controller connected"),
+                                // Learning listens on the live connection,
+                                // so only the controller in use can learn.
+                                Some(name) if Some(name) != controller.as_ref() => {
+                                    set_status(&mut status, "Use this controller first (Enter on the MIDI tab) to map knobs on it")
+                                }
                                 Some(name) => {
-                                    if let Some(cc) = midi::learn(terminal, learning, &format!("{label} {}", param_label(row.param)))? {
+                                    if let Some(cc) = midi::learn(terminal, learning, &format!("{prompt}{}", row.label))? {
                                         bind_knob(targets, name, cc, row.target.clone());
                                     }
                                 }
                             }
                         }
                         KeyCode::Char('x' | 'X') | KeyCode::Delete if !rows.is_empty() => {
-                            if let Some(name) = &controller {
-                                unbind_knob(targets, name, &rows[param_selected].target);
+                            let target = &rows[param_selected].target;
+                            match &editing {
+                                Some(name) if Some(name) == controller.as_ref() => unbind_knob(targets, name, target),
+                                Some(name) => unbind_saved(name, target),
+                                None => {}
                             }
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
@@ -1017,7 +1093,7 @@ pub fn run(
                             failed.remove(&row.key);
                         }
                         KeyCode::Enter if !channel_rows.is_empty() => {
-                            mapping_drill = Some(channel_rows[channel_selected].key.clone());
+                            mapping_drill = Some(Drill::Channel(channel_rows[channel_selected].key.clone()));
                             param_selected = 0;
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
@@ -1075,6 +1151,10 @@ pub fn run(
                         }
                         KeyCode::Char('x' | 'X') | KeyCode::Delete if controller_rows.get(midi_selected).is_some_and(|r| r.mappings > 0) => {
                             forget_controller(&controller_rows[midi_selected].name);
+                        }
+                        KeyCode::Char('c' | 'C') if !k.modifiers.contains(KeyModifiers::CONTROL) && !controller_rows.is_empty() => {
+                            mapping_drill = Some(Drill::Controller(controller_rows[midi_selected].name.clone()));
+                            param_selected = 0;
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
                         _ => {}
@@ -1907,12 +1987,12 @@ fn draw_settings(
         (_, Some(_)) => " Enter map  X clear ",
         (SettingsTab::Inputs, None) => " Space toggle  Enter settings ",
         (SettingsTab::Outputs, None) => " Enter use ",
-        (SettingsTab::Midi, None) => " Enter use  X forget mappings ",
+        (SettingsTab::Midi, None) => " Enter use  C configure  X forget mappings ",
         (SettingsTab::Buffer, None) => " Enter apply ",
     };
     let esc_action = if drilled.is_some() { "Back" } else { "Close" };
     let title = match &drilled {
-        Some((label, _)) => format!(" Settings — Inputs — {label} "),
+        Some((title, _)) => format!(" Settings — {title} "),
         None => " Settings ".to_string(),
     };
     let mut block = Block::bordered()
@@ -1931,8 +2011,9 @@ fn draw_settings(
     f.render_widget(block, area);
 
     if let Some((_, rows)) = drilled {
+        let label_w = rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(0);
         let items: Vec<ListItem> =
-            rows.iter().map(|r| ListItem::new(format!("{:<10}{}", param_label(r.param), r.cc.map_or("—".to_string(), |c| format!("CC {c}"))))).collect();
+            rows.iter().map(|r| ListItem::new(format!("{:<label_w$}  {}", r.label, r.cc.map_or("—".to_string(), |c| format!("CC {c}"))))).collect();
         let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
         let mut state = ListState::default().with_selected(Some(param_selected));
         f.render_stateful_widget(list, inner, &mut state);
@@ -2426,6 +2507,24 @@ mod tests {
     }
 
     #[test]
+    fn build_controller_mapping_rows_lists_every_channels_params_plus_saved_phantoms() {
+        let channels = build_channels(&[], &[entry("odj-deck-1", "Deck 1")]);
+        let rows = build_channel_rows(&channels, &Routing::default(), &Targets::default());
+        let deck_low = midi::target_key(&Target { input: entry("odj-deck-1", "Deck 1").key, param: Param::Low });
+        // A deck that isn't running, mapped only on this (not-in-use)
+        // controller — the live `Targets` above know nothing about it.
+        let gone_volume = midi::target_key(&Target { input: entry("odj-deck-2", "Deck 2").key, param: Param::Volume });
+        let saved = HashMap::from([(deck_low.clone(), 7), (gone_volume.clone(), 9)]);
+
+        let mapping = build_controller_mapping_rows(&rows, &saved);
+        assert_eq!(mapping.len(), 8, "4 params each for Deck 1 and the phantom Deck 2");
+        assert_eq!(mapping[0].label, "Deck 1 High", "strip order, top to bottom");
+        assert!(mapping.iter().any(|r| r.label == "Deck 1 Low" && r.target == deck_low && r.cc == Some(7)));
+        assert!(mapping.iter().any(|r| r.label == "Deck 2 Volume" && r.target == gone_volume && r.cc == Some(9)));
+        assert_eq!(mapping.iter().filter(|r| r.cc.is_none()).count(), 6);
+    }
+
+    #[test]
     fn build_param_rows_covers_a_single_channels_4_params() {
         let key = entry("mic", "Mic").key;
         let targets = Targets::default();
@@ -2434,7 +2533,7 @@ mod tests {
 
         let rows = build_param_rows(&key, &targets);
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().any(|r| r.param == Param::Low && r.target == bound && r.cc == Some(5)));
+        assert!(rows.iter().any(|r| r.label == "Low" && r.target == bound && r.cc == Some(5)));
         assert_eq!(rows.iter().filter(|r| r.cc.is_none()).count(), 3);
     }
 

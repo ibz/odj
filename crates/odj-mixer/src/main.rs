@@ -60,7 +60,10 @@ fn main() -> Result<()> {
              upfront. MIDI: one row per MIDI controller odj-mixer has saved mappings for,\n\
              plus one for each currently plugged in that has none yet (each row names how\n\
              many mappings it has); Enter switches to the selected one live if it's plugged\n\
-             in, X/Delete forgets its mappings (a no-op if it has none). Buffer: the audio\n\
+             in, X/Delete forgets its mappings (a no-op if it has none), C configures it:\n\
+             every possible mapping (each channel's High/Mid/Low/Volume) with the knob bound\n\
+             to it, if any — Enter maps the selected one (only on the controller in use), X\n\
+             clears it, Esc backs out. Buffer: the audio\n\
              buffer size every stream opens with from here on, in frames — lower trades\n\
              headroom against dropouts for lower round-trip latency; Enter applies the\n\
              selected size immediately, tearing down and reconnecting every input (same as\n\
@@ -70,10 +73,10 @@ fn main() -> Result<()> {
              Picking a MIDI controller at startup needs no picker either, the same way the\n\
              output doesn't, as long as one it's already learned mappings for is plugged in\n\
              (the last-used one if more than one qualifies) — only a screen full of unknown\n\
-             ones falls back to asking (skip with Esc/N). Once one's picked, if any decks are\n\
-             already running, walks you through mapping a knob to each deck's (and the\n\
-             sampler's, if it's running) Volume/Low/Mid/High that isn't mapped yet on that\n\
-             controller. R enters record mode: 8 fixed tracks, each freely assignable to any\n\
+             ones falls back to asking (skip with Esc/N). Once one's picked, if it has no\n\
+             mappings at all yet and any decks are already running, walks you through mapping\n\
+             a knob to each deck's (and the sampler's, if it's running) Volume/Low/Mid/High;\n\
+             once it has any, the rest are mapped from Settings (MIDI, C) instead. R enters record mode: 8 fixed tracks, each freely assignable to any\n\
              currently-routed input, toggled Play/Mute/Record (S, Shift+S to go back; Play is\n\
              the default) — a Play track mixes its own prior take back into the live output in\n\
              real time, synced to a shared playhead; Space/R/X are Play-Pause/Record/Stop for\n\
@@ -230,7 +233,11 @@ fn start(terminal: &mut DefaultTerminal, key_release: bool) -> Result<()> {
         })
     });
 
-    if midi_conn.is_some() {
+    // Only a controller with nothing mapped on it yet gets the startup
+    // walkthrough — once it has *any* mapping, anything left unmapped is
+    // Settings' job (MIDI tab, C), not something to ask about on every
+    // single start.
+    if midi_conn.is_some() && knobs.is_empty() {
         // Already-running decks need a moment to be scanned before
         // deciding what's left unmapped — the common case is starting
         // odj-mixer with decks already up, wanting to map them right

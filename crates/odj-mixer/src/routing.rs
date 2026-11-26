@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use cpal::Stream;
 use ringbuf::HeapRb;
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 
 use odj_core::audio::{self, Source};
 use odj_core::audio_link::{self, Listener};
@@ -149,6 +149,13 @@ struct MixedInput {
     /// own ~100ms-tick polling loop never catches it artificially low
     /// between loud blocks. See [`decay_level`] for the ballistics.
     level: f32,
+    /// How much of this input's ring buffer (see [`RING_STEREO_SAMPLES`])
+    /// was queued up, waiting to be played, at the start of the most
+    /// recent `render` — as a fraction of its capacity, peak-held and
+    /// decaying exactly like [`level`](Self::level). Every queued frame
+    /// is one more frame of delay between this input and the speakers,
+    /// so a bar pinned near full means this input is playing ~43ms late.
+    backlog: f32,
 }
 
 impl MixedSource {
@@ -203,6 +210,15 @@ impl MixedSource {
         self.inputs.get(key).map_or(0.0, |i| i.level)
     }
 
+    /// `key`'s current buffer backlog — a fraction of its ring's
+    /// capacity, and the same amount as milliseconds of delay — or
+    /// `None` if it isn't currently mixed in.
+    pub(crate) fn input_backlog(&self, key: &DeviceKey) -> Option<(f32, f32)> {
+        let input = self.inputs.get(key)?;
+        let frames = input.backlog * input.cons.capacity().get() as f32 / 2.0;
+        Some((input.backlog, frames / self.rate as f32 * 1000.0))
+    }
+
     pub(crate) fn set_play_track(&mut self, slot: usize, track: Option<PlayTrack>) {
         self.play_tracks[slot] = track;
     }
@@ -237,7 +253,7 @@ impl MixedSource {
     fn insert(&mut self, key: DeviceKey, cons: ringbuf::HeapCons<f32>, rate: u32) {
         self.inputs.insert(
             key,
-            MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false, level: 0.0 },
+            MixedInput { cons, volume: 1.0, eq: ThreeBandEq::new(rate), tap: None, muted: false, level: 0.0, backlog: 0.0 },
         );
     }
 
@@ -281,6 +297,8 @@ impl Source for MixedSource {
         let (l, r) = (&mut self.scratch_l[..frames], &mut self.scratch_r[..frames]);
         let rate = self.rate;
         for input in self.inputs.values_mut() {
+            let queued = input.cons.occupied_len() as f32 / input.cons.capacity().get() as f32;
+            input.backlog = decay_level(input.backlog, queued, frames, rate);
             let got = input.cons.pop_slice(scratch);
             scratch[got..].fill(0.0); // underrun: silence rather than stale samples
             for (i, lr) in scratch.as_chunks::<2>().0.iter().enumerate() {
@@ -697,6 +715,15 @@ impl Routing {
         let Some(r) = self.inputs.get(input) else { return 0.0 };
         let Some(o) = self.outputs.get(&r.output) else { return 0.0 };
         o.mixed.lock().unwrap_or_else(|e| e.into_inner()).input_level(input)
+    }
+
+    /// `input`'s ring-buffer backlog as `(fraction of capacity, ms of
+    /// delay)` — see `MixedInput::backlog` — or `None` if it isn't
+    /// routed anywhere right now.
+    pub fn input_backlog(&self, input: &DeviceKey) -> Option<(f32, f32)> {
+        let r = self.inputs.get(input)?;
+        let o = self.outputs.get(&r.output)?;
+        o.mixed.lock().unwrap_or_else(|e| e.into_inner()).input_backlog(input)
     }
 
     /// Installs (`Some`) or clears (`None`) record-mode track `slot`'s

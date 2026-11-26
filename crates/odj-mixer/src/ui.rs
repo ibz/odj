@@ -46,7 +46,7 @@ const VOLUME_STEP: f32 = 0.05;
 /// Likewise for an EQ band, in dB.
 const EQ_STEP: f32 = 1.0;
 /// How wide one channel strip is, borders included.
-const STRIP_WIDTH: u16 = 14;
+const STRIP_WIDTH: u16 = 17;
 /// The 4 controls a strip's cursor moves between: High, Mid, Low,
 /// Volume (top to bottom, same order a real channel strip reads).
 const CONTROLS: usize = 4;
@@ -1424,7 +1424,14 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     // things (where the volume control is set vs. how loud the signal
     // actually, dynamically, is right now), so conflating them would
     // make a hot signal on a low fader look deceptively quiet.
-    let [fader_area, meter_area] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(3)]).areas(inner);
+    //
+    // Below both, a horizontal bar across the strip's whole width shows
+    // the input's ring-buffer backlog (see `Routing::input_backlog`):
+    // how much audio is queued between this input and the speakers,
+    // i.e. how late it's playing — deliberately shaped and styled
+    // unlike the VU meter so the two can't be mistaken for each other.
+    let [strip_area, buffer_area] = Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(inner);
+    let [fader_area, meter_area] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(3)]).areas(strip_area);
 
     let row_style = |i: usize| {
         if active_control == Some(i) { Style::new().fg(Color::Black).bg(AMBER) } else { Style::new().fg(Color::White) }
@@ -1452,7 +1459,7 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     // The Volume fader: filled bottom-up over whatever vertical room is
     // left, like a real channel strip's — the dominant visual element.
     let volume = routing.get_param(&ch.key, Param::Volume);
-    let fader_rows = inner.height.saturating_sub(lines.len() as u16 + 1).max(1);
+    let fader_rows = strip_area.height.saturating_sub(lines.len() as u16 + 1).max(1);
     let fraction = volume.unwrap_or(0.0).clamp(0.0, 1.0);
     let filled = ((fader_rows as f32) * fraction).round() as u16;
     for row in 0..fader_rows {
@@ -1473,19 +1480,61 @@ fn draw_channel(f: &mut Frame, area: Rect, ch: &Channel, selected: bool, active_
     // bottom to top) rather than a single color, same convention a
     // real VU meter's colored scale uses, so a hot signal reads as hot
     // at a glance rather than needing the exact number read off it.
-    let mut meter_lines: Vec<Line> = (0..header_rows).map(|_| Line::from("")).collect();
-    let level = routing.input_level(&ch.key).clamp(0.0, 1.0);
-    let meter_filled = ((fader_rows as f32) * level).round() as u16;
+    let level = routing.input_level(&ch.key);
+    f.render_widget(Paragraph::new(meter_lines(header_rows, fader_rows, level)), meter_area);
+
+    let backlog = routing.input_backlog(&ch.key);
+    f.render_widget(Paragraph::new(buffer_lines(buffer_area.width, backlog)), buffer_area);
+}
+
+/// [`draw_channel`]'s VU meter column: blank rows down to the last of
+/// `header_rows` (so it lines up with the fader beside it), which
+/// carries a "VU" label instead, then `fader_rows` rows filled
+/// bottom-up to `level` in green/yellow/red zones, then one blank row
+/// level with the fader's own percentage readout.
+fn meter_lines(header_rows: usize, fader_rows: u16, level: f32) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = (0..header_rows.saturating_sub(1)).map(|_| Line::from("")).collect();
+    lines.push(Line::from(Span::styled("VU", Style::new().fg(DIM))).alignment(Alignment::Center));
+    let filled = ((fader_rows as f32) * level.clamp(0.0, 1.0)).round() as u16;
     for row in 0..fader_rows {
-        let is_filled = row >= fader_rows.saturating_sub(meter_filled);
+        let is_filled = row >= fader_rows.saturating_sub(filled);
         let bar = if is_filled { "▓▓" } else { "░░" };
         let zone =
             if row < fader_rows / 10 { Color::Red } else if row < fader_rows * 3 / 10 { Color::Yellow } else { Color::Green };
         let color = if is_filled { zone } else { DIM };
-        meter_lines.push(Line::from(Span::styled(bar, Style::new().fg(color))).alignment(Alignment::Center));
+        lines.push(Line::from(Span::styled(bar, Style::new().fg(color))).alignment(Alignment::Center));
     }
-    meter_lines.push(Line::from(""));
-    f.render_widget(Paragraph::new(meter_lines), meter_area);
+    lines.push(Line::from(""));
+    lines
+}
+
+/// [`draw_channel`]'s horizontal buffer meter, `width` cells wide: a
+/// "BUFFER" label with the delay in ms right-aligned on the same row,
+/// then a bar filled left-to-right to the backlog's fraction — plain
+/// white, red only for the cells past 90% (the input's playing
+/// noticeably late). `backlog` is `Routing::input_backlog`'s own result.
+fn buffer_lines(width: u16, backlog: Option<(f32, f32)>) -> Vec<Line<'static>> {
+    let width = width as usize;
+    let ms = backlog.map_or("—".to_string(), |(_, ms)| format!("{ms:.0}ms"));
+    let gap = width.saturating_sub("BUFFER".len() + ms.chars().count());
+    let label = Line::from(vec![
+        Span::styled("BUFFER", Style::new().fg(DIM)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(ms, Style::new().fg(DIM)),
+    ]);
+    let fraction = backlog.map_or(0.0, |(fraction, _)| fraction.clamp(0.0, 1.0));
+    let filled = ((width as f32) * fraction).round() as usize;
+    let red_from = width - width / 10;
+    let bar: Vec<Span> = (0..width)
+        .map(|i| {
+            if i >= filled {
+                Span::styled("·", Style::new().fg(DIM))
+            } else {
+                Span::styled("╱", Style::new().fg(if i >= red_from { Color::Red } else { Color::White }))
+            }
+        })
+        .collect();
+    vec![label, Line::from(bar)]
 }
 
 /// The record-mode screen's shared waveform timeline is always this

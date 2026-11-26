@@ -134,6 +134,10 @@ pub struct LearnRequest {
     pub name: String,
     pub slot: usize,
     pub port_id: String,
+    /// `Some(pad)` to learn just that one pad (Settings' MIDI tab, `C`,
+    /// `Enter` — see [`learn_one_pad`]); `None` for the whole 16-pad
+    /// walkthrough a never-learned device gets.
+    pub pad: Option<usize>,
 }
 
 /// Restores the remembered MIDI input at startup, no picker: the saved
@@ -175,6 +179,12 @@ pub fn restore(
 
 /// The pad whose entry in `pad_notes` is `note`, if any.
 pub fn note_to_pad(note: u8, pad_notes: &[u8; PADS]) -> Option<usize> {
+    // 0 is the "unlearned" sentinel (see `MidiConfig::set_pad_notes_for`),
+    // never a real mapping — otherwise a device with only some pads
+    // learned would fire its first unlearned one on note 0.
+    if note == 0 {
+        return None;
+    }
     pad_notes.iter().position(|&n| n == note)
 }
 
@@ -254,7 +264,7 @@ pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<
     let mut notes = [0u8; PADS];
     let mut pad = 0;
     while pad < PADS {
-        terminal.draw(|f| draw_learn_screen(f, pad))?;
+        terminal.draw(|f| draw_learn_screen(f, pad, false))?;
         if event::poll(Duration::ZERO)?
             && let Event::Key(key) = event::read()?
             && key.kind != KeyEventKind::Release
@@ -281,6 +291,36 @@ pub fn learn_pad_notes(terminal: &mut DefaultTerminal, port_id: &str) -> Result<
         }
     }
     Ok(Some(notes))
+}
+
+/// Learns just `pad`'s note: waits for one Note On from `port_id` and
+/// returns it — Settings' per-pad configure (`C`, then `Enter`), as
+/// opposed to [`learn_pad_notes`]' whole walkthrough. `Ok(None)` if
+/// `Esc`/`Ctrl+C` cancels, or the port can't be opened.
+pub fn learn_one_pad(terminal: &mut DefaultTerminal, port_id: &str, pad: usize) -> Result<Option<u8>> {
+    let Some((_conn, rx)) = listen_notes(port_id) else { return Ok(None) };
+    loop {
+        terminal.draw(|f| draw_learn_screen(f, pad, true))?;
+        if event::poll(Duration::ZERO)?
+            && let Event::Key(key) = event::read()?
+            && key.kind != KeyEventKind::Release
+            && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            return Ok(None);
+        }
+        match rx.recv_timeout(Duration::from_millis(30)) {
+            Ok(note) => {
+                // Same debounce as `learn_pad_notes`: a press can bounce
+                // into more than one Note On, and the caller may chain
+                // straight on to learning the next pad — let it settle
+                // here, on this connection, so a bounce can't land there.
+                std::thread::sleep(Duration::from_millis(150));
+                return Ok(Some(note));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
 }
 
 /// Each digit as 5 rows of a 3-column dot pattern — a plain bitmap font,
@@ -311,15 +351,22 @@ fn big_number(n: usize) -> [String; 5] {
     })
 }
 
-fn draw_learn_screen(f: &mut Frame, pad: usize) {
+/// `single`: learning just this one pad ([`learn_one_pad`]) rather than
+/// walking through all of them — no "of 16" progress, and nothing
+/// already learned to "finish here" with.
+fn draw_learn_screen(f: &mut Frame, pad: usize, single: bool) {
     let area = centered(f.area(), 60, 60);
     f.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" Configure pads ")
-        .title_bottom(if pad > 0 { " Esc finish here  Ctrl+C discard all " } else { " Esc/Ctrl+C cancel " })
+        .title_bottom(if pad > 0 && !single { " Esc finish here  Ctrl+C discard all " } else { " Esc/Ctrl+C cancel " })
         .border_style(Style::new().fg(AMBER));
     let mut text = big_number(pad + 1).join("\n");
-    text.push_str(&format!("\n\npress pad {} of {}", pad + 1, PADS));
+    if single {
+        text.push_str(&format!("\n\npress pad {}", pad + 1));
+    } else {
+        text.push_str(&format!("\n\npress pad {} of {}", pad + 1, PADS));
+    }
     let paragraph = Paragraph::new(text).alignment(Alignment::Center).style(Style::new().fg(AMBER)).block(block);
     f.render_widget(paragraph, area);
 }
@@ -376,6 +423,10 @@ mod tests {
         assert_eq!(note_to_pad(36, &notes), Some(0));
         assert_eq!(note_to_pad(51, &notes), Some(15), "the last pad");
         assert_eq!(note_to_pad(52, &notes), None, "above the table");
+        let mut partial = [0u8; PADS];
+        partial[3] = 40;
+        assert_eq!(note_to_pad(0, &partial), None, "0 marks an unlearned pad, never a mapping");
+        assert_eq!(note_to_pad(40, &partial), Some(3));
 
         // Real hardware (an M-VAVE SMC-PAD) sends pads in groups of 4,
         // descending by 4 each group — not a straight ascending range —

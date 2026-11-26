@@ -65,7 +65,8 @@ fn main() -> Result<()> {
              Optionally triggered by MIDI\n\
              Note On/Off too: a previously learned device reconnects automatically when it's\n\
              plugged in, and ` opens Settings to choose another present device (learning its\n\
-             pads on the spot) or forget one. The device and each pad's note are kept in the\n\
+             pads on the spot), forget one, or C to configure one pad by pad (Enter learns\n\
+             the selected pad, X clears it). The device and each pad's note are kept in the\n\
              settings file shared with odj-player, {}.",
             kits::kits_dir().display(),
             odj_core::memory::settings_file().display()
@@ -239,9 +240,17 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, errors: &audio::Errors) ->
         // Settings picked a device whose pads aren't learned yet: walk
         // through them here, where drawing a temporary screen is possible,
         // then let `App` connect it and remember the result.
-        if let Some(req) = app.take_midi_learn() {
-            let notes = midi::learn_pad_notes(terminal, &req.port_id)?;
-            app.finish_midi_learn(req, notes);
+        // `while`, not `if`: learning one pad can queue the next one
+        // (see `App::finish_pad_learn`), which must follow straight on
+        // rather than drawing the normal screen for a frame in between.
+        while let Some(req) = app.take_midi_learn() {
+            if let Some(pad) = req.pad {
+                let note = midi::learn_one_pad(terminal, &req.port_id, pad)?;
+                app.finish_pad_learn(req, pad, note);
+            } else {
+                let notes = midi::learn_pad_notes(terminal, &req.port_id)?;
+                app.finish_midi_learn(req, notes);
+            }
         }
     }
     Ok(())

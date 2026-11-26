@@ -50,7 +50,8 @@ pub fn draw(f: &mut Frame, app: &App, s: &Snapshot) {
         draw_naming_kit(f, name);
     } else if let Screen::Settings = &app.screen {
         let rows = app.midi_rows();
-        draw_settings(f, &rows, app.settings_selected.min(rows.len().saturating_sub(1)), app.midi_device.as_deref());
+        let pad_config = app.pad_config.as_deref().map(|name| (name, app.pad_notes_of(name), app.pad_config_selected));
+        draw_settings(f, &rows, app.settings_selected.min(rows.len().saturating_sub(1)), app.midi_device.as_deref(), pad_config);
     } else if app.help.is_open() {
         draw_help(f, &app.help, HELP);
     }
@@ -379,13 +380,44 @@ fn hints_line(parts: &[(&str, &str)]) -> Line<'static> {
 /// single tab is still drawn as a tab — not just a title — so it reads as
 /// the same kind of screen as odj-mixer's multi-tab one, and there's room
 /// for more here later without changing the shape.
-fn draw_settings(f: &mut Frame, rows: &[DeviceRow], selected: usize, current: Option<&str>) {
+///
+/// `pad_config` is `Some((device, notes, selected))` while drilled into
+/// one device's per-pad mappings (`C`): every pad with its learned note,
+/// or `—`.
+fn draw_settings(
+    f: &mut Frame,
+    rows: &[DeviceRow],
+    selected: usize,
+    current: Option<&str>,
+    pad_config: Option<(&str, [Option<u8>; crate::engine::PADS], usize)>,
+) {
     let area = centered(f.area(), 70, 70);
     f.render_widget(Clear, area);
+    if let Some((name, notes, selected)) = pad_config {
+        let block = Block::bordered()
+            .title(format!(" Settings — MIDI — {name} "))
+            .title_bottom(key_hint("Esc", "Back", AMBER).left_aligned())
+            .title_bottom(hints_line(&[("Enter", "learn"), ("X", "clear")]).centered())
+            .border_style(Style::new().fg(AMBER));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let items: Vec<ListItem> = notes
+            .iter()
+            .enumerate()
+            .map(|(pad, note)| {
+                let note = note.map_or(Span::styled("—", Style::new().fg(DIM)), |n| Span::raw(format!("note {n}")));
+                ListItem::new(Line::from(vec![Span::raw(format!("Pad {:<4}", pad + 1)), note]))
+            })
+            .collect();
+        let list = List::new(items).highlight_style(Style::new().fg(Color::Black).bg(AMBER)).highlight_symbol("› ");
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(list, inner, &mut state);
+        return;
+    }
     let block = Block::bordered()
         .title(" Settings ")
         .title_bottom(key_hint("Esc", "Close", AMBER).left_aligned())
-        .title_bottom(hints_line(&[("Enter", "use"), ("X", "forget mappings")]).centered())
+        .title_bottom(hints_line(&[("Enter", "use"), ("C", "configure"), ("X", "forget mappings")]).centered())
         .border_style(Style::new().fg(AMBER));
     let inner = block.inner(area);
     f.render_widget(block, area);
